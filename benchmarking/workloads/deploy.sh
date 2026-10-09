@@ -44,11 +44,15 @@ fi
 
 WORKER_COUNT=1
 SANDBOX_CLASS="gvisor"
+# Actor CPU limit (ActorTemplate resources.limits.cpu), booked against worker
+# CPU capacity by the scheduler and enforced in the actor sandbox. Supports
+# Kubernetes CPU quantities (e.g. "1", "250m").
+ACTOR_CPU="${ACTOR_CPU:-1}"
 # Actor memory limit (ActorTemplate resources.limits.memory). The default
 # is the smallest size microvm admits (128Mi VMM reserve + 128Mi guest floor),
 # so benchmark actors do not inherit the 2 GiB kata default and drag its page
 # cache into every memory snapshot. Raise it for RAM-consuming suites.
-ACTOR_MEMORY="256Mi"
+ACTOR_MEMORY="${ACTOR_MEMORY:-256Mi}"
 # Worker pod memory (WorkerPool spec.template.resources), set as both request
 # and limit. Empty leaves the pod unsized. The limit is also the memory the
 # worker reports as its actor capacity.
@@ -70,6 +74,8 @@ usage() {
   echo "  --worker-count N            Number of WorkerPool replicas (default: 1)"
   echo "  --sandbox-class CLASS       Sandbox runtime for the WorkerPool: gvisor | microvm (default: gvisor)."
   echo "                              microvm requires hack/install-microvm-deps.sh --install to have run."
+  echo "  --actor-cpu CPU             CPU limit for the benchmark ActorTemplates (default: 1,"
+  echo "                              accepts Kubernetes CPU quantities such as 250m)"
   echo "  --actor-memory SIZE         Memory limit for the benchmark ActorTemplates (default: 256Mi,"
   echo "                              the smallest size microvm admits)"
   echo "  --worker-memory SIZE        Memory request and limit for each WorkerPool pod"
@@ -142,6 +148,7 @@ substitute() {
       -e "s|\${SANDBOX_CLASS_ENUM}|${sandbox_class_enum}|g" \
       -e "s|\${SANDBOX_CONFIG_NAME}|${sandbox_config_name}|g" \
       -e "s|\${OTLP_ENDPOINT}|${OTLP_ENDPOINT}|g" \
+      -e "s|\${ACTOR_CPU}|${ACTOR_CPU}|g" \
       -e "s|\${ACTOR_MEMORY}|${ACTOR_MEMORY}|g" \
       -e "s|\${WORKER_RESOURCES}|${worker_resources}|g" \
       -e "s|\${SWEPERF_IMAGE}|${SWEPERF_IMAGE:-}|g" \
@@ -195,7 +202,7 @@ wait_templates_ready() {
 
 deploy() {
   resolve_otlp_endpoint
-  echo "Deploying workloads (worker_count=${WORKER_COUNT}, actor_memory=${ACTOR_MEMORY}, worker_memory=${WORKER_MEMORY:-unset}, otlp_endpoint=${OTLP_ENDPOINT})..."
+  echo "Deploying workloads (worker_count=${WORKER_COUNT}, actor_cpu=${ACTOR_CPU}, actor_memory=${ACTOR_MEMORY}, worker_memory=${WORKER_MEMORY:-unset}, otlp_endpoint=${OTLP_ENDPOINT})..."
   substitute "${POOL_MANIFEST}" | hack/run-tool.sh ko apply -f -
   echo "Waiting for worker pool to be ready (timeout: ${WAIT_TIMEOUT_SECS}s)..."
   kubectl wait --for=create deployment/benchmark-ateom \
@@ -274,6 +281,13 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --otlp-endpoint=*)
       OTLP_ENDPOINT="${1#*=}"
+      ;;
+    --actor-cpu)
+      shift
+      ACTOR_CPU="$1"
+      ;;
+    --actor-cpu=*)
+      ACTOR_CPU="${1#*=}"
       ;;
     --actor-memory)
       shift

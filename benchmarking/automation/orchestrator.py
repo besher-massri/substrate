@@ -307,6 +307,12 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"test {name!r} has invalid sandboxClass {sandbox_class!r} "
                 f"(want one of {list(SANDBOX_CLASSES)})"
             )
+        if "actorCPU" in t:
+            actor_cpu = t["actorCPU"]
+            if isinstance(actor_cpu, bool) or not str(actor_cpu).strip():
+                raise ValueError(
+                    f"test {name!r} has invalid actorCPU {actor_cpu!r}"
+                )
         if "type" not in t:
             raise ValueError(
                 f"test {name!r} missing required 'type' field "
@@ -349,6 +355,7 @@ def deploy_workloads(
     actor_memory: str = "",
     wait_timeout_secs: int | str = "",
     worker_memory: str = "",
+    actor_cpu: int | float | str = "",
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -358,6 +365,10 @@ def deploy_workloads(
         "--sandbox-class",
         sandbox_class,
     ]
+    # Empty keeps the default in workloads/deploy.sh ("1"); CPU-sizing suites
+    # set actorCPU in tests.yaml (e.g. "250m" or "1").
+    if str(actor_cpu) != "":
+        cmd += ["--actor-cpu", str(actor_cpu)]
     # Empty keeps the default in workloads/deploy.sh (256Mi, the microvm
     # minimum); RAM-consuming suites set actorMemory in tests.yaml.
     if actor_memory:
@@ -546,6 +557,7 @@ def main() -> None:
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
                     test.get("workerMemory", ""),
+                    test.get("actorCPU", ""),
                 )
                 try:
                     status = run_test(

@@ -29,7 +29,8 @@ WORKER_COUNT=1
 SANDBOX_CLASS=gvisor
 SKIP_BUILD=0
 OTLP_ENDPOINT=""
-# Empty keeps the default in workloads/deploy.sh (256Mi, the microvm minimum).
+# Empty keeps the defaults in workloads/deploy.sh (cpu=1, memory=256Mi).
+ACTOR_CPU=""
 ACTOR_MEMORY=""
 # Empty leaves the WorkerPool pods unsized.
 WORKER_MEMORY=""
@@ -46,6 +47,8 @@ usage() {
   echo "                          microvm requires hack/install-microvm-deps.sh --install to have run."
   echo "  --otlp-endpoint URL     Forwarded to workloads/deploy.sh. The address to which an"
   echo "                          instrumented actor container sends telemetry."
+  echo "  --actor-cpu CPU         Forwarded to workloads/deploy.sh. CPU limit for the"
+  echo "                          benchmark ActorTemplates (default: 1)."
   echo "  --actor-memory SIZE     Forwarded to workloads/deploy.sh. Memory limit for the"
   echo "                          benchmark ActorTemplates (default: 256Mi, the microvm minimum)."
   echo "  --worker-memory SIZE    Forwarded to workloads/deploy.sh. Memory request and limit"
@@ -76,6 +79,8 @@ while [[ "$#" -gt 0 ]]; do
     --sandbox-class=*) SANDBOX_CLASS="${1#*=}" ;;
     --otlp-endpoint) shift; OTLP_ENDPOINT="$1" ;;
     --otlp-endpoint=*) OTLP_ENDPOINT="${1#*=}" ;;
+    --actor-cpu) shift; ACTOR_CPU="$1" ;;
+    --actor-cpu=*) ACTOR_CPU="${1#*=}" ;;
     --actor-memory) shift; ACTOR_MEMORY="$1" ;;
     --actor-memory=*) ACTOR_MEMORY="${1#*=}" ;;
     --worker-memory) shift; WORKER_MEMORY="$1" ;;
@@ -114,6 +119,9 @@ if [[ "${action}" == "deploy" ]]; then
   workload_args=(--deploy --worker-count "${WORKER_COUNT}" --sandbox-class "${SANDBOX_CLASS}")
   if [[ -n "${OTLP_ENDPOINT}" ]]; then
     workload_args+=(--otlp-endpoint "${OTLP_ENDPOINT}")
+  fi
+  if [[ -n "${ACTOR_CPU}" ]]; then
+    workload_args+=(--actor-cpu "${ACTOR_CPU}")
   fi
   if [[ -n "${ACTOR_MEMORY}" ]]; then
     workload_args+=(--actor-memory "${ACTOR_MEMORY}")

@@ -40,6 +40,13 @@ class DeployWorkloadsTest(unittest.TestCase):
         )
 
     @mock.patch("orchestrator.run")
+    def test_actor_cpu(self, run):
+        orchestrator.deploy_workloads(actor_cpu="250m")
+        cmd = run.call_args.args[0]
+        i = cmd.index("--actor-cpu")
+        self.assertEqual(cmd[i + 1], "250m")
+
+    @mock.patch("orchestrator.run")
     def test_worker_memory(self, run):
         orchestrator.deploy_workloads(worker_memory="12Gi")
         cmd = run.call_args.args[0]
@@ -54,6 +61,7 @@ class DeployWorkloadsTest(unittest.TestCase):
             actor_memory="1536Mi",
             wait_timeout_secs=600,
             worker_memory="5Gi",
+            actor_cpu="250m",
         )
         run.assert_called_once_with(
             [
@@ -63,6 +71,8 @@ class DeployWorkloadsTest(unittest.TestCase):
                 "3",
                 "--sandbox-class",
                 "microvm",
+                "--actor-cpu",
+                "250m",
                 "--actor-memory",
                 "1536Mi",
                 "--worker-memory",
@@ -71,6 +81,73 @@ class DeployWorkloadsTest(unittest.TestCase):
                 "600",
             ]
         )
+
+
+class ValidateAndNormalizeTest(unittest.TestCase):
+    def _base_locust_test(self, **overrides):
+        t = {
+            "name": "glutton_cpu",
+            "type": "locust",
+            "targetCluster": "dev",
+            "file": "/app/tests/glutton.py",
+            "duration": "1m",
+            "users": 1,
+        }
+        t.update(overrides)
+        return t
+
+    def test_cpu_cores_and_duty_cycle_normalized_into_flags(self):
+        t = self._base_locust_test(
+            actorCPU="250m",
+            cpuCores=1,
+            cpuDutyCycle=0.25,
+            flags=["--min-wait-time", "1.0"],
+        )
+        orchestrator.validate_and_normalize_tests([t])
+        self.assertEqual(
+            t["flags"],
+            [
+                "--min-wait-time",
+                "1.0",
+                "--cpu-cores",
+                "1",
+                "--cpu-duty-cycle",
+                "0.25",
+            ],
+        )
+
+    def test_explicit_cpu_flags_not_duplicated(self):
+        t = self._base_locust_test(
+            cpuCores="1",
+            cpuDutyCycle="0.1",
+            flags=["--cpu-cores", "2", "--cpu-duty-cycle=0.5"],
+        )
+        orchestrator.validate_and_normalize_tests([t])
+        self.assertEqual(t["flags"], ["--cpu-cores", "2", "--cpu-duty-cycle=0.5"])
+
+    def test_invalid_actor_cpu_rejected(self):
+        for bad in ("", "   ", True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    orchestrator.validate_and_normalize_tests(
+                        [self._base_locust_test(actorCPU=bad)]
+                    )
+
+    def test_invalid_cpu_cores_rejected(self):
+        for bad in (-1, "1.5", "abc", True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    orchestrator.validate_and_normalize_tests(
+                        [self._base_locust_test(cpuCores=bad)]
+                    )
+
+    def test_invalid_cpu_duty_cycle_rejected(self):
+        for bad in (-0.1, 1.5, "abc", False):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    orchestrator.validate_and_normalize_tests(
+                        [self._base_locust_test(cpuDutyCycle=bad)]
+                    )
 
 
 class RunnerSizingTest(unittest.TestCase):

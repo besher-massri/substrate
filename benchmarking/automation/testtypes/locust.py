@@ -26,11 +26,56 @@ from util import build_and_push
 TEST_TYPE = "locust"
 
 
+def _has_flag(flags: list[Any], flag: str) -> bool:
+    prefix = f"{flag}="
+    return any(str(f) == flag or str(f).startswith(prefix) for f in flags)
+
+
 def validate(test: dict[str, Any]) -> None:
     name = test.get("name")
     for field in ("file", "duration", "users"):
         if field not in test:
             raise ValueError(f"locust test {name!r} missing {field!r}")
+    if "cpuCores" in test:
+        raw_cores = test["cpuCores"]
+        if isinstance(raw_cores, bool):
+            raise ValueError(
+                f"locust test {name!r} has invalid cpuCores {raw_cores!r} (want int >= 0)"
+            )
+        try:
+            cores = int(str(raw_cores).strip())
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"locust test {name!r} has invalid cpuCores {raw_cores!r} (want int >= 0)"
+            ) from e
+        if cores < 0 or str(cores) != str(raw_cores).strip():
+            raise ValueError(
+                f"locust test {name!r} has invalid cpuCores {raw_cores!r} (want int >= 0)"
+            )
+        flags = list(test.get("flags", []))
+        if not _has_flag(flags, "--cpu-cores"):
+            flags.extend(["--cpu-cores", str(cores)])
+            test["flags"] = flags
+    if "cpuDutyCycle" in test:
+        raw_duty = test["cpuDutyCycle"]
+        if isinstance(raw_duty, bool):
+            raise ValueError(
+                f"locust test {name!r} has invalid cpuDutyCycle {raw_duty!r} (want float in [0.0, 1.0])"
+            )
+        try:
+            duty = float(str(raw_duty).strip())
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"locust test {name!r} has invalid cpuDutyCycle {raw_duty!r} (want float in [0.0, 1.0])"
+            ) from e
+        if not (0.0 <= duty <= 1.0):
+            raise ValueError(
+                f"locust test {name!r} has invalid cpuDutyCycle {raw_duty!r} (want float in [0.0, 1.0])"
+            )
+        flags = list(test.get("flags", []))
+        if not _has_flag(flags, "--cpu-duty-cycle"):
+            flags.extend(["--cpu-duty-cycle", str(raw_duty).strip()])
+            test["flags"] = flags
 
 
 def build_image(commit: str) -> str:

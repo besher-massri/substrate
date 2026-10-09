@@ -32,6 +32,10 @@
 #                  deploy that runs before this test. The orchestrator
 #                  redeploys workloads between tests, so each test can
 #                  pick its own scale.
+#   actorCPU       Optional (default "1"). CPU limit on the benchmark
+#                  ActorTemplates (booked against worker capacity by the
+#                  scheduler and enforced on the actor sandbox). Accepts
+#                  Kubernetes CPU quantities such as "1" or "250m".
 #   actorMemory    Optional (default "256Mi", the smallest size microvm
 #                  admits). Memory limit on the benchmark ActorTemplates;
 #                  raise it for suites that exercise glutton's WriteRAM path.
@@ -61,7 +65,10 @@
 # Job, with --tag set to the build commit hash and --dest from the
 # orchestrator's --dest flag. `file`, `duration` and `users` are required.
 # Optional `flags` is a list of arbitrary strings appended to runner.py's
-# argv; runner.py forwards them to locust verbatim.
+# argv; runner.py forwards them to locust verbatim. Optional `cpuCores` (int
+# >= 0) and `cpuDutyCycle` (float in [0.0, 1.0]) are convenience fields that
+# append `--cpu-cores <N>` and `--cpu-duty-cycle <F>` to `flags` when not
+# already present, configuring glutton's background CPU burner per actor.
 #
 # Optional `runnerCpu` (default "500m") and `runnerMemory` (default "512Mi")
 # are the runner pod's requests. They are requests only, no limits, so the
