@@ -335,3 +335,117 @@ var zeroBlock = make([]byte, sparseBlock)
 func allZero(b []byte) bool {
 	return bytes.Equal(b, zeroBlock[:len(b)])
 }
+
+// DeflateAgainstBase turns a complete memory-ranges snapshot (targetFile) into a
+// sparse differential overlay against an immutable base memory-ranges (baseFile)
+// in place. Every 4 KiB page in targetFile that is byte-identical to baseFile is
+// punched into a hole (FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE), while any page
+// where baseFile was non-zero and targetFile is all zeros is explicitly written as
+// an allocated zero block (SEEK_DATA) so that MergeSparseOverlay(ctx, baseFile,
+// targetFile, outFile) — including after a sparse-zstd upload/download round-trip —
+// reconstructs the exact original targetFile byte-for-byte.
+func DeflateAgainstBase(ctx context.Context, baseFile, targetFile string) error {
+	bf, err := os.Open(baseFile)
+	if err != nil {
+		return fmt.Errorf("open base %q: %w", baseFile, err)
+	}
+	defer bf.Close()
+	bi, err := bf.Stat()
+	if err != nil {
+		return err
+	}
+
+	tf, err := os.OpenFile(targetFile, os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open target %q: %w", targetFile, err)
+	}
+	defer tf.Close()
+	ti, err := tf.Stat()
+	if err != nil {
+		return err
+	}
+	if bi.Size() != ti.Size() {
+		return fmt.Errorf("DeflateAgainstBase: size mismatch base=%d target=%d", bi.Size(), ti.Size())
+	}
+
+	size := ti.Size()
+	bfd := int(bf.Fd())
+	tfd := int(tf.Fd())
+	const chunkSize = 1 << 20
+	bBuf := make([]byte, chunkSize)
+	tBuf := make([]byte, chunkSize)
+
+	for off := int64(0); off < size; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		bData, bErr := unix.Seek(bfd, off, unix.SEEK_DATA)
+		if bErr != nil {
+			if errors.Is(bErr, unix.ENXIO) {
+				bData = size
+			} else {
+				return fmt.Errorf("base SEEK_DATA: %w", bErr)
+			}
+		}
+		tData, tErr := unix.Seek(tfd, off, unix.SEEK_DATA)
+		if tErr != nil {
+			if errors.Is(tErr, unix.ENXIO) {
+				tData = size
+			} else {
+				return fmt.Errorf("target SEEK_DATA: %w", tErr)
+			}
+		}
+		nextData := min(bData, tData)
+		nextData &= ^int64(sparseBlock - 1)
+		if nextData < off {
+			nextData = off
+		}
+		if nextData >= size {
+			break
+		}
+
+		n := min(int64(chunkSize), size-nextData)
+		if _, err := bf.ReadAt(bBuf[:n], nextData); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read base at %d: %w", nextData, err)
+		}
+		if _, err := tf.ReadAt(tBuf[:n], nextData); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read target at %d: %w", nextData, err)
+		}
+
+		punchStart := int64(-1)
+		for i := int64(0); i < n; i += sparseBlock {
+			end := min(i+sparseBlock, n)
+			bPage := bBuf[i:end]
+			tPage := tBuf[i:end]
+			pageOff := nextData + i
+			if bytes.Equal(bPage, tPage) {
+				if punchStart < 0 {
+					punchStart = pageOff
+				}
+				continue
+			}
+			if punchStart >= 0 {
+				if err := unix.Fallocate(tfd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, punchStart, pageOff-punchStart); err != nil {
+					return fmt.Errorf("punch hole [%d, %d): %w", punchStart, pageOff, err)
+				}
+				punchStart = -1
+			}
+			if allZero(tPage) {
+				// basePage was non-zero and targetPage is zero: ensure targetFile has an
+				// allocated (SEEK_DATA) zero block so sparse-zstd + MergeSparseOverlay
+				// overwrites baseFile's non-zero page with zeros.
+				if _, err := tf.WriteAt(zeroBlock[:len(tPage)], pageOff); err != nil {
+					return fmt.Errorf("write zero block at %d: %w", pageOff, err)
+				}
+			}
+		}
+		if punchStart >= 0 {
+			endOff := nextData + n
+			if err := unix.Fallocate(tfd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, punchStart, endOff-punchStart); err != nil {
+				return fmt.Errorf("punch hole [%d, %d): %w", punchStart, endOff, err)
+			}
+		}
+		off = nextData + n
+	}
+	return tf.Close()
+}

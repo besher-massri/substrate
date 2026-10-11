@@ -19,10 +19,14 @@ package ch
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/agent-substrate/substrate/pkg/objectstorage"
 )
 
 // region is a populated byte range written into a sparse test image.
@@ -277,5 +281,158 @@ func TestCopySparseFileLeavesZeroBlocksAsHoles(t *testing.T) {
 	// st.Blocks counts 512-byte units; allow slack for the filesystem's block size.
 	if allocated := st.Blocks * 512; allocated > 64<<10 {
 		t.Errorf("dst allocates %d bytes, want the zero runs left as holes", allocated)
+	}
+}
+
+type memGCS struct {
+	data []byte
+}
+
+func (m *memGCS) PutObject(_ context.Context, _, _ string, r io.Reader) error {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	m.data = b
+	return nil
+}
+
+func (m *memGCS) GetObject(_ context.Context, _, _ string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(m.data)), nil
+}
+
+// TestDeflateAgainstBaseRoundTrip verifies that deflating a warm snapshot against
+// a golden base, shipping the deflated delta through sparse-zstd compression, and
+// reconstructing via MergeSparseOverlay yields the exact byte-for-byte original
+// warm snapshot (including pages that are identical to base, modified non-zero
+// pages, newly populated pages, and pages that were non-zero in base and zeroed
+// out in the warm snapshot).
+func TestDeflateAgainstBaseRoundTrip(t *testing.T) {
+	const size = 4 << 20 // 4 MiB logical
+	baseRegions := []region{
+		{off: 0, data: fill(1, 64*4096)},        // 256 KiB unchanged in target
+		{off: 1 << 20, data: fill(2, 4*4096)},   // 16 KiB modified in target
+		{off: 2 << 20, data: fill(3, 4*4096)},   // 16 KiB zeroed out in target!
+		{off: 3 << 20, data: fill(4, 128*4096)}, // 512 KiB unchanged in target
+	}
+	targetRegions := []region{
+		{off: 0, data: fill(1, 64*4096)},        // identical to base
+		{off: 1 << 20, data: fill(99, 4*4096)},  // modified non-zero
+		{off: 2<<20 + 16*4096, data: fill(77, 2*4096)}, // newly populated where base had a hole
+		{off: 3 << 20, data: fill(4, 128*4096)}, // identical to base
+	}
+	want := make([]byte, size)
+	for _, r := range targetRegions {
+		copy(want[r.off:], r.data)
+	}
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base")
+	targetPath := filepath.Join(dir, "target")
+	writeSparse(t, basePath, size, baseRegions)
+	writeSparse(t, targetPath, size, targetRegions)
+
+	if err := DeflateAgainstBase(ctx, basePath, targetPath); err != nil {
+		t.Fatalf("DeflateAgainstBase: %v", err)
+	}
+
+	// Ship targetPath through sparse-zstd (SendFileToGCSWithZstd -> FetchFileFromGCSWithZstd).
+	gcs := &memGCS{}
+	tf, err := os.Open(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objectstorage.SendFileToGCSWithZstd(ctx, gcs, "gs://b/delta.zstd", tf); err != nil {
+		tf.Close()
+		t.Fatalf("SendFileToGCSWithZstd: %v", err)
+	}
+	tf.Close()
+
+	// The compressed delta should be tiny (< 32 KiB) even though base+target have >768 KiB of random data.
+	if len(gcs.data) > 32<<10 {
+		t.Errorf("compressed delta size = %d bytes, want < 32 KiB (unchanged base pages should be holes)", len(gcs.data))
+	}
+
+	fetchedDelta := filepath.Join(dir, "fetched-delta")
+	df, err := os.OpenFile(fetchedDelta, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objectstorage.FetchFileFromGCSWithZstd(ctx, gcs, "gs://b/delta.zstd", df); err != nil {
+		df.Close()
+		t.Fatalf("FetchFileFromGCSWithZstd: %v", err)
+	}
+	df.Close()
+
+	reconstructed := filepath.Join(dir, "reconstructed")
+	if err := MergeSparseOverlay(ctx, basePath, fetchedDelta, reconstructed); err != nil {
+		t.Fatalf("MergeSparseOverlay: %v", err)
+	}
+
+	got, err := os.ReadFile(reconstructed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sha256.Sum256(got) != sha256.Sum256(want) {
+		t.Fatalf("reconstructed SHA256 != original target SHA256")
+	}
+
+	// If real microvm snapshots are staged in /tmp/uvm_snap_inspect, verify
+	// bit-for-bit SHA256 roundtrip and measure latency & compression ratio.
+	snap2 := "/tmp/uvm_snap_inspect/snap2/memory-ranges"
+	snap3 := "/tmp/uvm_snap_inspect/snap3/memory-ranges"
+	if _, err := os.Stat(snap2); err == nil {
+		if _, err := os.Stat(snap3); err == nil {
+			t.Run("RealStep5MicroVMSnapshots", func(t *testing.T) {
+				orig3, err := os.ReadFile(snap3)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantHash := sha256.Sum256(orig3)
+
+				workTarget := filepath.Join(dir, "snap3-work")
+				if err := copySparseFile(ctx, snap3, workTarget); err != nil {
+					t.Fatal(err)
+				}
+				if err := DeflateAgainstBase(ctx, snap2, workTarget); err != nil {
+					t.Fatalf("DeflateAgainstBase(snap2, snap3): %v", err)
+				}
+				realGCS := &memGCS{}
+				wf, err := os.Open(workTarget)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := objectstorage.SendFileToGCSWithZstd(ctx, realGCS, "gs://b/snap3-delta.zstd", wf); err != nil {
+					wf.Close()
+					t.Fatal(err)
+				}
+				wf.Close()
+				t.Logf("Real Step 5 microVM compressed delta size: %d bytes (%.2f MiB)", len(realGCS.data), float64(len(realGCS.data))/(1024*1024))
+
+				fetched := filepath.Join(dir, "snap3-fetched")
+				ff, err := os.OpenFile(fetched, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := objectstorage.FetchFileFromGCSWithZstd(ctx, realGCS, "gs://b/snap3-delta.zstd", ff); err != nil {
+					ff.Close()
+					t.Fatal(err)
+				}
+				ff.Close()
+
+				rebuilt := filepath.Join(dir, "snap3-rebuilt")
+				if err := MergeSparseOverlay(ctx, snap2, fetched, rebuilt); err != nil {
+					t.Fatal(err)
+				}
+				got3, err := os.ReadFile(rebuilt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sha256.Sum256(got3) != wantHash {
+					t.Fatalf("real Step 5 microVM rebuilt SHA256 mismatch")
+				}
+			})
+		}
 	}
 }

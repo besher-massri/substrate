@@ -293,6 +293,28 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 			slog.String("id", actorUID), slog.Duration("merge", time.Since(tMerge)))
 	}
 
+	checkpointMem := filepath.Join(checkpointDir, "memory-ranges")
+	if actorUID == baseID {
+		ensureGoldenBaseCached(ctx, checkpointDir, baseID, checkpointMem)
+	} else if cacheDir, ok := goldenBaseCacheDir(checkpointDir, baseID); ok {
+		cacheFile := filepath.Join(cacheDir, "memory-ranges")
+		if _, err := os.Stat(cacheFile); err == nil {
+			tDeflate := time.Now()
+			if err := ch.DeflateAgainstBase(ctx, cacheFile, checkpointMem); err != nil {
+				return 0, fmt.Errorf("while deflating snapshot against golden base: %w", err)
+			}
+			marker := []byte("1\n")
+			if srcURI, rerr := os.ReadFile(filepath.Join(cacheDir, "source-uri")); rerr == nil && len(srcURI) > 0 {
+				marker = srcURI
+			}
+			if err := os.WriteFile(filepath.Join(checkpointDir, goldenDeltaFile), marker, 0o600); err != nil {
+				return 0, fmt.Errorf("while writing %s: %w", goldenDeltaFile, err)
+			}
+			slog.InfoContext(ctx, "Deflated warm snapshot against golden base",
+				slog.String("id", actorUID), slog.String("base_id", baseID), slog.Duration("deflate", time.Since(tDeflate)))
+		}
+	}
+
 	// The RO lower never ships (reconstructed from the OCI image at restore).
 	// The disk-backed upper ships as its own tar from CheckpointWorkload; a
 	return dSnapshot, nil

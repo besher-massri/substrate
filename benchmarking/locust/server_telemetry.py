@@ -241,7 +241,7 @@ def _psi_query(
     """
     return (
         f'sum by ({by}) (rate(container_pressure_{resource}_waiting_seconds_total'
-        f'{{{selector}}}[1m])) * 100'
+        f'{{{selector}}}[2m])) * 100'
     )
 
 

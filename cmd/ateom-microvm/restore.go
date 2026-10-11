@@ -76,9 +76,20 @@ func reseedGuestCRNG(ctx context.Context, ac *kata.AgentClient) error {
 	if err != nil {
 		return err
 	}
-	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return ac.ReseedRandomDev(rctx, nonce)
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		lastErr = ac.ReseedRandomDev(rctx, nonce)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return lastErr
 }
 
 // newReseedNonce returns 32 bytes of fresh entropy to mix into the guest CRNG.
@@ -235,6 +246,24 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		if v := strings.TrimSpace(string(b)); v != "" {
 			srcID = v
 		}
+	}
+	deltaMarker := filepath.Join(restoreDir, goldenDeltaFile)
+	restoreMem := filepath.Join(restoreDir, "memory-ranges")
+	if _, derr := os.Stat(deltaMarker); derr == nil {
+		cacheDir, ok := goldenBaseCacheDir(restoreDir, srcID)
+		if !ok {
+			return fmt.Errorf("golden-delta snapshot present but invalid base-id %q", srcID)
+		}
+		cacheFile := filepath.Join(cacheDir, "memory-ranges")
+		tReconstruct := time.Now()
+		if err := ch.MergeSparseOverlay(ctx, cacheFile, restoreMem, restoreMem); err != nil {
+			return fmt.Errorf("while reconstructing warm snapshot from golden base %q: %w", srcID, err)
+		}
+		_ = os.Remove(deltaMarker)
+		slog.InfoContext(ctx, "Reconstructed warm snapshot from golden base",
+			slog.String("id", actorUID), slog.String("base_id", srcID), slog.Duration("reconstruct", time.Since(tReconstruct)))
+	} else {
+		ensureGoldenBaseCached(ctx, restoreDir, srcID, restoreMem)
 	}
 	if err := os.MkdirAll(kata.VMDir(actorUID), 0o700); err != nil {
 		return fmt.Errorf("while creating VM dir: %w", err)

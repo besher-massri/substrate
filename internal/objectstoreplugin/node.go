@@ -23,11 +23,15 @@ package objectstoreplugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/objectstorage"
@@ -40,7 +44,12 @@ import (
 // This plugin stores each file as <name>.zstd, except manifestFile, which it
 // stores as-is so that snapshots written before atelet used this plugin stay
 // readable.
-const manifestFile = "manifest.json"
+const (
+	manifestFile    = "manifest.json"
+	baseIDFile      = "base-id"
+	memoryRangesFile = "memory-ranges"
+	goldenDeltaFile = "golden-delta"
+)
 
 // NodePlugin serves NodeProvider on an object storage client.
 type NodePlugin struct {
@@ -49,6 +58,9 @@ type NodePlugin struct {
 	gcsClient objectstorage.ObjectStorage
 	// root confines every local path a caller names.
 	root string
+
+	cacheMu   sync.Mutex
+	keyLocks  map[string]*sync.Mutex
 }
 
 // NewNodePlugin returns a NodePlugin that reads and writes local files only
@@ -57,7 +69,33 @@ func NewNodePlugin(gcsClient objectstorage.ObjectStorage, root string) (*NodePlu
 	if !filepath.IsAbs(root) {
 		return nil, fmt.Errorf("root %q is not an absolute path", root)
 	}
-	return &NodePlugin{gcsClient: gcsClient, root: filepath.Clean(root)}, nil
+	return &NodePlugin{
+		gcsClient: gcsClient,
+		root:      filepath.Clean(root),
+		keyLocks:  make(map[string]*sync.Mutex),
+	}, nil
+}
+
+func (p *NodePlugin) keyLock(key string) *sync.Mutex {
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+	mu, ok := p.keyLocks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		p.keyLocks[key] = mu
+	}
+	return mu
+}
+
+func isCacheableTagURI(uri resources.SnapshotURI) bool {
+	if os.Getenv("ATE_DISABLE_GOLDEN_SNAPSHOT_CACHE") == "true" {
+		return false
+	}
+	return uri.OwnedBy(resources.TagSnapshotOwner(uri.Atespace(), uri.Name()))
+}
+
+func validLocalID(id string) bool {
+	return id != "" && id != "." && !strings.Contains(id, "/") && filepath.IsLocal(id)
 }
 
 // FetchSnapshot downloads the requested snapshot files into write_path.
@@ -71,6 +109,13 @@ func (p *NodePlugin) FetchSnapshot(ctx context.Context, req *objectstoresnapshot
 		return nil, toStatus(fmt.Errorf("while opening restore directory: %w", err))
 	}
 	defer root.Close()
+
+	if isCacheableTagURI(uri) {
+		if err := p.fetchCachedTagSnapshot(ctx, uri, dstDir, root, req.GetFiles()); err != nil {
+			return nil, toStatus(err)
+		}
+		return &objectstoresnapshotv1.FetchSnapshotResponse{}, nil
+	}
 
 	g, gCtx := errgroup.WithContext(ctx)
 	for _, fileName := range req.GetFiles() {
@@ -98,7 +143,188 @@ func (p *NodePlugin) FetchSnapshot(ctx context.Context, req *objectstoresnapshot
 	if err := g.Wait(); err != nil {
 		return nil, toStatus(err)
 	}
+	if err := p.ensureGoldenBaseFromDelta(ctx, root); err != nil {
+		return nil, toStatus(err)
+	}
 	return &objectstoresnapshotv1.FetchSnapshotResponse{}, nil
+}
+
+func (p *NodePlugin) fetchCachedTagSnapshot(ctx context.Context, uri resources.SnapshotURI, dstDir string, root *os.Root, files []string) error {
+	cacheHash := fmt.Sprintf("%x", sha256.Sum256([]byte(uri.String())))
+	cacheDir := filepath.Join(p.root, "golden-snapshot-cache", cacheHash)
+
+	mu := p.keyLock("tag:" + cacheHash)
+	mu.Lock()
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		mu.Unlock()
+		return fmt.Errorf("while creating golden snapshot cache directory: %w", err)
+	}
+	var missing []string
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(cacheDir, f)); err != nil {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) > 0 {
+		g, gCtx := errgroup.WithContext(ctx)
+		for _, fileName := range missing {
+			fileName := fileName
+			g.Go(func() error {
+				dstFile := filepath.Join(cacheDir, fileName)
+				tmpFile := fmt.Sprintf("%s.tmp.%d", dstFile, time.Now().UnixNano())
+				defer os.Remove(tmpFile)
+				if fileName == manifestFile {
+					manifestURI, err := uri.ObjectURI(manifestFile)
+					if err != nil {
+						return err
+					}
+					b, err := objectstorage.FetchFromGCS(gCtx, p.gcsClient, manifestURI)
+					if err != nil {
+						return fmt.Errorf("while fetching snapshot manifest: %w", err)
+					}
+					if err := os.WriteFile(tmpFile, b, 0o600); err != nil {
+						return err
+					}
+					return os.Rename(tmpFile, dstFile)
+				}
+				objectURI, err := uri.ObjectURI(fileName + ".zstd")
+				if err != nil {
+					return fmt.Errorf("while addressing %s in GCS: %w", fileName, err)
+				}
+				local, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+				if err != nil {
+					return err
+				}
+				fetchErr := objectstorage.FetchFileFromGCSWithZstd(gCtx, p.gcsClient, objectURI, local)
+				closeErr := local.Close()
+				if err := errors.Join(fetchErr, closeErr); err != nil {
+					return fmt.Errorf("while downloading %s from GCS: %w", fileName, err)
+				}
+				return os.Rename(tmpFile, dstFile)
+			})
+		}
+		if err := g.Wait(); err != nil {
+			mu.Unlock()
+			return err
+		}
+	}
+	// If this cached tag snapshot holds base-id and memory-ranges, also link it
+	// under golden-base-cache/<baseID> so ateom-microvm can deflate/reconstruct
+	// warm deltas on this node.
+	if b, err := os.ReadFile(filepath.Join(cacheDir, baseIDFile)); err == nil {
+		baseID := strings.TrimSpace(string(b))
+		memPath := filepath.Join(cacheDir, memoryRangesFile)
+		if validLocalID(baseID) {
+			if _, merr := os.Stat(memPath); merr == nil {
+				objURI, _ := uri.ObjectURI(memoryRangesFile + ".zstd")
+				p.linkGoldenBaseCache(baseID, memPath, objURI)
+			}
+		}
+	}
+	mu.Unlock()
+
+	for _, fileName := range files {
+		cachedPath := filepath.Join(cacheDir, fileName)
+		if fileName == memoryRangesFile {
+			if fi, err := root.Lstat(fileName); err == nil {
+				if fi.Mode()&os.ModeSymlink != 0 {
+					return fmt.Errorf("restore file %s is a symlink", fileName)
+				}
+				_ = root.Remove(fileName)
+			}
+			if err := os.Link(cachedPath, filepath.Join(p.root, dstDir, fileName)); err == nil {
+				continue
+			}
+		}
+		src, err := os.Open(cachedPath)
+		if err != nil {
+			return err
+		}
+		dst, err := root.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			src.Close()
+			return fmt.Errorf("while opening %s in restore directory: %w", fileName, err)
+		}
+		_, copyErr := io.Copy(dst, src)
+		closeErr := dst.Close()
+		src.Close()
+		if err := errors.Join(copyErr, closeErr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *NodePlugin) linkGoldenBaseCache(baseID, srcMemPath, sourceObjectURI string) {
+	if !validLocalID(baseID) {
+		return
+	}
+	baseDir := filepath.Join(p.root, "golden-base-cache", baseID)
+	baseMem := filepath.Join(baseDir, memoryRangesFile)
+	if _, err := os.Stat(baseMem); err == nil {
+		return
+	}
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		return
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", baseMem, time.Now().UnixNano())
+	_ = os.Remove(tmp)
+	if err := os.Link(srcMemPath, tmp); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, baseMem); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	if sourceObjectURI != "" {
+		_ = os.WriteFile(filepath.Join(baseDir, "source-uri"), []byte(sourceObjectURI), 0o600)
+	}
+}
+
+func (p *NodePlugin) ensureGoldenBaseFromDelta(ctx context.Context, root *os.Root) error {
+	deltaBytes, err := root.ReadFile(goldenDeltaFile)
+	if err != nil {
+		return nil // Not a golden-delta snapshot
+	}
+	baseBytes, err := root.ReadFile(baseIDFile)
+	if err != nil {
+		return nil
+	}
+	baseID := strings.TrimSpace(string(baseBytes))
+	if !validLocalID(baseID) {
+		return nil
+	}
+	baseDir := filepath.Join(p.root, "golden-base-cache", baseID)
+	baseMem := filepath.Join(baseDir, memoryRangesFile)
+	if _, err := os.Stat(baseMem); err == nil {
+		return nil
+	}
+	sourceObjectURI := strings.TrimSpace(string(deltaBytes))
+	if !strings.HasPrefix(sourceObjectURI, "gs://") && !strings.HasPrefix(sourceObjectURI, "s3://") {
+		return nil
+	}
+	mu := p.keyLock("base:" + baseID)
+	mu.Lock()
+	defer mu.Unlock()
+	if _, err := os.Stat(baseMem); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", baseMem, time.Now().UnixNano())
+	defer os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	fetchErr := objectstorage.FetchFileFromGCSWithZstd(ctx, p.gcsClient, sourceObjectURI, f)
+	closeErr := f.Close()
+	if err := errors.Join(fetchErr, closeErr); err != nil {
+		return fmt.Errorf("while fetching golden base %s from %s: %w", baseID, sourceObjectURI, err)
+	}
+	_ = os.WriteFile(filepath.Join(baseDir, "source-uri"), []byte(sourceObjectURI), 0o600)
+	return os.Rename(tmp, baseMem)
 }
 
 // UploadSnapshot uploads the requested files from local_path into the
@@ -145,6 +371,18 @@ func (p *NodePlugin) UploadSnapshot(ctx context.Context, req *objectstoresnapsho
 	}
 	if err := g.Wait(); err != nil {
 		return nil, toStatus(err)
+	}
+	if b, err := root.ReadFile(baseIDFile); err == nil {
+		baseID := strings.TrimSpace(string(b))
+		if validLocalID(baseID) && uri.OwnedBy(resources.ActorSnapshotOwner(uri.Atespace(), baseID)) {
+			if _, derr := root.Stat(goldenDeltaFile); errors.Is(derr, os.ErrNotExist) {
+				memPath := filepath.Join(p.root, srcDir, memoryRangesFile)
+				if _, merr := os.Stat(memPath); merr == nil {
+					objURI, _ := uri.ObjectURI(memoryRangesFile + ".zstd")
+					p.linkGoldenBaseCache(baseID, memPath, objURI)
+				}
+			}
+		}
 	}
 	return &objectstoresnapshotv1.UploadSnapshotResponse{}, nil
 }

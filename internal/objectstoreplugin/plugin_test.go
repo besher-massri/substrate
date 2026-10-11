@@ -446,6 +446,65 @@ func TestCopySnapshot(t *testing.T) {
 	}
 }
 
+func TestFetchTagSnapshotUsesNodeCache(t *testing.T) {
+	ctx := context.Background()
+	backend := newMemObjects()
+	root := t.TempDir()
+	conn := serve(t, backend, root)
+	nodeClient := objectstoresnapshotv1.NewNodeProviderClient(conn)
+	ctrlClient := objectstoresnapshotv1.NewControlProviderClient(conn)
+
+	src := filepath.Join(root, "src")
+	dst1 := filepath.Join(root, "dst1")
+	dst2 := filepath.Join(root, "dst2")
+	for _, d := range []string{src, dst1, dst2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantMem := bytes.Repeat([]byte("golden-page-"), 4096)
+	if err := os.WriteFile(filepath.Join(src, baseIDFile), []byte("uid1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, memoryRangesFile), wantMem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodeClient.UploadSnapshot(ctx, &objectstoresnapshotv1.UploadSnapshotRequest{
+		SnapshotUri: testURI, LocalPath: src, Files: []string{baseIDFile, memoryRangesFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot = %v", err)
+	}
+	tagURI := "gs://" + testBucket + "/root/atespaces/ate-golden/tags/tag1"
+	if _, err := ctrlClient.CopySnapshot(ctx, &objectstoresnapshotv1.CopySnapshotRequest{SrcUri: testURI, DstUri: tagURI}); err != nil {
+		t.Fatalf("CopySnapshot = %v", err)
+	}
+
+	// First fetch from the tag populates the node-local cache.
+	if _, err := nodeClient.FetchSnapshot(ctx, &objectstoresnapshotv1.FetchSnapshotRequest{
+		SnapshotUri: tagURI, WritePath: dst1, Files: []string{baseIDFile, memoryRangesFile},
+	}); err != nil {
+		t.Fatalf("first FetchSnapshot(tag) = %v", err)
+	}
+
+	// Delete all objects from backend: a second fetch of the same tag must hit the node cache.
+	for _, k := range backend.keys() {
+		parts := strings.SplitN(k, "/", 2)
+		_ = backend.Delete(ctx, parts[0], parts[1])
+	}
+	if _, err := nodeClient.FetchSnapshot(ctx, &objectstoresnapshotv1.FetchSnapshotRequest{
+		SnapshotUri: tagURI, WritePath: dst2, Files: []string{baseIDFile, memoryRangesFile},
+	}); err != nil {
+		t.Fatalf("second FetchSnapshot(tag) after backend wipe = %v (expected node cache hit)", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst2, memoryRangesFile))
+	if err != nil || !bytes.Equal(got, wantMem) {
+		t.Fatalf("cached memory-ranges mismatch")
+	}
+	if _, err := os.Stat(filepath.Join(root, "golden-base-cache", "uid1", memoryRangesFile)); err != nil {
+		t.Errorf("golden-base-cache not populated: %v", err)
+	}
+}
+
 func equal(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
