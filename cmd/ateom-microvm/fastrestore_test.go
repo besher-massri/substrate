@@ -214,6 +214,46 @@ func TestReadaheadMemoryImage(t *testing.T) {
 	readaheadMemoryImage(context.Background(), f)
 }
 
+// readaheadDataExtents walks a sparse image (data, hole, data, trailing hole)
+// without error, including chunks that straddle an extent end, and stops on a
+// cancelled context.
+func TestReadaheadDataExtents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory-ranges")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	const mib = 1 << 20
+	if err := f.Truncate(16 * mib); err != nil {
+		t.Fatal(err)
+	}
+	for _, off := range []int64{0, 6 * mib} {
+		if _, err := f.WriteAt(make([]byte, 3*mib+12345), off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := readaheadDataExtents(context.Background(), int(f.Fd()), 16*mib, readaheadChunk); err != nil {
+		t.Fatalf("readaheadDataExtents: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := readaheadDataExtents(ctx, int(f.Fd()), 16*mib, readaheadChunk); !errors.Is(err, context.Canceled) {
+		t.Errorf("readaheadDataExtents with a cancelled context = %v, want context.Canceled", err)
+	}
+	empty, err := os.Create(filepath.Join(t.TempDir(), "empty"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer empty.Close()
+	if err := empty.Truncate(4 * mib); err != nil {
+		t.Fatal(err)
+	}
+	if err := readaheadDataExtents(context.Background(), int(empty.Fd()), 4*mib, readaheadChunk); err != nil {
+		t.Errorf("readaheadDataExtents on an all-hole file: %v", err)
+	}
+}
+
 func TestFastRestoreConfigOnDemandPrefault(t *testing.T) {
 	c, err := fastRestoreConfigFromEnv(envMap(map[string]string{envMemoryRestoreMode: "ondemand-prefault"}))
 	if err != nil {

@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -70,10 +71,12 @@ const (
 	// of the rest. It needs a cloud-hypervisor that advertises
 	// ch.FeatureRestoreBackgroundFetchPages in vmm.ping.
 	envOnDemandBackgroundFetch = "ATEOM_MICROVM_ONDEMAND_BACKGROUND_FETCH"
-	// envRestoreReadahead ("true") asks the kernel to start reading the memory
-	// image into the page cache (POSIX_FADV_WILLNEED) as soon as a restore
-	// starts, so the disk reads overlap the rootfs, network and VMM set-up
-	// instead of landing inside vm.restore.
+	// envRestoreReadahead ("true") starts reading the memory image's data into
+	// the page cache (readahead(2) in 128 KiB calls, see readaheadMemoryImage) as
+	// soon as a restore starts, so the disk reads run deep and overlap the
+	// rootfs, network and VMM set-up instead of landing inside vm.restore as one
+	// sequential 128 KiB stream. It matters when the image is not cached, e.g. a
+	// local snapshot written minutes ago on a busy node.
 	envRestoreReadahead = "ATEOM_MICROVM_RESTORE_READAHEAD"
 	// envEarlyVMMLaunch ("true") starts the restore's cloud-hypervisor process
 	// while the rootfs, virtiofsd and tap are still being set up, instead of
@@ -254,9 +257,18 @@ func (c fastRestoreConfig) pickRestoreMemMode(ctx context.Context, info ch.VMMIn
 	return auto, false
 }
 
-// readaheadMemoryImage asks the kernel to start reading path into the page
-// cache now (POSIX_FADV_WILLNEED). It returns immediately; the reads happen in
-// the background. Errors are only logged: this is an optimization.
+// readaheadChunk is the size of each readahead(2) call. The kernel honors at
+// most max(read_ahead_kb, max_sectors_kb) per call (force_page_cache_ra), which
+// is 128–256 KiB on default GKE disks, so one big call would prefetch only its
+// first chunk; many small ones queue the whole image.
+const readaheadChunk = 128 << 10
+
+// readaheadMemoryImage asks the kernel to start reading path's data extents
+// into the page cache now, so the eager restore that follows finds them cached
+// (or in flight) instead of reading the image with one sequential 128 KiB
+// stream. It only submits I/O and returns; it skips holes, which would
+// otherwise fill the page cache with zero pages. Errors are only logged at
+// debug level: this is an optimization.
 func readaheadMemoryImage(ctx context.Context, path string) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -266,9 +278,43 @@ func readaheadMemoryImage(ctx context.Context, path string) {
 		return
 	}
 	defer f.Close()
-	if err := unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_WILLNEED); err != nil {
-		slog.DebugContext(ctx, "restore readahead: fadvise failed", slog.String("path", path), slog.Any("err", err))
+	st, err := f.Stat()
+	if err != nil {
+		return
 	}
+	if err := readaheadDataExtents(ctx, int(f.Fd()), st.Size(), readaheadChunk); err != nil {
+		slog.DebugContext(ctx, "restore readahead failed", slog.String("path", path), slog.Any("err", err))
+	}
+}
+
+// readaheadDataExtents issues readahead(2) over every data extent of fd below
+// size, in calls of at most chunk bytes.
+func readaheadDataExtents(ctx context.Context, fd int, size, chunk int64) error {
+	for off := int64(0); off < size; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		data, err := unix.Seek(fd, off, unix.SEEK_DATA)
+		if err != nil {
+			if errors.Is(err, unix.ENXIO) {
+				return nil // no data past off
+			}
+			return err
+		}
+		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if err != nil {
+			hole = size
+		}
+		hole = min(hole, size)
+		for o := data; o < hole; o += chunk {
+			n := min(chunk, hole-o)
+			if _, _, e := unix.Syscall(unix.SYS_READAHEAD, uintptr(fd), uintptr(o), uintptr(n)); e != 0 {
+				return e
+			}
+		}
+		off = hole
+	}
+	return nil
 }
 
 // sharesInode reports whether path has other hard links (for example the node's
