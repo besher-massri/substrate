@@ -1070,3 +1070,64 @@ func TestBuildDeploymentApplyConfigLogsExporter(t *testing.T) {
 		})
 	}
 }
+
+// Only ATEOM_* variables are forwarded, sorted, and an empty set leaves the
+// ateom container exactly as built.
+func TestAteomPassthroughEnv(t *testing.T) {
+	got := AteomPassthroughEnv([]string{
+		"PATH=/bin",
+		"ATEOM_MICROVM_PARALLEL_WAKEUP=true",
+		"ATEOM_=ignored",
+		"ATEOM_MICROVM_ACTIVATION_CPU_BOOST=max",
+		"NOT_ATEOM_X=1",
+		"malformed",
+	})
+	want := []corev1.EnvVar{
+		{Name: "ATEOM_MICROVM_ACTIVATION_CPU_BOOST", Value: "max"},
+		{Name: "ATEOM_MICROVM_PARALLEL_WAKEUP", Value: "true"},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("AteomPassthroughEnv() mismatch (-want +got):\n%s", diff)
+	}
+	if got := AteomPassthroughEnv([]string{"PATH=/bin"}); len(got) != 0 {
+		t.Errorf("AteomPassthroughEnv() = %v, want none", got)
+	}
+}
+
+func TestWithAteomExtraEnv(t *testing.T) {
+	build := func() *appsv1ac.DeploymentApplyConfiguration {
+		return buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{},
+			installdefaults.SystemNamespace, installdefaults.AteletServiceAccount, installdefaults.RouterServiceAccount)
+	}
+	base := build()
+	unchanged := build()
+	withAteomExtraEnv(unchanged, nil)
+	if diff := cmp.Diff(base, unchanged); diff != "" {
+		t.Errorf("no extra env changed the Deployment (-want +got):\n%s", diff)
+	}
+
+	dep := build()
+	withAteomExtraEnv(dep, []corev1.EnvVar{{Name: "ATEOM_MICROVM_ACTIVATION_CPU_BOOST", Value: "max"}})
+	var ateom *corev1ac.ContainerApplyConfiguration
+	for i, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name != nil && *c.Name == "ateom" {
+			ateom = &dep.Spec.Template.Spec.Containers[i]
+		}
+	}
+	if ateom == nil {
+		t.Fatal("no ateom container")
+	}
+	last := ateom.Env[len(ateom.Env)-1]
+	if last.Name == nil || *last.Name != "ATEOM_MICROVM_ACTIVATION_CPU_BOOST" || last.Value == nil || *last.Value != "max" {
+		t.Errorf("last ateom env = %+v, want ATEOM_MICROVM_ACTIVATION_CPU_BOOST=max", last)
+	}
+	baseEnv := 0
+	for _, c := range base.Spec.Template.Spec.Containers {
+		if c.Name != nil && *c.Name == "ateom" {
+			baseEnv = len(c.Env)
+		}
+	}
+	if len(ateom.Env) != baseEnv+1 {
+		t.Errorf("ateom env has %d entries, want %d", len(ateom.Env), baseEnv+1)
+	}
+}

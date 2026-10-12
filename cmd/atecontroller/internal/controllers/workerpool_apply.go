@@ -16,6 +16,8 @@ package controllers
 
 import (
 	"slices"
+	"sort"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -643,4 +645,42 @@ func nodeSelectorRequirementToApply(req *corev1.NodeSelectorRequirement) *corev1
 		ac.WithValues(req.Values...)
 	}
 	return ac
+}
+
+// AteomEnvPrefix marks the controller environment variables forwarded to every
+// ateom container (see AteomPassthroughEnv). It is how a deployment opts worker
+// runtimes into ateom settings that have no WorkerPool field, such as the
+// ateom-microvm restore-latency knobs (ATEOM_MICROVM_*). With none set, worker
+// pods are exactly what they were.
+const AteomEnvPrefix = "ATEOM_"
+
+// AteomPassthroughEnv returns the AteomEnvPrefix entries of environ (in
+// os.Environ form), sorted by name so the rendered Deployment is stable.
+func AteomPassthroughEnv(environ []string) []corev1.EnvVar {
+	var out []corev1.EnvVar
+	for _, kv := range environ {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasPrefix(name, AteomEnvPrefix) || name == AteomEnvPrefix {
+			continue
+		}
+		out = append(out, corev1.EnvVar{Name: name, Value: value})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// withAteomExtraEnv appends env to the ateom container of dep.
+func withAteomExtraEnv(dep *appsv1ac.DeploymentApplyConfiguration, env []corev1.EnvVar) {
+	if len(env) == 0 || dep == nil || dep.Spec == nil || dep.Spec.Template == nil || dep.Spec.Template.Spec == nil {
+		return
+	}
+	ps := dep.Spec.Template.Spec
+	for i := range ps.Containers {
+		if ps.Containers[i].Name == nil || *ps.Containers[i].Name != "ateom" {
+			continue
+		}
+		for _, e := range env {
+			ps.Containers[i].WithEnv(corev1ac.EnvVar().WithName(e.Name).WithValue(e.Value))
+		}
+	}
 }

@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,6 +65,10 @@ type WorkerPoolReconciler struct {
 	SystemNamespace      string
 	AteletServiceAccount string
 	RouterServiceAccount string
+	// AteomExtraEnv is appended to every ateom container's environment (main
+	// forwards the controller's own ATEOM_* variables, see AteomPassthroughEnv).
+	// Empty adds nothing.
+	AteomExtraEnv []corev1.EnvVar
 
 	desiredWorkers metric.Int64ObservableUpDownCounter
 	readyWorkers   metric.Int64ObservableUpDownCounter
@@ -130,6 +135,7 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
 		TracesSamplerArg:     r.OTelTracesSamplerArg,
 		LogsExporter:         r.OTelLogsExporter,
 	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount)
+	withAteomExtraEnv(depAC, r.AteomExtraEnv)
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}
