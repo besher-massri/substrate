@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -94,6 +95,13 @@ func isCacheableTagURI(uri resources.SnapshotURI) bool {
 	return uri.OwnedBy(resources.TagSnapshotOwner(uri.Atespace(), uri.Name()))
 }
 
+func isCacheableActorURI(uri resources.SnapshotURI) bool {
+	if os.Getenv("ATE_CACHE_ACTOR_SNAPSHOTS") != "true" {
+		return false
+	}
+	return !isCacheableTagURI(uri)
+}
+
 func validLocalID(id string) bool {
 	return id != "" && id != "." && !strings.Contains(id, "/") && filepath.IsLocal(id)
 }
@@ -115,6 +123,14 @@ func (p *NodePlugin) FetchSnapshot(ctx context.Context, req *objectstoresnapshot
 			return nil, toStatus(err)
 		}
 		return &objectstoresnapshotv1.FetchSnapshotResponse{}, nil
+	}
+
+	if isCacheableActorURI(uri) {
+		if hit, err := p.tryFetchCachedActorSnapshot(ctx, uri, dstDir, root, req.GetFiles()); err != nil {
+			return nil, toStatus(err)
+		} else if hit {
+			return &objectstoresnapshotv1.FetchSnapshotResponse{}, nil
+		}
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -146,7 +162,127 @@ func (p *NodePlugin) FetchSnapshot(ctx context.Context, req *objectstoresnapshot
 	if err := p.ensureGoldenBaseFromDelta(ctx, root); err != nil {
 		return nil, toStatus(err)
 	}
+	if isCacheableActorURI(uri) {
+		p.cacheActorSnapshot(uri, dstDir, req.GetFiles())
+	}
 	return &objectstoresnapshotv1.FetchSnapshotResponse{}, nil
+}
+
+func (p *NodePlugin) actorSnapshotCachePaths(uri resources.SnapshotURI) (actorHash, actorCacheRoot, snapKey, snapCacheDir string, ok bool) {
+	actorDirKey := path.Dir(uri.String())
+	snapKey = path.Base(uri.String())
+	if !validLocalID(snapKey) {
+		return "", "", "", "", false
+	}
+	actorHash = fmt.Sprintf("%x", sha256.Sum256([]byte(actorDirKey)))[:24]
+	actorCacheRoot = filepath.Join(p.root, "actor-snapshot-cache", actorHash)
+	snapCacheDir = filepath.Join(actorCacheRoot, snapKey)
+	return actorHash, actorCacheRoot, snapKey, snapCacheDir, true
+}
+
+func (p *NodePlugin) tryFetchCachedActorSnapshot(ctx context.Context, uri resources.SnapshotURI, dstDir string, root *os.Root, files []string) (bool, error) {
+	actorHash, _, _, snapCacheDir, ok := p.actorSnapshotCachePaths(uri)
+	if !ok {
+		return false, nil
+	}
+	mu := p.keyLock("actor:" + actorHash)
+	mu.Lock()
+	for _, f := range files {
+		if fi, err := os.Stat(filepath.Join(snapCacheDir, f)); err != nil || !fi.Mode().IsRegular() {
+			mu.Unlock()
+			return false, nil
+		}
+	}
+	for _, fileName := range files {
+		cachedPath := filepath.Join(snapCacheDir, fileName)
+		if fi, err := root.Lstat(fileName); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				mu.Unlock()
+				return false, fmt.Errorf("restore file %s is a symlink", fileName)
+			}
+			_ = root.Remove(fileName)
+		}
+		if err := os.Link(cachedPath, filepath.Join(p.root, dstDir, fileName)); err == nil {
+			continue
+		}
+		src, err := os.Open(cachedPath)
+		if err != nil {
+			mu.Unlock()
+			return false, err
+		}
+		dst, err := root.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			src.Close()
+			mu.Unlock()
+			return false, fmt.Errorf("while opening %s in restore directory: %w", fileName, err)
+		}
+		_, copyErr := io.Copy(dst, src)
+		closeErr := dst.Close()
+		src.Close()
+		if err := errors.Join(copyErr, closeErr); err != nil {
+			mu.Unlock()
+			return false, err
+		}
+	}
+	mu.Unlock()
+
+	if err := p.ensureGoldenBaseFromDelta(ctx, root); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (p *NodePlugin) cacheActorSnapshot(uri resources.SnapshotURI, srcDir string, files []string) {
+	actorHash, actorCacheRoot, snapKey, snapCacheDir, ok := p.actorSnapshotCachePaths(uri)
+	if !ok {
+		return
+	}
+	mu := p.keyLock("actor:" + actorHash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if err := os.MkdirAll(snapCacheDir, 0o700); err != nil {
+		return
+	}
+	for _, fileName := range files {
+		srcFile := filepath.Join(p.root, srcDir, fileName)
+		dstFile := filepath.Join(snapCacheDir, fileName)
+		if srcFi, err := os.Stat(srcFile); err == nil {
+			if dstFi, err := os.Stat(dstFile); err == nil && os.SameFile(srcFi, dstFi) {
+				continue
+			}
+		}
+		tmpFile := fmt.Sprintf("%s.tmp.%d", dstFile, time.Now().UnixNano())
+		_ = os.Remove(tmpFile)
+		if err := os.Link(srcFile, tmpFile); err != nil {
+			src, oerr := os.Open(srcFile)
+			if oerr != nil {
+				continue
+			}
+			dst, cerr := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+			if cerr != nil {
+				src.Close()
+				continue
+			}
+			_, copyErr := io.Copy(dst, src)
+			closeErr := dst.Close()
+			src.Close()
+			if errors.Join(copyErr, closeErr) != nil {
+				_ = os.Remove(tmpFile)
+				continue
+			}
+		}
+		if err := os.Rename(tmpFile, dstFile); err != nil {
+			_ = os.Remove(tmpFile)
+		}
+	}
+	if entries, err := os.ReadDir(actorCacheRoot); err == nil {
+		for _, entry := range entries {
+			if entry.Name() != snapKey {
+				_ = os.RemoveAll(filepath.Join(actorCacheRoot, entry.Name()))
+			}
+		}
+	}
 }
 
 func (p *NodePlugin) fetchCachedTagSnapshot(ctx context.Context, uri resources.SnapshotURI, dstDir string, root *os.Root, files []string) error {
@@ -383,6 +519,9 @@ func (p *NodePlugin) UploadSnapshot(ctx context.Context, req *objectstoresnapsho
 				}
 			}
 		}
+	}
+	if isCacheableActorURI(uri) {
+		p.cacheActorSnapshot(uri, srcDir, req.GetFiles())
 	}
 	return &objectstoresnapshotv1.UploadSnapshotResponse{}, nil
 }

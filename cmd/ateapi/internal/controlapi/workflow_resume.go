@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"time"
 
@@ -620,6 +621,15 @@ func schedulingConstraints(actor *ateapipb.Actor, tmpl *ateapipb.ActorTemplate) 
 	if sel := tmpl.GetWorkerSelector(); sel != nil {
 		c.TemplateSelector = labels.SelectorFromSet(labels.Set(sel.GetMatchLabels()))
 	}
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+		preferredWorker := actor.GetStatus().GetInProgressLocalSnapshotName()
+		if preferredWorker == "" && actor.GetMetadata() != nil {
+			if v, ok := lastActorWorker.Load(resources.ActorRefFromActor(actor).String()); ok {
+				preferredWorker, _ = v.(string)
+			}
+		}
+		c.PreferredWorker = preferredWorker
+	}
 	return c, nil
 }
 
@@ -797,6 +807,9 @@ func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.
 
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+		if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+			toUpdate.Status.InProgressLocalSnapshotName = ""
+		}
 		return nil
 	})
 	if err != nil {

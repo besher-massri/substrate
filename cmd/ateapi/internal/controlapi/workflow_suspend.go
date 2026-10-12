@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
@@ -30,6 +32,11 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/protobuf/proto"
 )
+
+// lastActorWorker caches the last assigned worker name per actorRef when
+// ATE_SOFT_NODE_AFFINITY=true, providing an in-memory fallback alongside the
+// persisted ate.dev/last-worker annotation.
+var lastActorWorker sync.Map
 
 // SuspendActor executes the workflow to suspend a running or paused actor:
 // a running actor is checkpointed on its worker, a paused actor's node-local
@@ -342,6 +349,11 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 		return nil, err
 	}
 
+	lastWorker := latestActor.GetStatus().GetWorkerAssignment().GetWorker().GetName()
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" && lastWorker != "" {
+		lastActorWorker.Store(actorRef.String(), lastWorker)
+	}
+
 	// 1. Free the worker (if it hasn't been freed yet)
 	if latestActor.GetStatus().GetWorkerAssignment() != nil {
 		t = time.Now()
@@ -387,6 +399,9 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 		toUpdate.Status.WorkerAssignment = nil
 		toUpdate.Status.LocalSnapshot = nil
 		toUpdate.Status.AssignedNode = ""
+		if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" && lastWorker != "" {
+			toUpdate.Status.InProgressLocalSnapshotName = lastWorker
+		}
 		return nil
 	})
 	dUpdateActor = time.Since(t)

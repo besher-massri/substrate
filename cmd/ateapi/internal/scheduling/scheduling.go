@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"slices"
 
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -45,6 +46,11 @@ type Constraints struct {
 	// Limits are the actor's declared resource limits, named as a Worker names
 	// the capacity it reports, so the two subtract.
 	Limits *ateapipb.Resources
+
+	// PreferredWorker, when non-empty and ATE_SOFT_NODE_AFFINITY=true, is a soft
+	// preference for the worker (or another worker on the same node) that last
+	// hosted this actor.
+	PreferredWorker string
 }
 
 // ErrNoCapacity is returned by Schedule when no worker that meets the
@@ -129,6 +135,32 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 		return candidates[0].worker, nil
 	}
 
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" && constraints.PreferredWorker != "" {
+		for _, cand := range candidates {
+			if workerMatchesPreferred(cand.worker, constraints.PreferredWorker) {
+				return cand.worker, nil
+			}
+		}
+		var preferredNode string
+		for _, worker := range workers {
+			if workerMatchesPreferred(worker, constraints.PreferredWorker) {
+				preferredNode = worker.GetNodeName()
+				break
+			}
+		}
+		if preferredNode != "" {
+			var nodeCandidates []candidate
+			for _, cand := range candidates {
+				if cand.worker.GetNodeName() == preferredNode {
+					nodeCandidates = append(nodeCandidates, cand)
+				}
+			}
+			if len(nodeCandidates) > 0 {
+				return nodeCandidates[s.intn(len(nodeCandidates))].worker, nil
+			}
+		}
+	}
+
 	i := s.intn(len(candidates))
 	j := s.intn(len(candidates) - 1)
 	if j >= i {
@@ -138,6 +170,10 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 		return candidates[j].worker, nil
 	}
 	return candidates[i].worker, nil
+}
+
+func workerMatchesPreferred(w *ateapipb.Worker, preferred string) bool {
+	return w.GetMetadata().GetName() == preferred || w.GetWorkerPod() == preferred
 }
 
 // candidate pairs an eligible worker with its cached compute utilization.

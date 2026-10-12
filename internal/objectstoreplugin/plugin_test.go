@@ -505,6 +505,108 @@ func TestFetchTagSnapshotUsesNodeCache(t *testing.T) {
 	}
 }
 
+func TestFetchActorSnapshotUsesNodeCacheAndEvictsOldGenerations(t *testing.T) {
+	t.Setenv("ATE_CACHE_ACTOR_SNAPSHOTS", "true")
+	ctx := context.Background()
+	backend := newMemObjects()
+	root := t.TempDir()
+	nodeClient := objectstoresnapshotv1.NewNodeProviderClient(serve(t, backend, root))
+
+	src1 := filepath.Join(root, "src1")
+	src2 := filepath.Join(root, "src2")
+	dst1 := filepath.Join(root, "dst1")
+	dst2 := filepath.Join(root, "dst2")
+	for _, d := range []string{src1, src2, dst1, dst2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap1URI := "gs://" + testBucket + "/root/atespaces/team-a/actors/uid1/snapshots/snap1"
+	snap2URI := "gs://" + testBucket + "/root/atespaces/team-a/actors/uid1/snapshots/snap2"
+
+	mem1 := bytes.Repeat([]byte("actor-gen1-"), 1024)
+	manifest1 := []byte(`{"snapshotFiles":["memory-ranges"]}`)
+	if err := os.WriteFile(filepath.Join(src1, memoryRangesFile), mem1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src1, manifestFile), manifest1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload in two calls (data files then manifest), matching atelet's sequence.
+	if _, err := nodeClient.UploadSnapshot(ctx, &objectstoresnapshotv1.UploadSnapshotRequest{
+		SnapshotUri: snap1URI, LocalPath: src1, Files: []string{memoryRangesFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot(snap1 data) = %v", err)
+	}
+	if _, err := nodeClient.UploadSnapshot(ctx, &objectstoresnapshotv1.UploadSnapshotRequest{
+		SnapshotUri: snap1URI, LocalPath: src1, Files: []string{manifestFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot(snap1 manifest) = %v", err)
+	}
+
+	// Wipe backend: FetchSnapshot for snap1 must still succeed from local actor-snapshot-cache.
+	for _, k := range backend.keys() {
+		parts := strings.SplitN(k, "/", 2)
+		_ = backend.Delete(ctx, parts[0], parts[1])
+	}
+
+	if _, err := nodeClient.FetchSnapshot(ctx, &objectstoresnapshotv1.FetchSnapshotRequest{
+		SnapshotUri: snap1URI, WritePath: dst1, Files: []string{manifestFile},
+	}); err != nil {
+		t.Fatalf("FetchSnapshot(snap1 manifest) after backend wipe = %v", err)
+	}
+	if _, err := nodeClient.FetchSnapshot(ctx, &objectstoresnapshotv1.FetchSnapshotRequest{
+		SnapshotUri: snap1URI, WritePath: dst1, Files: []string{memoryRangesFile},
+	}); err != nil {
+		t.Fatalf("FetchSnapshot(snap1 data) after backend wipe = %v", err)
+	}
+	got1, err := os.ReadFile(filepath.Join(dst1, memoryRangesFile))
+	if err != nil || !bytes.Equal(got1, mem1) {
+		t.Fatalf("cached snap1 memory-ranges mismatch")
+	}
+
+	// Upload snap2 for the same actor: snap1 must be evicted from actor-snapshot-cache.
+	mem2 := bytes.Repeat([]byte("actor-gen2-"), 1024)
+	if err := os.WriteFile(filepath.Join(src2, memoryRangesFile), mem2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src2, manifestFile), manifest1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodeClient.UploadSnapshot(ctx, &objectstoresnapshotv1.UploadSnapshotRequest{
+		SnapshotUri: snap2URI, LocalPath: src2, Files: []string{memoryRangesFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot(snap2 data) = %v", err)
+	}
+	if _, err := nodeClient.UploadSnapshot(ctx, &objectstoresnapshotv1.UploadSnapshotRequest{
+		SnapshotUri: snap2URI, LocalPath: src2, Files: []string{manifestFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot(snap2 manifest) = %v", err)
+	}
+
+	// Wipe backend again: snap1 should now be evicted (NotFound), while snap2 hits the cache.
+	for _, k := range backend.keys() {
+		parts := strings.SplitN(k, "/", 2)
+		_ = backend.Delete(ctx, parts[0], parts[1])
+	}
+	if _, err := nodeClient.FetchSnapshot(ctx, &objectstoresnapshotv1.FetchSnapshotRequest{
+		SnapshotUri: snap1URI, WritePath: dst2, Files: []string{memoryRangesFile},
+	}); status.Code(err) != codes.NotFound {
+		t.Fatalf("FetchSnapshot(evicted snap1) = %v, want NotFound", err)
+	}
+	if _, err := nodeClient.FetchSnapshot(ctx, &objectstoresnapshotv1.FetchSnapshotRequest{
+		SnapshotUri: snap2URI, WritePath: dst2, Files: []string{memoryRangesFile},
+	}); err != nil {
+		t.Fatalf("FetchSnapshot(snap2) after backend wipe = %v", err)
+	}
+	got2, err := os.ReadFile(filepath.Join(dst2, memoryRangesFile))
+	if err != nil || !bytes.Equal(got2, mem2) {
+		t.Fatalf("cached snap2 memory-ranges mismatch")
+	}
+}
+
 func equal(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

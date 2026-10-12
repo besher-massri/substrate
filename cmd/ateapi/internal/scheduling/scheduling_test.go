@@ -595,3 +595,51 @@ func TestScheduleMalformedLimitsIsNotNoCapacity(t *testing.T) {
 		t.Fatalf("Schedule() error = %v, want an error other than ErrNoCapacity", err)
 	}
 }
+
+func TestSchedulePreferredWorkerAndSameNodeAffinity(t *testing.T) {
+	t.Setenv("ATE_SOFT_NODE_AFFINITY", "true")
+	ctx := context.Background()
+
+	// 1. Preferred worker has room -> picks preferred worker directly even when intn=0 would pick w-other.
+	f1 := fleet{
+		worker("w-other-1", "microvm", "node-a", nil),
+		worker("w-other-2", "microvm", "node-b", nil),
+		worker("w-pref", "microvm", "node-c", nil),
+	}
+	got, err := New(f1, WithIntn(firstIntn)).Schedule(ctx, Constraints{
+		SandboxClass:    "microvm",
+		PreferredWorker: "w-pref",
+	})
+	if err != nil || got.GetWorkerPod() != "w-pref" {
+		t.Fatalf("Schedule(preferred worker available) = %v, %v; want w-pref", got.GetWorkerPod(), err)
+	}
+
+	// 2. Preferred worker is full, but another worker on the same node has room -> picks same-node sibling.
+	f2 := fleet{
+		worker("w-other-1", "microvm", "node-a", nil),
+		worker("w-other-2", "microvm", "node-b", nil),
+		worker("w-pref", "microvm", "node-c", nil, assigned("demo", "busy")),
+		worker("w-sibling", "microvm", "node-c", nil),
+	}
+	got, err = New(f2, WithIntn(firstIntn)).Schedule(ctx, Constraints{
+		SandboxClass:    "microvm",
+		PreferredWorker: "w-pref",
+	})
+	if err != nil || got.GetWorkerPod() != "w-sibling" {
+		t.Fatalf("Schedule(preferred worker full, sibling free) = %v, %v; want w-sibling", got.GetWorkerPod(), err)
+	}
+
+	// 3. All workers on preferred node are full -> falls back to pool-wide scheduling.
+	f3 := fleet{
+		worker("w-other-1", "microvm", "node-a", nil),
+		worker("w-pref", "microvm", "node-c", nil, assigned("demo", "busy-1")),
+		worker("w-sibling", "microvm", "node-c", nil, assigned("demo", "busy-2")),
+	}
+	got, err = New(f3, WithIntn(firstIntn)).Schedule(ctx, Constraints{
+		SandboxClass:    "microvm",
+		PreferredWorker: "w-pref",
+	})
+	if err != nil || got.GetWorkerPod() != "w-other-1" {
+		t.Fatalf("Schedule(preferred node full) = %v, %v; want w-other-1", got.GetWorkerPod(), err)
+	}
+}
