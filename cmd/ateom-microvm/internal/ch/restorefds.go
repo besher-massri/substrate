@@ -102,15 +102,33 @@ func LaunchVMM(ctx context.Context, o LaunchVMMOptions) (*exec.Cmd, *Client, err
 // NOTE: with OnDemand, CH demand-pages from the snapshot's memory file for the
 // VM's whole lifetime, so sourceDir must stay present until the actor is torn down.
 func (c *Client) RestoreWithNetFDs(ctx context.Context, sourceDir string, nets []RestoredNet, memMode string) error {
+	return c.RestoreWithNetFDsOpts(ctx, sourceDir, nets, RestoreOptions{MemoryRestoreMode: memMode})
+}
+
+// RestoreOptions are the optional vm.restore settings.
+type RestoreOptions struct {
+	// MemoryRestoreMode is "" / MemRestoreEager or MemRestoreOnDemand.
+	MemoryRestoreMode string
+	// BackgroundFetchPages, when set, is sent as vm.restore's
+	// background_fetch_pages. False asks an OnDemand restore to serve only the
+	// pages the guest touches, with no background prefault. Only a VMM that
+	// advertises FeatureRestoreBackgroundFetchPages honors it; others ignore the
+	// field, so callers must check the feature first. Nil sends nothing.
+	BackgroundFetchPages *bool
+}
+
+// RestoreWithNetFDsOpts is RestoreWithNetFDs with the optional settings.
+func (c *Client) RestoreWithNetFDsOpts(ctx context.Context, sourceDir string, nets []RestoredNet, opts RestoreOptions) error {
 	type restoredNetConfig struct {
 		ID     string `json:"id"`
 		NumFDs int    `json:"num_fds"`
 	}
 	cfg := struct {
-		SourceURL         string              `json:"source_url"`
-		MemoryRestoreMode string              `json:"memory_restore_mode,omitempty"`
-		NetFDs            []restoredNetConfig `json:"net_fds,omitempty"`
-	}{SourceURL: SnapshotURL(sourceDir), MemoryRestoreMode: memMode}
+		SourceURL            string              `json:"source_url"`
+		MemoryRestoreMode    string              `json:"memory_restore_mode,omitempty"`
+		NetFDs               []restoredNetConfig `json:"net_fds,omitempty"`
+		BackgroundFetchPages *bool               `json:"background_fetch_pages,omitempty"`
+	}{SourceURL: SnapshotURL(sourceDir), MemoryRestoreMode: opts.MemoryRestoreMode, BackgroundFetchPages: opts.BackgroundFetchPages}
 	var fds []int
 	for _, n := range nets {
 		cfg.NetFDs = append(cfg.NetFDs, restoredNetConfig{ID: n.ID, NumFDs: len(n.FDs)})

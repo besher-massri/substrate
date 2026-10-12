@@ -146,3 +146,52 @@ func TestWaitReadyTimesOut(t *testing.T) {
 		t.Fatal("WaitReady returned nil for a dead socket, want timeout error")
 	}
 }
+
+func TestVMMInfoHasFeature(t *testing.T) {
+	info := VMMInfo{Version: "53.0.0", Features: []string{"kvm", FeatureRestoreBackgroundFetchPages}}
+	if !info.HasFeature(FeatureRestoreBackgroundFetchPages) {
+		t.Error("HasFeature missed a listed feature")
+	}
+	if info.HasFeature("io_uring") || (VMMInfo{}).HasFeature("kvm") {
+		t.Error("HasFeature reported an unlisted feature")
+	}
+}
+
+// background_fetch_pages is sent only when set, so a stock VMM sees exactly the
+// body it always did.
+func TestRestoreWithNetFDsOptsBody(t *testing.T) {
+	no := false
+	for _, tc := range []struct {
+		name string
+		opts RestoreOptions
+		want map[string]any
+	}{
+		{"default", RestoreOptions{MemoryRestoreMode: MemRestoreEager},
+			map[string]any{"source_url": "file:///snap", "memory_restore_mode": "Copy"}},
+		{"no background fetch", RestoreOptions{MemoryRestoreMode: MemRestoreOnDemand, BackgroundFetchPages: &no},
+			map[string]any{"source_url": "file:///snap", "memory_restore_mode": "OnDemand", "background_fetch_pages": false}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, fake := startFakeCH(t)
+			if err := client.RestoreWithNetFDsOpts(context.Background(), "/snap", nil, tc.opts); err != nil {
+				t.Fatalf("RestoreWithNetFDsOpts: %v", err)
+			}
+			reqs := fake.recorded()
+			if len(reqs) != 1 || reqs[0].path != "/api/v1/vm.restore" {
+				t.Fatalf("requests = %+v, want one vm.restore", reqs)
+			}
+			var got map[string]any
+			if err := json.Unmarshal([]byte(reqs[0].body), &got); err != nil {
+				t.Fatalf("body not JSON: %v (%q)", err, reqs[0].body)
+			}
+			if len(got) != len(tc.want) {
+				t.Errorf("body = %v, want %v", got, tc.want)
+			}
+			for k, v := range tc.want {
+				if got[k] != v {
+					t.Errorf("body[%q] = %v, want %v", k, got[k], v)
+				}
+			}
+		})
+	}
+}

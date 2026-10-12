@@ -232,6 +232,15 @@ func do(ctx context.Context) error {
 	}
 	ateomService := NewService(*podUID, *chBinary, *guestDebug, *vmmMemReserve, *maxActors, tunnel, actorLogger)
 	ateomService.actorCgroups = actorCgroups
+	// Opt-in restore-latency knobs (all off unless their ATEOM_MICROVM_* env is set).
+	fast, err := fastRestoreConfigFromEnv(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("while reading restore latency settings: %w", err)
+	}
+	ateomService.fast = fast
+	if fast.enabled() {
+		slog.InfoContext(ctx, "Opt-in restore latency settings", fast.attrs()...)
+	}
 	// The controller sets both from the downward API.
 	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -378,6 +387,9 @@ type AteomService struct {
 	// actorCgroups is set when the worker's cgroup is delegated, so each actor's
 	// VMM and virtiofsd run in a leaf of their own.
 	actorCgroups bool
+	// fast holds the opt-in restore-latency knobs (fastrestore.go). The zero
+	// value is today's behavior.
+	fast fastRestoreConfig
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)

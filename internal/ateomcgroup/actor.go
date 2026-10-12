@@ -38,7 +38,8 @@ const (
 // ActorLeaf is a cgroup of its own for one actor's host processes, so actors on
 // one worker share its CPU fairly and each stays within its declared limit.
 type ActorLeaf struct {
-	dir *os.File
+	dir  *os.File
+	path string
 }
 
 // OpenActorLeaf creates the actor's leaf under the delegated scope, or reuses a
@@ -65,7 +66,20 @@ func openActorLeaf(root, actorUID string, milliCPU int64) (*ActorLeaf, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while opening cgroup %q: %w", path, err)
 	}
-	return &ActorLeaf{dir: dir}, nil
+	return &ActorLeaf{dir: dir, path: path}, nil
+}
+
+// SetCPULimit replaces the leaf's CPU cap with milliCPU (0 removes it). It
+// works after Close too: the leaf lives until RemoveActorLeaf. A nil leaf, or a
+// node that did not delegate the cpu controller, has nothing to change.
+func (l *ActorLeaf) SetCPULimit(milliCPU int64) error {
+	if l == nil {
+		return nil
+	}
+	if err := writeExisting(filepath.Join(l.path, "cpu.max"), cpuMax(milliCPU)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("while limiting cgroup %q: %w", l.path, err)
+	}
+	return nil
 }
 
 // writeExisting writes a cgroup interface file without creating it: cgroupfs

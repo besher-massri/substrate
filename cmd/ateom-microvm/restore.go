@@ -23,11 +23,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/ateomcgroup"
 	"github.com/agent-substrate/substrate/internal/ateomphaselog"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 
@@ -265,8 +269,50 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	} else {
 		ensureGoldenBaseCached(ctx, restoreDir, srcID, restoreMem)
 	}
+	if s.fast.readahead {
+		// Opt-in: get the memory image's disk reads going now, so they overlap the
+		// rootfs, network and VMM set-up below instead of landing in vm.restore.
+		go readaheadMemoryImage(context.WithoutCancel(ctx), restoreMem)
+	}
 	if err := os.MkdirAll(kata.VMDir(actorUID), 0o700); err != nil {
 		return fmt.Errorf("while creating VM dir: %w", err)
+	}
+	// Opt-in activation CPU boost: the actor's leaf (its VMM and virtiofsd) runs
+	// at activationMilliCPU until the wakeup probe passes, then gets the actor's
+	// own limit back (endActivationBoost below).
+	leafSize := p.size
+	leafSize.MilliCPU = s.fast.activationMilliCPU(p.size.MilliCPU)
+	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api-restore.sock")
+	// Opt-in early VMM launch: the VMM needs only its leaf and api-socket, so
+	// start it now and join it right before vm.restore, overlapping its start-up
+	// with the rootfs, virtiofsd and tap set-up.
+	var leaf *ateomcgroup.ActorLeaf
+	var earlyLaunch chan vmmLaunchResult
+	var earlyLaunchTook time.Duration
+	if s.fast.earlyVMMLaunch {
+		if leaf, err = s.actorLeaf(actorUID, leafSize); err != nil {
+			return err
+		}
+		defer leaf.Close()
+		earlyLaunch = make(chan vmmLaunchResult, 1)
+		go func() {
+			t := time.Now()
+			cmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+				Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
+				SysProcAttr: leaf.SysProcAttr(),
+			})
+			earlyLaunch <- vmmLaunchResult{cmd: cmd, client: client, err: err, took: time.Since(t)}
+		}()
+		// Every return before the join below must reap the VMM it launched.
+		defer func() {
+			if earlyLaunch == nil {
+				return
+			}
+			if r := <-earlyLaunch; r.err == nil && r.cmd.Process != nil {
+				_ = r.cmd.Process.Kill()
+				_, _ = r.cmd.Process.Wait()
+			}
+		}()
 	}
 	tPrep := time.Now()
 
@@ -317,11 +363,12 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		return untarErr
 	}
 	tUpper := time.Now()
-	leaf, err := s.actorLeaf(actorUID, p.size)
-	if err != nil {
-		return err
+	if leaf == nil {
+		if leaf, err = s.actorLeaf(actorUID, leafSize); err != nil {
+			return err
+		}
+		defer leaf.Close()
 	}
-	defer leaf.Close()
 	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
 	if err != nil {
 		return err
@@ -380,12 +427,19 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 
 	// Relaunch CH and restore with the tap FDs attached (SCM_RIGHTS). CH reopens
 	// /dev/vda (image) + each /dev/vd{b+i} (actor rootfs) from the snapshot config paths.
-	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api-restore.sock")
 	tTap := time.Now()
-	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
-		Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
-		SysProcAttr: leaf.SysProcAttr(),
-	})
+	var chCmd *exec.Cmd
+	var client *ch.Client
+	if earlyLaunch != nil {
+		r := <-earlyLaunch
+		earlyLaunch = nil
+		chCmd, client, err, earlyLaunchTook = r.cmd, r.client, r.err, r.took
+	} else {
+		chCmd, client, err = ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+			Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
+			SysProcAttr: leaf.SysProcAttr(),
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("while launching VMM for restore: %w", err)
 	}
@@ -406,10 +460,17 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	//     source afterwards and nothing merges against it, so it is dropped below and
 	//     the next snapshot stands on its own.
 	tLaunch := time.Now()
-	memMode := restoreMemMode(ctx, client.Info())
+	memMode, noBackgroundFetch := restoreMemMode(ctx, client.Info()), false
+	if s.fast.memRestoreMode != "" || s.fast.noBackgroundFetch {
+		memMode, noBackgroundFetch = s.fast.pickRestoreMemMode(ctx, client.Info())
+	}
 	slog.InfoContext(ctx, "restoring guest memory",
 		slog.String("mode", memMode), slog.String("vmm_version", client.Info().Version))
-	if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, memMode); err != nil {
+	restoreOpts := ch.RestoreOptions{MemoryRestoreMode: memMode}
+	if noBackgroundFetch {
+		restoreOpts.BackgroundFetchPages = new(bool)
+	}
+	if err := client.RestoreWithNetFDsOpts(ctx, restoreDir, restoredNets, restoreOpts); err != nil {
 		return fmt.Errorf("while restoring VM with net FDs: %w", err)
 	}
 	tVMRestore := time.Now()
@@ -421,49 +482,81 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	// One kata-agent connection serves this whole activation: the CRNG reseed below,
 	// then log forwarding and guest stats. As on cold boot, not reaching the agent
 	// fails the restore. A failing restore closes the connection on its way out.
-	guestAC, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
-	if err != nil {
-		return fmt.Errorf("while dialing kata-agent after resume: %w", err)
-	}
+	var guestAC *kata.AgentClient
 	defer func() {
-		if retErr != nil {
+		if retErr != nil && guestAC != nil {
 			_ = guestAC.Close()
 		}
 	}()
+	dialAndReseed := func(ctx context.Context) error {
+		ac, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
+		if err != nil {
+			return fmt.Errorf("while dialing kata-agent after resume: %w", err)
+		}
+		guestAC = ac
 
-	// Reseed the guest CRNG before the workload gets far. A restored guest resumes with
-	// the entropy pool frozen in the snapshot, so every actor restored from one snapshot
-	// (golden cold-start, tag clones) would share an identical CRNG state and emit the
-	// same "random" values. Cloud Hypervisor has no VmGenID device to signal the guest,
-	// so we feed fresh per-restore entropy through the kata-agent's ReseedRandomDev, which
-	// mixes it into /dev/random and reseeds. A failed reseed fails the restore, since the
-	// actor would otherwise run with randomness it shares with its clones.
-	//
-	// The reseed runs just after Resume, so a workload that reads randomness in its first
-	// instants after resume can still see the frozen state. Fully closing that needs the
-	// workload frozen across the reseed, or a VMM VmGenID that acts before the vCPUs resume.
-	//
-	// TODO: switch to a Cloud Hypervisor VmGenID device once it exists. clh has no such
-	// device today; Firecracker and QEMU do. With one, the VMM changes the generation id
-	// and notifies the guest before unpausing the vCPUs, so a >=5.18 kernel reseeds its
-	// CRNG on its own with no host round-trip, no per-restore RPC, and no post-Resume
-	// race. At that point this agent-driven reseed can be dropped.
-	if err := reseedGuestCRNG(ctx, guestAC); err != nil {
-		return fmt.Errorf("while reseeding guest CRNG: %w", err)
+		// Reseed the guest CRNG before the workload gets far. A restored guest resumes with
+		// the entropy pool frozen in the snapshot, so every actor restored from one snapshot
+		// (golden cold-start, tag clones) would share an identical CRNG state and emit the
+		// same "random" values. Cloud Hypervisor has no VmGenID device to signal the guest,
+		// so we feed fresh per-restore entropy through the kata-agent's ReseedRandomDev, which
+		// mixes it into /dev/random and reseeds. A failed reseed fails the restore, since the
+		// actor would otherwise run with randomness it shares with its clones.
+		//
+		// The reseed runs just after Resume, so a workload that reads randomness in its first
+		// instants after resume can still see the frozen state. Fully closing that needs the
+		// workload frozen across the reseed, or a VMM VmGenID that acts before the vCPUs resume.
+		//
+		// TODO: switch to a Cloud Hypervisor VmGenID device once it exists. clh has no such
+		// device today; Firecracker and QEMU do. With one, the VMM changes the generation id
+		// and notifies the guest before unpausing the vCPUs, so a >=5.18 kernel reseeds its
+		// CRNG on its own with no host round-trip, no per-restore RPC, and no post-Resume
+		// race. At that point this agent-driven reseed can be dropped.
+		if err := reseedGuestCRNG(ctx, ac); err != nil {
+			return fmt.Errorf("while reseeding guest CRNG: %w", err)
+		}
+		return nil
 	}
-
 	// Block until every wakeup-probe-enabled container reports 200.
-	if err := wakeupprobe.WaitAll(ctx, containers, ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
-		return fmt.Errorf("while waiting for container wakeup probe: %w", err)
+	waitProbes := func(ctx context.Context) error {
+		if err := wakeupprobe.WaitAll(ctx, containers, ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
+			return fmt.Errorf("while waiting for container wakeup probe: %w", err)
+		}
+		return nil
+	}
+	if s.fast.parallelWakeup {
+		// Opt-in: the probe does not need the agent, so run the two together. The
+		// restore still succeeds only once both have, so nothing reaches the actor
+		// before its CRNG is reseeded.
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error { return dialAndReseed(gctx) })
+		g.Go(func() error { return waitProbes(gctx) })
+		if err := g.Wait(); err != nil {
+			return err
+		}
+	} else {
+		if err := dialAndReseed(ctx); err != nil {
+			return err
+		}
+		if err := waitProbes(ctx); err != nil {
+			return err
+		}
+	}
+	tWakeup := time.Now()
+	// The actor is up: give it back its own CPU limit (opt-in activation boost).
+	if s.fast.boosted(p.size.MilliCPU) {
+		if err := leaf.SetCPULimit(p.size.MilliCPU); err != nil {
+			return fmt.Errorf("while restoring the actor's CPU limit after activation: %w", err)
+		}
 	}
 
 	// Where a resume goes. Like the boot phases, this used to be a single total,
 	// which hid that a first (cold) restore and a later (warm) one differ by more
 	// than 5x on the same actor. upper/lowers is the host reassembling the rootfs;
 	// vm_restore is cloud-hypervisor reading guest RAM back.
-	dWakeupProbe := time.Since(tResume)
+	dWakeupProbe := tWakeup.Sub(tResume)
 	dTotal := time.Since(tStart)
-	slog.InfoContext(ctx, "Actor restore phases", slog.String("id", actorUID),
+	phaseAttrs := []any{slog.String("id", actorUID),
 		slog.Duration("prep", tPrep.Sub(tStart)),
 		slog.Duration("bundles", tBundles.Sub(tPrep)),
 		slog.Duration("upper_join", tUpper.Sub(tBundles)),
@@ -474,7 +567,18 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		slog.Duration("vm_restore", tVMRestore.Sub(tLaunch)),
 		slog.Duration("resume", tResume.Sub(tVMRestore)),
 		slog.Duration("wakeup_probe", dWakeupProbe),
-		slog.Duration("total", dTotal))
+		slog.Duration("total", dTotal)}
+	if s.fast.enabled() {
+		// What the opt-in knobs did: the launch's own duration when it overlapped the
+		// set-up (vmm_launch is then only the wait for it), and the restore settings.
+		phaseAttrs = append(phaseAttrs,
+			slog.Duration("vmm_launch_async", earlyLaunchTook),
+			slog.String("mem_mode", memMode),
+			slog.Bool("no_background_fetch", noBackgroundFetch),
+			slog.Int64("activation_millicpu", leafSize.MilliCPU),
+			slog.Bool("parallel_wakeup", s.fast.parallelWakeup))
+	}
+	slog.InfoContext(ctx, "Actor restore phases", phaseAttrs...)
 	// The joinable per-actor record the benchmarking tooling aggregates. The
 	// durable delta is not carried: tDurable is pinned to tLowers today, so it
 	// would always be the zero a record skips.
@@ -492,10 +596,17 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			{Name: phaseTotal, D: dTotal},
 		})
 
+	preserveSource := preserveRestoreDir
+	if (s.fast.memRestoreMode != "" || noBackgroundFetch) && memMode == ch.MemRestoreOnDemand && sharesInode(restoreMem) {
+		// An opt-in OnDemand restore whose source is also linked elsewhere (the
+		// node's golden-base cache, a retained local snapshot): the checkpoint must
+		// merge into a copy, never into this shared inode.
+		preserveSource = true
+	}
 	ra := &runningActor{
 		chCmd: chCmd, vfsdCmd: vfsdCmd,
 		apiSocket: apiSocket, baseID: srcID, restoreSourceDir: restoreDir,
-		preserveRestoreSource:   preserveRestoreDir,
+		preserveRestoreSource:   preserveSource,
 		snapshotIsSelfContained: memMode == ch.MemRestoreEager,
 		// Signaling an id the agent does not know fails the whole graceful
 		// shutdown with InvalidContainerId, so these must be what the guest runs.

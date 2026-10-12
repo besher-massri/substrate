@@ -105,3 +105,47 @@ func TestNilActorLeaf(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// SetCPULimit swaps the cap of a live leaf (the activation boost ends this
+// way), even after Close, and is a no-op without the cpu controller.
+func TestActorLeafSetCPULimit(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "uid-a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "uid-a", "cpu.max"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := openActorLeaf(root, "uid-a", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leaf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, milli := range []int64{250, 0, 2000} {
+		if err := leaf.SetCPULimit(milli); err != nil {
+			t.Fatalf("SetCPULimit(%d): %v", milli, err)
+		}
+		got, err := os.ReadFile(filepath.Join(root, "uid-a", "cpu.max"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := cpuMax(milli); string(got) != want {
+			t.Errorf("after SetCPULimit(%d) cpu.max = %q, want %q", milli, got, want)
+		}
+	}
+
+	bare, err := openActorLeaf(t.TempDir(), "uid-b", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bare.Close()
+	if err := bare.SetCPULimit(250); err != nil {
+		t.Errorf("SetCPULimit without cpu.max: %v", err)
+	}
+	var nilLeaf *ActorLeaf
+	if err := nilLeaf.SetCPULimit(250); err != nil {
+		t.Errorf("SetCPULimit on a nil leaf: %v", err)
+	}
+}

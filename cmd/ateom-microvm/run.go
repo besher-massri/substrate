@@ -472,7 +472,11 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	// host upper, mounted into the shared dir) + durable-dir and CSI volumes (if any),
 	// and start the ONE virtiofsd that serves them all. CH connects to it at vm.create
 	// and demand-pages for the actor's lifetime, so ateom owns the process (killed in teardownActor).
-	leaf, err := s.actorLeaf(actorUID, p.size)
+	// With the opt-in activation CPU boost, the leaf runs uncapped (or at the
+	// boost) until the wakeup probe passes; the actor's own limit is applied below.
+	leafSize := p.size
+	leafSize.MilliCPU = s.fast.activationMilliCPU(p.size.MilliCPU)
+	leaf, err := s.actorLeaf(actorUID, leafSize)
 	if err != nil {
 		return err
 	}
@@ -578,6 +582,12 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	// Block until every wakeup-probe-enabled container reports 200.
 	if err := wakeupprobe.WaitAll(ctx, containers, ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
 		return fmt.Errorf("while waiting for container wakeup probe: %w", err)
+	}
+	// The actor is up: give it back its own CPU limit (opt-in activation boost).
+	if s.fast.boosted(p.size.MilliCPU) {
+		if err := leaf.SetCPULimit(p.size.MilliCPU); err != nil {
+			return fmt.Errorf("while restoring the actor's CPU limit after boot: %w", err)
+		}
 	}
 
 	// Everything from BootVM onward, split. ateom used to log only the total, which

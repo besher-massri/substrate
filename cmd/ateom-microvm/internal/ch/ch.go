@@ -57,6 +57,23 @@ type VMMInfo struct {
 	Features     []string `json:"features"`
 }
 
+// FeatureRestoreBackgroundFetchPages is the vmm.ping feature a cloud-hypervisor
+// build reports when its vm.restore accepts background_fetch_pages, i.e. when an
+// OnDemand restore can be told not to prefault the rest of guest RAM in the
+// background. No upstream release has it yet (upstream added the same knob to
+// vm.receive-migration only); it marks a patched build.
+const FeatureRestoreBackgroundFetchPages = "restore_background_fetch_pages"
+
+// HasFeature reports whether the VMM listed name among its vmm.ping features.
+func (i VMMInfo) HasFeature(name string) bool {
+	for _, f := range i.Features {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Ping reports what the VMM says about itself, or an error if the api-socket does
 // not answer vmm.ping.
 func (c *Client) Ping(ctx context.Context) (VMMInfo, error) {
