@@ -267,7 +267,14 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 
 	slog.InfoContext(ctx, "Snapshotting guest", slog.String("id", actorUID), slog.String("dir", checkpointDir))
 	tSnapshot := time.Now()
-	if err := client.Snapshot(ctx, checkpointDir); err != nil {
+	snapshot := client.Snapshot
+	if ra != nil && ra.onDemandPrefaulting {
+		// Opt-in ondemand-prefault restore: wait out the VMM's background prefault.
+		snapshot = func(ctx context.Context, dir string) error {
+			return snapshotWhilePrefaulting(ctx, client, dir, 30*time.Second)
+		}
+	}
+	if err := snapshot(ctx, checkpointDir); err != nil {
 		return 0, fmt.Errorf("while snapshotting guest: %w", err)
 	}
 	dSnapshot := time.Since(tSnapshot)

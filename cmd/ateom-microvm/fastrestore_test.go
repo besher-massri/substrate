@@ -18,9 +18,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 )
@@ -167,6 +172,7 @@ func TestPickRestoreMemMode(t *testing.T) {
 		{"forced on-demand on patched v53 without opting out of prefault falls back", fastRestoreConfig{memRestoreMode: ch.MemRestoreOnDemand}, v53patched, ch.MemRestoreEager, false},
 		{"forced on-demand on patched v53 disables background fetch", fastRestoreConfig{memRestoreMode: ch.MemRestoreOnDemand, noBackgroundFetch: true}, v53patched, ch.MemRestoreOnDemand, true},
 		{"no-background-fetch alone keeps auto eager on v53", fastRestoreConfig{noBackgroundFetch: true}, v53patched, ch.MemRestoreEager, false},
+		{"ondemand-prefault keeps the prefault on stock v53", fastRestoreConfig{memRestoreMode: ch.MemRestoreOnDemand, allowPrefault: true}, v53, ch.MemRestoreOnDemand, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mode, noBG := tc.c.pickRestoreMemMode(ctx, tc.info)
@@ -206,4 +212,65 @@ func TestReadaheadMemoryImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	readaheadMemoryImage(context.Background(), f)
+}
+
+func TestFastRestoreConfigOnDemandPrefault(t *testing.T) {
+	c, err := fastRestoreConfigFromEnv(envMap(map[string]string{envMemoryRestoreMode: "ondemand-prefault"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.memRestoreMode != ch.MemRestoreOnDemand || !c.allowPrefault {
+		t.Errorf("config = %+v, want OnDemand with the prefault allowed", c)
+	}
+}
+
+func TestIsRestoringError(t *testing.T) {
+	if !isRestoringError(errors.New(`PUT /api/v1/vm.snapshot: status 500: Error from API: ... VM on-demand memory restore is still in progress`)) {
+		t.Error("missed cloud-hypervisor's restoring error")
+	}
+	if isRestoringError(errors.New("PUT /api/v1/vm.snapshot: status 500: VM is not running")) {
+		t.Error("matched an unrelated error")
+	}
+}
+
+// fakeSnapshotVMM answers vm.snapshot with cloud-hypervisor's "still restoring"
+// error until refusals run out.
+func fakeSnapshotVMM(t *testing.T, refusals int32) (*ch.Client, *atomic.Int32) {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	lis, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/vm.snapshot" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if calls.Add(1) <= refusals {
+			http.Error(w, "VM on-demand memory restore is still in progress", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go srv.Serve(lis)
+	t.Cleanup(func() { _ = srv.Close() })
+	return ch.NewClient(sock), &calls
+}
+
+func TestSnapshotWhilePrefaulting(t *testing.T) {
+	client, calls := fakeSnapshotVMM(t, 2)
+	if err := snapshotWhilePrefaulting(context.Background(), client, filepath.Join(t.TempDir(), "snap"), 5*time.Second); err != nil {
+		t.Fatalf("snapshotWhilePrefaulting: %v", err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("vm.snapshot calls = %d, want 3", got)
+	}
+
+	client, _ = fakeSnapshotVMM(t, 1000)
+	err := snapshotWhilePrefaulting(context.Background(), client, filepath.Join(t.TempDir(), "snap"), 120*time.Millisecond)
+	if err == nil || !isRestoringError(err) {
+		t.Errorf("snapshotWhilePrefaulting past its deadline = %v, want the restoring error", err)
+	}
 }

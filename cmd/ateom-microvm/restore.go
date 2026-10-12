@@ -608,6 +608,7 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		apiSocket: apiSocket, baseID: srcID, restoreSourceDir: restoreDir,
 		preserveRestoreSource:   preserveSource,
 		snapshotIsSelfContained: memMode == ch.MemRestoreEager,
+		onDemandPrefaulting:     s.fast.allowPrefault && memMode == ch.MemRestoreOnDemand && !noBackgroundFetch && client.Info().PrefaultsUnconditionally(),
 		// Signaling an id the agent does not know fails the whole graceful
 		// shutdown with InvalidContainerId, so these must be what the guest runs.
 		workloadIDs: workloadIDs(ctrs),

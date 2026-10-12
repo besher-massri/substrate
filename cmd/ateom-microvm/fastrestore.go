@@ -52,11 +52,18 @@ const (
 	// randomness shared with its clones.
 	envParallelWakeup = "ATEOM_MICROVM_PARALLEL_WAKEUP"
 	// envMemoryRestoreMode overrides how guest RAM is restored: "auto" (default:
-	// restoreMemMode's version check), "copy", or "ondemand". "ondemand" is only
-	// honored on a VMM that does not prefault unconditionally, or on one that
-	// can be told not to (see envOnDemandBackgroundFetch); otherwise ateom logs
-	// and restores eagerly, because an unconditional prefault both starves the
-	// guest and makes vm.snapshot fail until it completes.
+	// restoreMemMode's version check), "copy", "ondemand" or
+	// "ondemand-prefault". "ondemand" is only honored on a VMM that does not
+	// prefault unconditionally, or on one that can be told not to (see
+	// envOnDemandBackgroundFetch); otherwise ateom logs and restores eagerly,
+	// because at a fractional CPU cap the unconditional prefault both starves
+	// the guest and makes vm.snapshot fail until it completes.
+	// "ondemand-prefault" restores OnDemand and keeps the VMM's background
+	// prefault: the guest wakes while the rest of RAM streams in behind it. Use
+	// it only with the activation CPU boost (the prefault then runs at full
+	// speed) and with a cloud-hypervisor whose prefault skips snapshot holes
+	// (upstream c91a6543, after v53.0); v53.0 itself fills all of guest RAM,
+	// which also bloats every later snapshot to the full RAM size.
 	envMemoryRestoreMode = "ATEOM_MICROVM_MEMORY_RESTORE_MODE"
 	// envOnDemandBackgroundFetch ("false") asks the VMM to serve only the pages
 	// the guest touches after an OnDemand restore, with no background prefault
@@ -84,6 +91,9 @@ type fastRestoreConfig struct {
 	parallelWakeup bool
 	// memRestoreMode is "" (auto), ch.MemRestoreEager or ch.MemRestoreOnDemand.
 	memRestoreMode string
+	// allowPrefault keeps an OnDemand restore even on a VMM that prefaults the
+	// rest of guest RAM in the background ("ondemand-prefault").
+	allowPrefault bool
 	// noBackgroundFetch asks a capable VMM not to prefault after OnDemand.
 	noBackgroundFetch bool
 	// readahead starts page-cache readahead of the memory image early.
@@ -109,6 +119,8 @@ func (c fastRestoreConfig) attrs() []any {
 	mode := c.memRestoreMode
 	if mode == "" {
 		mode = "auto"
+	} else if c.allowPrefault {
+		mode += "+prefault"
 	}
 	return []any{
 		slog.String("activation_cpu_boost", boost),
@@ -150,8 +162,11 @@ func fastRestoreConfigFromEnv(getenv func(string) string) (fastRestoreConfig, er
 		c.memRestoreMode = ch.MemRestoreEager
 	case "ondemand", "on-demand", "lazy":
 		c.memRestoreMode = ch.MemRestoreOnDemand
+	case "ondemand-prefault":
+		c.memRestoreMode = ch.MemRestoreOnDemand
+		c.allowPrefault = true
 	default:
-		return fastRestoreConfig{}, fmt.Errorf("%s: want auto, copy or ondemand, got %q", envMemoryRestoreMode, v)
+		return fastRestoreConfig{}, fmt.Errorf("%s: want auto, copy, ondemand or ondemand-prefault, got %q", envMemoryRestoreMode, v)
 	}
 	return c, nil
 }
@@ -222,6 +237,9 @@ func (c fastRestoreConfig) pickRestoreMemMode(ctx context.Context, info ch.VMMIn
 		if !info.PrefaultsUnconditionally() {
 			return ch.MemRestoreOnDemand, false
 		}
+		if c.allowPrefault {
+			return ch.MemRestoreOnDemand, false
+		}
 		if c.noBackgroundFetch && info.HasFeature(ch.FeatureRestoreBackgroundFetchPages) {
 			return ch.MemRestoreOnDemand, true
 		}
@@ -270,4 +288,30 @@ type vmmLaunchResult struct {
 	client *ch.Client
 	err    error
 	took   time.Duration
+}
+
+// snapshotWhilePrefaulting snapshots the paused guest, retrying for up to wait
+// while the VMM refuses because its OnDemand background prefault has not
+// finished yet (cloud-hypervisor >= 53 rejects vm.snapshot until then). Only
+// "ondemand-prefault" restores can be in that state.
+func snapshotWhilePrefaulting(ctx context.Context, client *ch.Client, dir string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		err := client.Snapshot(ctx, dir)
+		if err == nil || !isRestoringError(err) || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// isRestoringError reports whether err is cloud-hypervisor refusing an
+// operation because an OnDemand restore is still faulting in guest RAM.
+func isRestoringError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "on-demand memory restore is still in progress") || strings.Contains(msg, "VmRestoring")
 }

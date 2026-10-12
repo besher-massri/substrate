@@ -84,6 +84,11 @@ type runningActor struct {
 	// there is no delta to overlay onto restoreSourceDir.
 	snapshotIsSelfContained bool
 
+	// onDemandPrefaulting is set for an opt-in "ondemand-prefault" restore: the
+	// VMM is still faulting the rest of guest RAM in the background for a while
+	// after the restore, and refuses vm.snapshot until it is done.
+	onDemandPrefaulting bool
+
 	// guestAgent is the kata-agent ttrpc client retained past boot. Two things
 	// share it: the stdout/stderr forwarding goroutines (they pump the
 	// container's output via ReadStdout/ReadStderr on this connection for the
