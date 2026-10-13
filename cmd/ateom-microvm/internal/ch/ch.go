@@ -102,7 +102,7 @@ func (c *Client) WaitReady(ctx context.Context, deadline time.Duration) (VMMInfo
 		select {
 		case <-ctx.Done():
 			return VMMInfo{}, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(1 * time.Millisecond):
 		}
 	}
 }

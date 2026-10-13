@@ -251,29 +251,6 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			srcID = v
 		}
 	}
-	deltaMarker := filepath.Join(restoreDir, goldenDeltaFile)
-	restoreMem := filepath.Join(restoreDir, "memory-ranges")
-	if _, derr := os.Stat(deltaMarker); derr == nil {
-		cacheDir, ok := goldenBaseCacheDir(restoreDir, srcID)
-		if !ok {
-			return fmt.Errorf("golden-delta snapshot present but invalid base-id %q", srcID)
-		}
-		cacheFile := filepath.Join(cacheDir, "memory-ranges")
-		tReconstruct := time.Now()
-		if err := ch.MergeSparseOverlay(ctx, cacheFile, restoreMem, restoreMem); err != nil {
-			return fmt.Errorf("while reconstructing warm snapshot from golden base %q: %w", srcID, err)
-		}
-		_ = os.Remove(deltaMarker)
-		slog.InfoContext(ctx, "Reconstructed warm snapshot from golden base",
-			slog.String("id", actorUID), slog.String("base_id", srcID), slog.Duration("reconstruct", time.Since(tReconstruct)))
-	} else {
-		ensureGoldenBaseCached(ctx, restoreDir, srcID, restoreMem)
-	}
-	if s.fast.readahead {
-		// Opt-in: get the memory image's disk reads going now, so they overlap the
-		// rootfs, network and VMM set-up below instead of landing in vm.restore.
-		go readaheadMemoryImage(context.WithoutCancel(ctx), restoreMem)
-	}
 	if err := os.MkdirAll(kata.VMDir(actorUID), 0o700); err != nil {
 		return fmt.Errorf("while creating VM dir: %w", err)
 	}
@@ -285,7 +262,7 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api-restore.sock")
 	// Opt-in early VMM launch: the VMM needs only its leaf and api-socket, so
 	// start it now and join it right before vm.restore, overlapping its start-up
-	// with the rootfs, virtiofsd and tap set-up.
+	// with the rootfs, virtiofsd, tap and golden-delta slot overlay.
 	var leaf *ateomcgroup.ActorLeaf
 	var earlyLaunch chan vmmLaunchResult
 	var earlyLaunchTook time.Duration
@@ -314,6 +291,53 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			}
 		}()
 	}
+
+	deltaMarker := filepath.Join(restoreDir, goldenDeltaFile)
+	restoreMem := filepath.Join(restoreDir, "memory-ranges")
+	type reconstructResult struct {
+		commit func(eager bool)
+		abort  func()
+		err    error
+	}
+	reconstructDone := make(chan reconstructResult, 1)
+	reconstructJoined := false
+	go func() {
+		if _, derr := os.Stat(deltaMarker); derr == nil {
+			cacheDir, ok := goldenBaseCacheDir(restoreDir, srcID)
+			if !ok {
+				reconstructDone <- reconstructResult{err: fmt.Errorf("golden-delta snapshot present but invalid base-id %q", srcID)}
+				return
+			}
+			cacheFile := filepath.Join(cacheDir, "memory-ranges")
+			tReconstruct := time.Now()
+			commitFn, abortFn, rerr := acquireGoldenSlotOverlay(ctx, cacheFile, restoreMem, restoreMem)
+			if rerr != nil {
+				reconstructDone <- reconstructResult{err: fmt.Errorf("while reconstructing warm snapshot from golden base %q: %w", srcID, rerr)}
+				return
+			}
+			slog.InfoContext(ctx, "Reconstructed warm snapshot from golden base",
+				slog.String("id", actorUID), slog.String("base_id", srcID), slog.Duration("reconstruct", time.Since(tReconstruct)))
+			reconstructDone <- reconstructResult{commit: commitFn, abort: abortFn}
+			return
+		}
+		ensureGoldenBaseCached(ctx, restoreDir, srcID, restoreMem)
+		if cacheDir, ok := goldenBaseCacheDir(restoreDir, srcID); ok {
+			maybePrewarmGoldenSlots(filepath.Join(cacheDir, "memory-ranges"))
+		}
+		if s.fast.readahead {
+			// Opt-in: get the memory image's disk reads going now, so they overlap the
+			// rootfs, network and VMM set-up below instead of landing in vm.restore.
+			go readaheadMemoryImage(context.WithoutCancel(ctx), restoreMem)
+		}
+		reconstructDone <- reconstructResult{}
+	}()
+	defer func() {
+		if !reconstructJoined {
+			if res := <-reconstructDone; res.abort != nil {
+				res.abort()
+			}
+		}
+	}()
 	tPrep := time.Now()
 
 	// MEMORY snapshots carry each container's upper as a tar (rootfsUpperTarFile).
@@ -369,24 +393,10 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		}
 		defer leaf.Close()
 	}
-	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if retErr != nil && vfsdCmd.Process != nil {
-			_ = vfsdCmd.Process.Kill()
-			_, _ = vfsdCmd.Process.Wait()
-		}
-	}()
 
-	tLowers := time.Now()
-	tDurable := tLowers
-
-	// Networking: rebuild the actor's namespace; the snapshot's virtio-net is
-	// fd-backed, so CH needs fresh tap FDs (net_fds) on restore. The caller
-	// unhosts on failure, once the defers here have stopped the actor's
-	// processes.
+	// Networking: rebuild the actor's namespace concurrently with stageMergedRootfs;
+	// the snapshot's virtio-net is fd-backed, so CH needs fresh tap FDs (net_fds)
+	// on restore.
 	defer func() {
 		if retErr != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -401,29 +411,76 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			}
 		}
 	}()
-	netDevs, err := ch.SnapshotNetDevices(restoreDir)
-	if err != nil {
-		return fmt.Errorf("while reading snapshot net devices: %w", err)
+	type tapSetupResult struct {
+		nets  []ch.RestoredNet
+		files []*os.File
+		err   error
 	}
-	var restoredNets []ch.RestoredNet
+	tapDone := make(chan tapSetupResult, 1)
+	tapJoined := false
+	go func() {
+		netDevs, nerr := ch.SnapshotNetDevices(restoreDir)
+		if nerr != nil {
+			tapDone <- tapSetupResult{err: fmt.Errorf("while reading snapshot net devices: %w", nerr)}
+			return
+		}
+		var rNets []ch.RestoredNet
+		var tFiles []*os.File
+		for i, nd := range netDevs {
+			files, terr := setupActorTap(ctx, s.sandboxNetNS(actorUID), fmt.Sprintf("tap%d_kata", i), nd.QueuePairs)
+			if terr != nil {
+				for _, f := range tFiles {
+					_ = f.Close()
+				}
+				tapDone <- tapSetupResult{err: fmt.Errorf("while building restore tap for %s: %w", nd.ID, terr)}
+				return
+			}
+			tFiles = append(tFiles, files...)
+			rn := ch.RestoredNet{ID: nd.ID}
+			for _, f := range files {
+				rn.FDs = append(rn.FDs, int(f.Fd()))
+			}
+			rNets = append(rNets, rn)
+		}
+		tapDone <- tapSetupResult{nets: rNets, files: tFiles}
+	}()
+	defer func() {
+		if !tapJoined {
+			if tr := <-tapDone; tr.err == nil {
+				for _, f := range tr.files {
+					_ = f.Close()
+				}
+			}
+		}
+	}()
+
+	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil && vfsdCmd.Process != nil {
+			_ = vfsdCmd.Process.Kill()
+			_, _ = vfsdCmd.Process.Wait()
+		}
+	}()
+
+	tLowers := time.Now()
+	tDurable := tLowers
+
+	tapRes := <-tapDone
+	tapJoined = true
 	var tapFiles []*os.File
 	defer func() {
 		for _, f := range tapFiles {
 			_ = f.Close()
 		}
 	}()
-	for i, nd := range netDevs {
-		files, terr := setupActorTap(ctx, s.sandboxNetNS(actorUID), fmt.Sprintf("tap%d_kata", i), nd.QueuePairs)
-		if terr != nil {
-			return fmt.Errorf("while building restore tap for %s: %w", nd.ID, terr)
-		}
-		tapFiles = append(tapFiles, files...)
-		rn := ch.RestoredNet{ID: nd.ID}
-		for _, f := range files {
-			rn.FDs = append(rn.FDs, int(f.Fd()))
-		}
-		restoredNets = append(restoredNets, rn)
+	if tapRes.err != nil {
+		return tapRes.err
 	}
+	tapFiles = tapRes.files
+	restoredNets := tapRes.nets
 
 	// Relaunch CH and restore with the tap FDs attached (SCM_RIGHTS). CH reopens
 	// /dev/vda (image) + each /dev/vd{b+i} (actor rootfs) from the snapshot config paths.
@@ -449,6 +506,16 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			_, _ = chCmd.Process.Wait()
 		}
 	}()
+
+	recRes := <-reconstructDone
+	reconstructJoined = true
+	if recRes.abort != nil {
+		defer recRes.abort()
+	}
+	if recRes.err != nil {
+		return recRes.err
+	}
+
 	// How guest RAM comes back depends on the VMM (see restoreMemMode), and the rest
 	// of the actor's lifecycle follows from that choice:
 	//
@@ -472,6 +539,10 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	}
 	if err := client.RestoreWithNetFDsOpts(ctx, restoreDir, restoredNets, restoreOpts); err != nil {
 		return fmt.Errorf("while restoring VM with net FDs: %w", err)
+	}
+	if recRes.commit != nil {
+		_ = os.Remove(deltaMarker)
+		recRes.commit(memMode == ch.MemRestoreEager && !preserveRestoreDir)
 	}
 	tVMRestore := time.Now()
 	if err := client.Resume(ctx); err != nil {

@@ -336,6 +336,179 @@ func allZero(b []byte) bool {
 	return bytes.Equal(b, zeroBlock[:len(b)])
 }
 
+// ByteRange is a [Offset, Offset+Length) extent modified in a reusable slot.
+type ByteRange struct {
+	Offset int64
+	Length int64
+}
+
+// CopySparseFileFast creates dstPath as a sparse copy of an already-sparse
+// srcPath using copy_file_range(2) over SEEK_DATA/SEEK_HOLE extents, falling
+// back to copySparseFile if copy_file_range is unsupported on the filesystem.
+func CopySparseFileFast(ctx context.Context, srcPath, dstPath string) error {
+	s, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	si, err := s.Stat()
+	if err != nil {
+		return err
+	}
+	d, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	size := si.Size()
+	if err := d.Truncate(size); err != nil {
+		return err
+	}
+	sfd := int(s.Fd())
+	dfd := int(d.Fd())
+	for off := int64(0); off < size; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ds, err := unix.Seek(sfd, off, unix.SEEK_DATA)
+		if errors.Is(err, unix.ENXIO) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("SEEK_DATA: %w", err)
+		}
+		de, err := unix.Seek(sfd, ds, unix.SEEK_HOLE)
+		if err != nil {
+			return fmt.Errorf("SEEK_HOLE: %w", err)
+		}
+		for pos := ds; pos < de; {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			rOff := pos
+			wOff := pos
+			chunk := int(min(int64(1<<26), de-pos))
+			n, cerr := unix.CopyFileRange(sfd, &rOff, dfd, &wOff, chunk, 0)
+			if cerr != nil {
+				if errors.Is(cerr, unix.EINTR) || errors.Is(cerr, unix.EAGAIN) {
+					continue
+				}
+				_ = d.Close()
+				return copySparseFile(ctx, srcPath, dstPath)
+			}
+			if n <= 0 {
+				_ = d.Close()
+				return copySparseFile(ctx, srcPath, dstPath)
+			}
+			pos += int64(n)
+		}
+		off = de
+	}
+	return d.Close()
+}
+
+// OverlaySparseRegionsRecorded overwrites dst with every populated (non-hole)
+// region of src at the same byte offsets and returns the modified [Offset,
+// Offset+Length) extents so the caller can later restore only those ranges from
+// an immutable base file via RestoreSparseRegions.
+func OverlaySparseRegionsRecorded(src, dst *os.File) ([]ByteRange, error) {
+	si, err := src.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := si.Size()
+	sfd := int(src.Fd())
+	buf := make([]byte, 1<<20)
+	var ranges []ByteRange
+	for off := int64(0); off < size; {
+		ds, err := unix.Seek(sfd, off, unix.SEEK_DATA)
+		if err != nil {
+			if errors.Is(err, unix.ENXIO) {
+				break
+			}
+			return ranges, fmt.Errorf("SEEK_DATA: %w", err)
+		}
+		de, err := unix.Seek(sfd, ds, unix.SEEK_HOLE)
+		if err != nil {
+			return ranges, fmt.Errorf("SEEK_HOLE: %w", err)
+		}
+		ranges = append(ranges, ByteRange{Offset: ds, Length: de - ds})
+		for pos := ds; pos < de; {
+			n := min(int64(len(buf)), de-pos)
+			if _, err := src.ReadAt(buf[:n], pos); err != nil {
+				return ranges, fmt.Errorf("reading delta region at %d: %w", pos, err)
+			}
+			if _, err := dst.WriteAt(buf[:n], pos); err != nil {
+				return ranges, fmt.Errorf("writing slot region at %d: %w", pos, err)
+			}
+			pos += n
+		}
+		off = de
+	}
+	return ranges, nil
+}
+
+// RestoreSparseRegions resets the specified byte ranges of slot back to match
+// base (punching holes where base has holes and copying data where base has
+// populated extents).
+func RestoreSparseRegions(base, slot *os.File, ranges []ByteRange) error {
+	if len(ranges) == 0 {
+		return nil
+	}
+	bi, err := base.Stat()
+	if err != nil {
+		return err
+	}
+	size := bi.Size()
+	bfd := int(base.Fd())
+	sfd := int(slot.Fd())
+	buf := make([]byte, 1<<20)
+	for _, r := range ranges {
+		start := max(int64(0), r.Offset)
+		end := min(size, r.Offset+r.Length)
+		for off := start; off < end; {
+			ds, err := unix.Seek(bfd, off, unix.SEEK_DATA)
+			if err != nil {
+				if errors.Is(err, unix.ENXIO) {
+					ds = end
+				} else {
+					return fmt.Errorf("base SEEK_DATA: %w", err)
+				}
+			}
+			if ds > end {
+				ds = end
+			}
+			if ds > off {
+				if err := unix.Fallocate(sfd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, off, ds-off); err != nil {
+					return fmt.Errorf("punch hole [%d, %d): %w", off, ds, err)
+				}
+			}
+			if ds >= end {
+				break
+			}
+			de, err := unix.Seek(bfd, ds, unix.SEEK_HOLE)
+			if err != nil {
+				return fmt.Errorf("base SEEK_HOLE: %w", err)
+			}
+			if de > end {
+				de = end
+			}
+			for pos := ds; pos < de; {
+				n := min(int64(len(buf)), de-pos)
+				if _, err := base.ReadAt(buf[:n], pos); err != nil {
+					return fmt.Errorf("reading base region at %d: %w", pos, err)
+				}
+				if _, err := slot.WriteAt(buf[:n], pos); err != nil {
+					return fmt.Errorf("writing slot region at %d: %w", pos, err)
+				}
+				pos += n
+			}
+			off = de
+		}
+	}
+	return nil
+}
+
 // DeflateAgainstBase turns a complete memory-ranges snapshot (targetFile) into a
 // sparse differential overlay against an immutable base memory-ranges (baseFile)
 // in place. Every 4 KiB page in targetFile that is byte-identical to baseFile is
@@ -448,4 +621,118 @@ func DeflateAgainstBase(ctx context.Context, baseFile, targetFile string) error 
 		off = nextData + n
 	}
 	return tf.Close()
+}
+
+// CreateDeltaAgainstBase writes a sparse differential overlay (deltaFile) of
+// targetFile against an immutable base memory-ranges (baseFile) without
+// modifying targetFile. Every 4 KiB page in targetFile that differs from
+// baseFile is written at its offset in deltaFile (including explicit zero
+// blocks where baseFile was non-zero and targetFile is all zeros) so that
+// MergeSparseOverlay(ctx, baseFile, deltaFile, outFile) reconstructs targetFile
+// byte-for-bit.
+func CreateDeltaAgainstBase(ctx context.Context, baseFile, targetFile, deltaFile string) error {
+	bf, err := os.Open(baseFile)
+	if err != nil {
+		return fmt.Errorf("open base %q: %w", baseFile, err)
+	}
+	defer bf.Close()
+	bi, err := bf.Stat()
+	if err != nil {
+		return err
+	}
+
+	tf, err := os.Open(targetFile)
+	if err != nil {
+		return fmt.Errorf("open target %q: %w", targetFile, err)
+	}
+	defer tf.Close()
+	ti, err := tf.Stat()
+	if err != nil {
+		return err
+	}
+	if bi.Size() != ti.Size() {
+		return fmt.Errorf("CreateDeltaAgainstBase: size mismatch base=%d target=%d", bi.Size(), ti.Size())
+	}
+
+	df, err := os.OpenFile(deltaFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create delta %q: %w", deltaFile, err)
+	}
+	defer df.Close()
+	size := ti.Size()
+	if err := df.Truncate(size); err != nil {
+		return err
+	}
+
+	bfd := int(bf.Fd())
+	tfd := int(tf.Fd())
+	const chunkSize = 1 << 20
+	bBuf := make([]byte, chunkSize)
+	tBuf := make([]byte, chunkSize)
+
+	for off := int64(0); off < size; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		bData, bErr := unix.Seek(bfd, off, unix.SEEK_DATA)
+		if bErr != nil {
+			if errors.Is(bErr, unix.ENXIO) {
+				bData = size
+			} else {
+				return fmt.Errorf("base SEEK_DATA: %w", bErr)
+			}
+		}
+		tData, tErr := unix.Seek(tfd, off, unix.SEEK_DATA)
+		if tErr != nil {
+			if errors.Is(tErr, unix.ENXIO) {
+				tData = size
+			} else {
+				return fmt.Errorf("target SEEK_DATA: %w", tErr)
+			}
+		}
+		nextData := min(bData, tData)
+		nextData &= ^int64(sparseBlock - 1)
+		if nextData < off {
+			nextData = off
+		}
+		if nextData >= size {
+			break
+		}
+
+		n := min(int64(chunkSize), size-nextData)
+		clear(bBuf[:n])
+		clear(tBuf[:n])
+		if _, err := bf.ReadAt(bBuf[:n], nextData); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read base at %d: %w", nextData, err)
+		}
+		if _, err := tf.ReadAt(tBuf[:n], nextData); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read target at %d: %w", nextData, err)
+		}
+
+		writeStart := int64(-1)
+		for i := int64(0); i < n; i += sparseBlock {
+			end := min(i+sparseBlock, n)
+			bPage := bBuf[i:end]
+			tPage := tBuf[i:end]
+			if !bytes.Equal(bPage, tPage) {
+				if writeStart < 0 {
+					writeStart = i
+				}
+				continue
+			}
+			if writeStart >= 0 {
+				if _, err := df.WriteAt(tBuf[writeStart:i], nextData+writeStart); err != nil {
+					return fmt.Errorf("write delta [%d, %d): %w", nextData+writeStart, nextData+i, err)
+				}
+				writeStart = -1
+			}
+		}
+		if writeStart >= 0 {
+			if _, err := df.WriteAt(tBuf[writeStart:n], nextData+writeStart); err != nil {
+				return fmt.Errorf("write delta [%d, %d): %w", nextData+writeStart, nextData+n, err)
+			}
+		}
+		off = nextData + n
+	}
+	return df.Close()
 }

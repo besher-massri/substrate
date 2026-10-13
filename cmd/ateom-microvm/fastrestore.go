@@ -24,8 +24,11 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -360,4 +363,238 @@ func snapshotWhilePrefaulting(ctx context.Context, client *ch.Client, dir string
 func isRestoringError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "on-demand memory restore is still in progress") || strings.Contains(msg, "VmRestoring")
+}
+
+const (
+	goldenSlotPoolCap      = 8
+	goldenSlotPrewarmCount = 6
+)
+
+var goldenPools sync.Map // baseFile string -> *baseSlotPool
+
+type goldenSlot struct {
+	path string
+}
+
+type baseSlotPool struct {
+	baseFile    string
+	slotDir     string
+	idle        chan *goldenSlot
+	prewarmOnce sync.Once
+	nextID      atomic.Uint64
+}
+
+func getOrCreateBaseSlotPool(baseFile string) *baseSlotPool {
+	if v, ok := goldenPools.Load(baseFile); ok {
+		return v.(*baseSlotPool)
+	}
+	baseDir := filepath.Dir(baseFile)
+	slotDir := filepath.Join(baseDir, fmt.Sprintf("slots-%d", os.Getpid()))
+	pool := &baseSlotPool{
+		baseFile: baseFile,
+		slotDir:  slotDir,
+		idle:     make(chan *goldenSlot, goldenSlotPoolCap),
+	}
+	actual, loaded := goldenPools.LoadOrStore(baseFile, pool)
+	if loaded {
+		return actual.(*baseSlotPool)
+	}
+	// Best-effort cleanup of slot directories from dead ateom-microvm PIDs.
+	if entries, err := os.ReadDir(baseDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), "slots-") {
+				continue
+			}
+			pidStr := strings.TrimPrefix(e.Name(), "slots-")
+			pid, perr := strconv.Atoi(pidStr)
+			if perr != nil || pid == os.Getpid() {
+				continue
+			}
+			if kerr := unix.Kill(pid, 0); errors.Is(kerr, unix.ESRCH) {
+				_ = os.RemoveAll(filepath.Join(baseDir, e.Name()))
+			}
+		}
+	}
+	_ = os.MkdirAll(slotDir, 0o700)
+	return pool
+}
+
+// maybePrewarmGoldenSlots asynchronously populates reusable golden-base slot
+// files once baseFile exists so warm restores never copy the 168 MiB base on
+// the critical path.
+func maybePrewarmGoldenSlots(baseFile string) {
+	if os.Getenv("ATEOM_MICROVM_DISABLE_GOLDEN_SLOT_POOL") == "true" {
+		return
+	}
+	if _, err := os.Stat(baseFile); err != nil {
+		return
+	}
+	pool := getOrCreateBaseSlotPool(baseFile)
+	pool.prewarmOnce.Do(func() {
+		go func() {
+			for i := 0; i < goldenSlotPrewarmCount; i++ {
+				pool.replenishOneSlot()
+			}
+		}()
+	})
+}
+
+func (p *baseSlotPool) replenishOneSlot() {
+	if err := os.MkdirAll(p.slotDir, 0o700); err != nil {
+		return
+	}
+	slotPath := filepath.Join(p.slotDir, fmt.Sprintf("slot-%d", p.nextID.Add(1)))
+	if err := ch.CopySparseFileFast(context.Background(), p.baseFile, slotPath); err != nil {
+		_ = os.Remove(slotPath)
+		return
+	}
+	select {
+	case p.idle <- &goldenSlot{path: slotPath}:
+	default:
+		_ = os.Remove(slotPath)
+	}
+}
+
+func (p *baseSlotPool) resetAndReturnSlot(slot *goldenSlot, dirtyRanges []ch.ByteRange) {
+	if slot == nil {
+		return
+	}
+	bf, err := os.Open(p.baseFile)
+	if err != nil {
+		_ = os.Remove(slot.path)
+		return
+	}
+	defer bf.Close()
+	sf, err := os.OpenFile(slot.path, os.O_RDWR, 0o600)
+	if err != nil {
+		_ = os.Remove(slot.path)
+		return
+	}
+	rerr := ch.RestoreSparseRegions(bf, sf, dirtyRanges)
+	cerr := sf.Close()
+	if rerr != nil || cerr != nil {
+		_ = os.Remove(slot.path)
+		return
+	}
+	select {
+	case p.idle <- slot:
+	default:
+		_ = os.Remove(slot.path)
+	}
+}
+
+// acquireGoldenSlotOverlay overlays deltaFile's populated pages onto a
+// pre-staged golden-base slot file (~7 MiB write instead of a 168 MiB base copy)
+// and links it at outFile for vm.restore.
+//
+// Call commit(true) once an eager vm.restore finishes (unlinks outFile and
+// asynchronously resets the modified ~7 MiB ranges of the slot for reuse), or
+// commit(false) for OnDemand/preserved restores (detaches the slot so outFile
+// remains owned exclusively by the actor). Defer abort() so any failure before
+// commit restores deltaFile at outFile and returns the reset slot to the pool.
+func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile string) (commit func(eager bool), abort func(), err error) {
+	if os.Getenv("ATEOM_MICROVM_DISABLE_GOLDEN_SLOT_POOL") == "true" {
+		if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
+			return nil, nil, err
+		}
+		return func(bool) {}, func() {}, nil
+	}
+	maybePrewarmGoldenSlots(baseFile)
+	bi, err := os.Stat(baseFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat base %q: %w", baseFile, err)
+	}
+	di, err := os.Stat(deltaFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat delta %q: %w", deltaFile, err)
+	}
+	if bi.Size() != di.Size() {
+		return nil, nil, fmt.Errorf("acquireGoldenSlotOverlay: size mismatch base=%d delta=%d", bi.Size(), di.Size())
+	}
+
+	pool := getOrCreateBaseSlotPool(baseFile)
+	var slot *goldenSlot
+	for {
+		select {
+		case s := <-pool.idle:
+			if st, serr := os.Stat(s.path); serr == nil && st.Size() == bi.Size() && !sharesInode(s.path) {
+				slot = s
+				break
+			}
+			_ = os.Remove(s.path)
+			continue
+		default:
+		}
+		break
+	}
+	if slot == nil {
+		if err := os.MkdirAll(pool.slotDir, 0o700); err != nil {
+			return nil, nil, err
+		}
+		slotPath := filepath.Join(pool.slotDir, fmt.Sprintf("slot-%d", pool.nextID.Add(1)))
+		if err := ch.CopySparseFileFast(ctx, baseFile, slotPath); err != nil {
+			_ = os.Remove(slotPath)
+			return nil, nil, fmt.Errorf("staging golden slot: %w", err)
+		}
+		slot = &goldenSlot{path: slotPath}
+	}
+
+	df, err := os.Open(deltaFile)
+	if err != nil {
+		pool.resetAndReturnSlot(slot, nil)
+		return nil, nil, err
+	}
+	sf, err := os.OpenFile(slot.path, os.O_RDWR, 0o600)
+	if err != nil {
+		df.Close()
+		_ = os.Remove(slot.path)
+		return nil, nil, err
+	}
+	dirtyRanges, oerr := ch.OverlaySparseRegionsRecorded(df, sf)
+	scloseErr := sf.Close()
+	df.Close()
+	if oerr != nil || scloseErr != nil {
+		_ = os.Remove(slot.path)
+		if oerr != nil {
+			return nil, nil, oerr
+		}
+		return nil, nil, scloseErr
+	}
+
+	deltaBackup := outFile + ".delta.bak"
+	_ = os.Remove(deltaBackup)
+	if err := os.Rename(outFile, deltaBackup); err != nil {
+		go pool.resetAndReturnSlot(slot, dirtyRanges)
+		return nil, nil, fmt.Errorf("backup delta %q: %w", outFile, err)
+	}
+	if err := os.Link(slot.path, outFile); err != nil {
+		_ = os.Rename(deltaBackup, outFile)
+		go pool.resetAndReturnSlot(slot, dirtyRanges)
+		if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
+			return nil, nil, err
+		}
+		return func(bool) {}, func() {}, nil
+	}
+
+	var once sync.Once
+	commitFn := func(eager bool) {
+		once.Do(func() {
+			_ = os.Remove(deltaBackup)
+			if eager {
+				_ = os.Remove(outFile)
+				go pool.resetAndReturnSlot(slot, dirtyRanges)
+			} else {
+				_ = os.Remove(slot.path)
+				go pool.replenishOneSlot()
+			}
+		})
+	}
+	abortFn := func() {
+		once.Do(func() {
+			_ = os.Remove(outFile)
+			_ = os.Rename(deltaBackup, outFile)
+			go pool.resetAndReturnSlot(slot, dirtyRanges)
+		})
+	}
+	return commitFn, abortFn, nil
 }

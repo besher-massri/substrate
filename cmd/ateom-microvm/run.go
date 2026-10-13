@@ -1013,10 +1013,14 @@ func dialAgentRetry(ctx context.Context, vsockPath string, timeout time.Duration
 		if time.Now().After(deadline) {
 			return nil, lastErr
 		}
+		wait := agentDialInterval
+		if attempt <= 25 {
+			wait = 1 * time.Millisecond
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(agentDialInterval):
+		case <-time.After(wait):
 		}
 	}
 }

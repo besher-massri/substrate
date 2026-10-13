@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -312,5 +313,111 @@ func TestSnapshotWhilePrefaulting(t *testing.T) {
 	err := snapshotWhilePrefaulting(context.Background(), client, filepath.Join(t.TempDir(), "snap"), 120*time.Millisecond)
 	if err == nil || !isRestoringError(err) {
 		t.Errorf("snapshotWhilePrefaulting past its deadline = %v, want the restoring error", err)
+	}
+}
+
+func TestAcquireGoldenSlotOverlay(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	const page = 4096
+	const totalSize = 8 * page
+
+	baseFile := filepath.Join(dir, "base", "memory-ranges")
+	if err := os.MkdirAll(filepath.Dir(baseFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bf, err := os.Create(baseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bf.Truncate(totalSize); err != nil {
+		t.Fatal(err)
+	}
+	// Populate pages 1 and 3 in base; leave pages 0, 2, 4..7 as holes.
+	if _, err := bf.WriteAt(bytes.Repeat([]byte{0x11}, page), 1*page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bf.WriteAt(bytes.Repeat([]byte{0x33}, page), 3*page); err != nil {
+		t.Fatal(err)
+	}
+	if err := bf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 12 sequential warm restores with different deltas to exercise slot
+	// creation, overlay, eager commit, background reset, and slot reuse.
+	for round := 0; round < 12; round++ {
+		targetSnap := filepath.Join(dir, "target.bin")
+		tf, err := os.Create(targetSnap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tf.Truncate(totalSize); err != nil {
+			t.Fatal(err)
+		}
+		// Keep page 1 == 0x11, zero out page 3 (was 0x33 in base!), write round-specific data to page 2 and page 5.
+		if _, err := tf.WriteAt(bytes.Repeat([]byte{0x11}, page), 1*page); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tf.WriteAt(bytes.Repeat([]byte{byte(0xA0 + round)}, page), 2*page); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tf.WriteAt(bytes.Repeat([]byte{byte(0xB0 + round)}, page), 5*page); err != nil {
+			t.Fatal(err)
+		}
+		if err := tf.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		wantBytes, err := os.ReadFile(targetSnap)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		restoreMem := filepath.Join(dir, "restore-memory-ranges")
+		if err := ch.CreateDeltaAgainstBase(ctx, baseFile, targetSnap, restoreMem); err != nil {
+			t.Fatalf("round %d CreateDeltaAgainstBase: %v", round, err)
+		}
+
+		commit, abort, err := acquireGoldenSlotOverlay(ctx, baseFile, restoreMem, restoreMem)
+		if err != nil {
+			t.Fatalf("round %d acquireGoldenSlotOverlay: %v", round, err)
+		}
+		gotBytes, err := os.ReadFile(restoreMem)
+		if err != nil {
+			abort()
+			t.Fatalf("round %d ReadFile(restoreMem): %v", round, err)
+		}
+		if !bytes.Equal(gotBytes, wantBytes) {
+			abort()
+			t.Fatalf("round %d reconstructed bytes mismatch with target", round)
+		}
+		commit(true)
+		abort() // no-op after commit
+
+		if _, err := os.Stat(restoreMem); !os.IsNotExist(err) {
+			t.Fatalf("round %d restoreMem still exists after eager commit", round)
+		}
+		// Give background reset goroutine a moment to return the slot to the pool so the next round reuses it.
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Verify abort() rolls back deltaFile at outFile.
+	restoreMem := filepath.Join(dir, "abort-memory-ranges")
+	deltaContent := bytes.Repeat([]byte{0xEE}, totalSize)
+	if err := os.WriteFile(restoreMem, deltaContent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, abort, err := acquireGoldenSlotOverlay(ctx, baseFile, restoreMem, restoreMem)
+	if err != nil {
+		t.Fatalf("acquireGoldenSlotOverlay for abort: %v", err)
+	}
+	abort()
+	rolledBack, err := os.ReadFile(restoreMem)
+	if err != nil {
+		t.Fatalf("ReadFile after abort: %v", err)
+	}
+	if !bytes.Equal(rolledBack, deltaContent) {
+		t.Fatalf("abort did not restore original delta file")
 	}
 }
