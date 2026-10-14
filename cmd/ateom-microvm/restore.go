@@ -34,6 +34,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateomcgroup"
 	"github.com/agent-substrate/substrate/internal/ateomphaselog"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
+	"github.com/agent-substrate/substrate/internal/ateomtunnel"
 
 	"github.com/agent-substrate/substrate/internal/ateomnet"
 
@@ -162,17 +163,21 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	attribution := p.actorAttribution()
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restoring", attribution)
 
+	tEndPrev := time.Now()
 	if err := s.endPreviousActivation(ctx, attribution.UID, req.GetActorDirs()); err != nil {
 		return nil, err
 	}
+	p.dEndPrev = time.Since(tEndPrev)
 	// Publish attribution before restore, so a stats read during it is
 	// attributed. A VOLUMES restore cold-boots, so its CPU counts from zero; the other
 	// scopes resume the guest's counters, so theirs counts from the first
 	// reading.
 	resumesGuest := req.GetFidelity() != ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+	tHost := time.Now()
 	if _, err := s.hostActor(ctx, attribution, resumesGuest); err != nil {
 		return nil, err
 	}
+	p.dHost = time.Since(tHost)
 	defer func() {
 		if retErr != nil {
 			// Detached: the RPC's context may be what failed it.
@@ -234,16 +239,46 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	actorUID := p.actorUID
 
 	rr := s.resolveRuntime(p.assetPaths)
-	egress, err := s.tunnel.PrepareEgress(ctx, p.attribution(), p.egressGateway)
-	if err != nil {
+	var err error
+	// Sub-phases of prep and lowers, logged with the opt-in phase attributes.
+	var dEgress, dCleanup, dRewrite, dLeaf, dVirtiofsd, dEgressWait time.Duration
+	// Mint the actor's egress certificate (an RPC to atelet), and repoint the
+	// snapshot's vsock socket to this actor's VMDir (the disk + kernel paths are
+	// content-addressed/per-actor and already line up on the same node). With
+	// the opt-in parallelPrep both run concurrently with the set-up below: the
+	// rewrite is joined before vm.restore reads the config, the egress before
+	// the guest resumes, so a failed mint still fails closed.
+	var egress *ateomtunnel.ActorEgress
+	prepareEgress := func() error {
+		t := time.Now()
+		e, err := s.tunnel.PrepareEgress(ctx, p.attribution(), p.egressGateway)
+		egress, dEgress = e, time.Since(t)
 		return err
 	}
+	rewrite := func() error {
+		t := time.Now()
+		err := rewriteSnapshotSocketPaths(restoreDir, actorUID)
+		dRewrite = time.Since(t)
+		if err != nil {
+			return fmt.Errorf("while rewriting snapshot socket paths: %w", err)
+		}
+		return nil
+	}
+	joinEgress, joinRewrite := noJoin, noJoin
+	if s.fast.parallelPrep {
+		joinEgress, joinRewrite = runAsync(prepareEgress), runAsync(rewrite)
+		// Every return drains both, so nothing outlives the restore attempt.
+		defer func() { _, _ = joinEgress(), joinRewrite() }()
+	} else if err := prepareEgress(); err != nil {
+		return err
+	}
+	tCleanup := time.Now()
 	s.cleanupSandboxState(ctx, actorUID)
-
-	// Repoint the snapshot's vsock socket to this actor's VMDir (the disk + kernel
-	// paths are content-addressed/per-actor and already line up on the same node).
-	if err := rewriteSnapshotSocketPaths(restoreDir, actorUID); err != nil {
-		return fmt.Errorf("while rewriting snapshot socket paths: %w", err)
+	dCleanup = time.Since(tCleanup)
+	if !s.fast.parallelPrep {
+		if err := rewrite(); err != nil {
+			return err
+		}
 	}
 	srcID := actorUID
 	if b, rerr := os.ReadFile(filepath.Join(restoreDir, baseIDFile)); rerr == nil {
@@ -267,9 +302,11 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	var earlyLaunch chan vmmLaunchResult
 	var earlyLaunchTook time.Duration
 	if s.fast.earlyVMMLaunch {
+		tLeaf := time.Now()
 		if leaf, err = s.actorLeaf(actorUID, leafSize); err != nil {
 			return err
 		}
+		dLeaf = time.Since(tLeaf)
 		defer leaf.Close()
 		earlyLaunch = make(chan vmmLaunchResult, 1)
 		go func() {
@@ -388,9 +425,11 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	}
 	tUpper := time.Now()
 	if leaf == nil {
+		tLeaf := time.Now()
 		if leaf, err = s.actorLeaf(actorUID, leafSize); err != nil {
 			return err
 		}
+		dLeaf = time.Since(tLeaf)
 		defer leaf.Close()
 	}
 
@@ -454,7 +493,8 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		}
 	}()
 
-	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
+	vfsdCmd, dVfsd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
+	dVirtiofsd = dVfsd
 	if err != nil {
 		return err
 	}
@@ -526,6 +566,10 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	//   - Eager: every populated extent is read here and now. Nothing pages from the
 	//     source afterwards and nothing merges against it, so it is dropped below and
 	//     the next snapshot stands on its own.
+	// vm.restore reads the rewritten config (opt-in parallelPrep).
+	if err := joinRewrite(); err != nil {
+		return err
+	}
 	tLaunch := time.Now()
 	memMode, noBackgroundFetch := restoreMemMode(ctx, client.Info()), false
 	if s.fast.memRestoreMode != "" || s.fast.noBackgroundFetch {
@@ -549,6 +593,11 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		}
 	}
 	tVMRestore := time.Now()
+	// The guest must not run before its egress is minted (opt-in parallelPrep).
+	if err := joinEgress(); err != nil {
+		return err
+	}
+	dEgressWait = time.Since(tVMRestore)
 	if err := client.Resume(ctx); err != nil {
 		return fmt.Errorf("while resuming restored guest: %w", err)
 	}
@@ -652,7 +701,17 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			slog.String("mem_mode", memMode),
 			slog.Bool("no_background_fetch", noBackgroundFetch),
 			slog.Int64("activation_millicpu", leafSize.MilliCPU),
-			slog.Bool("parallel_wakeup", s.fast.parallelWakeup))
+			slog.Bool("parallel_wakeup", s.fast.parallelWakeup),
+			// Sub-phases of prep and lowers (egress and rewrite overlap the rest
+			// with parallelPrep; egress_wait is what the guest then waited).
+			slog.Duration("prep_end_prev", p.dEndPrev),
+			slog.Duration("prep_host", p.dHost),
+			slog.Duration("prep_egress", dEgress),
+			slog.Duration("prep_cleanup", dCleanup),
+			slog.Duration("prep_rewrite", dRewrite),
+			slog.Duration("prep_leaf", dLeaf),
+			slog.Duration("lowers_virtiofsd", dVirtiofsd),
+			slog.Duration("egress_wait", dEgressWait))
 	}
 	slog.InfoContext(ctx, "Actor restore phases", phaseAttrs...)
 	// The joinable per-actor record the benchmarking tooling aggregates. The

@@ -137,10 +137,37 @@ func (s *AteomService) applySteadyCPUWeight(ctx context.Context, actorUID string
 	}
 }
 
+// raiseLeafForTeardown gives an actor's leaf its opt-in activation cpu.weight
+// before the actor is checkpointed or torn down. Its VMM and virtiofsd then
+// pause, snapshot and exit promptly: at a low steady weight on a saturated
+// node they can be starved for seconds while holding kernel locks their exit
+// takes (the mount namespace and cgroup locks), which every activation on the
+// node then waits behind.
+func (s *AteomService) raiseLeafForTeardown(ctx context.Context, actorUID string) {
+	s.setLeafWeightByUID(ctx, actorUID, s.fast.activationWeight(), "teardown")
+}
+
+// restoreSteadyWeightByUID puts a still-running actor's leaf back to its
+// steady weight (for example after a failed checkpoint left it running).
+func (s *AteomService) restoreSteadyWeightByUID(ctx context.Context, actorUID string) {
+	s.setLeafWeightByUID(ctx, actorUID, s.fast.steadyWeight(), "steady")
+}
+
+func (s *AteomService) setLeafWeightByUID(ctx context.Context, actorUID string, weight int, why string) {
+	if !s.actorCgroups || weight <= 0 {
+		return
+	}
+	if err := ateomcgroup.SetActorLeafCPUWeight(actorUID, weight); err != nil {
+		slog.WarnContext(ctx, "Could not set the actor's cpu.weight", slog.String("id", actorUID), slog.String("for", why), slog.Int("weight", weight), slog.Any("err", err))
+	}
+}
+
 // cleanupSandboxState kills what is left of the actor's host processes and
 // clears its sandbox directories.
 func (s *AteomService) cleanupSandboxState(ctx context.Context, actorUID string) {
 	if s.actorCgroups {
+		// Leftover processes exit faster at the activation weight (opt-in).
+		s.raiseLeafForTeardown(ctx, actorUID)
 		killCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := ateomcgroup.KillActorLeaf(killCtx, actorUID); err != nil {
 			slog.WarnContext(ctx, "Failed to kill the actor's leftover processes", slog.Any("err", err))

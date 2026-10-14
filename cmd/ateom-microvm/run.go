@@ -317,6 +317,9 @@ type actorBootParams struct {
 	// memory); a container's own cgroup limit comes from its declared resources.
 	// Zero fields keep the kata defaults.
 	size sizing.SandboxSize
+	// dEndPrev and dHost time a restore's first two set-up steps (ending a
+	// previous activation, hosting the actor's network), for the phase log.
+	dEndPrev, dHost time.Duration
 }
 
 func (p actorBootParams) attribution() resources.ActorAttribution {
@@ -486,7 +489,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 		return err
 	}
 	defer leaf.Close()
-	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
+	vfsdCmd, _, err := s.stageMergedRootfs(ctx, rr, actorUID, p.actorDirs, ctrs, containers, leaf.SysProcAttr())
 	if err != nil {
 		return err
 	}
@@ -686,35 +689,36 @@ func (s *AteomService) buildActorContainers(actorUID string, actorDirs *ateompb.
 // upper contents). The returned virtiofsd cmd outlives this call (CH
 // demand-pages from it); the caller owns it (tracked on runningActor, killed
 // in teardownActor).
-func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime, id string, actorDirs *ateompb.ActorDirs, ctrs []actorContainer, containers []*ateompb.Container, procAttr *syscall.SysProcAttr) (*exec.Cmd, error) {
+func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime, id string, actorDirs *ateompb.ActorDirs, ctrs []actorContainer, containers []*ateompb.Container, procAttr *syscall.SysProcAttr) (*exec.Cmd, time.Duration, error) {
 	upperBase := rootfsUpperDir(actorDirs)
 	for _, c := range ctrs {
 		if err := kata.StageMergedRootfs(ctx, c.bundleRootfs, upperBase, id, c.name); err != nil {
-			return nil, fmt.Errorf("while staging merged rootfs for %q: %w", c.name, err)
+			return nil, 0, fmt.Errorf("while staging merged rootfs for %q: %w", c.name, err)
 		}
 		for _, vm := range c.imageMounts {
 			src := imagecache.ImageVolumeMountPath(c.bundle, vm.GetVolumeName())
 			if err := kata.StageImageVolume(ctx, src, id, c.name, vm.GetVolumeName()); err != nil {
-				return nil, fmt.Errorf("while staging image volume %q for %q: %w", vm.GetVolumeName(), c.name, err)
+				return nil, 0, fmt.Errorf("while staging image volume %q for %q: %w", vm.GetVolumeName(), c.name, err)
 			}
 		}
 	}
 	if hasDurableVolumes(containers) {
 		if err := s.stageDurableVolumes(ctx, id, actorDirs.GetDurableDirVolumeMountsDir()); err != nil {
-			return nil, fmt.Errorf("while staging durable-dir volumes: %w", err)
+			return nil, 0, fmt.Errorf("while staging durable-dir volumes: %w", err)
 		}
 	}
 	if hasCsiVolumes(containers) {
 		if err := s.stageCsiVolumes(ctx, id, actorDirs.GetVolumesDir()); err != nil {
-			return nil, fmt.Errorf("while staging CSI volumes: %w", err)
+			return nil, 0, fmt.Errorf("while staging CSI volumes: %w", err)
 		}
 	}
 	if hasSystemInfoVolumes(containers) {
 		if err := s.stageSystemInfoVolumes(ctx, id, actorDirs.GetSystemInfoVolumeRootsDir()); err != nil {
-			return nil, fmt.Errorf("while staging system-info volumes: %w", err)
+			return nil, 0, fmt.Errorf("while staging system-info volumes: %w", err)
 		}
 	}
 	vfsdLog, _ := os.OpenFile(virtiofsdLogPath(id), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	tVfsd := time.Now()
 	vfsdCmd, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
 		Binary:      rr.virtiofsd,
 		SocketPath:  kata.VirtiofsdSocketPath(id),
@@ -722,10 +726,11 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 		Log:         vfsdLog,
 		SysProcAttr: procAttr,
 	})
+	dVfsd := time.Since(tVfsd)
 	if err != nil {
-		return nil, fmt.Errorf("while starting virtiofsd: %w", err)
+		return nil, dVfsd, fmt.Errorf("while starting virtiofsd: %w", err)
 	}
-	return vfsdCmd, nil
+	return vfsdCmd, dVfsd, nil
 }
 
 // guestConfig returns the default guest sizing and kernel params

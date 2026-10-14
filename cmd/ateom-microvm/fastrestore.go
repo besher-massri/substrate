@@ -121,6 +121,13 @@ const (
 	// PauseActor included) while it queues or runs slower.
 	envCheckpointConcurrency = "ATEOM_MICROVM_CHECKPOINT_CONCURRENCY"
 	envCheckpointNice        = "ATEOM_MICROVM_CHECKPOINT_NICE"
+	// envParallelPrep ("true") takes two steps of a restore's set-up off its
+	// critical path: minting the actor's egress certificate (an RPC to atelet)
+	// and rewriting the snapshot's config.json both run concurrently with the
+	// rest of the set-up. The rewrite is joined before vm.restore reads the
+	// config and the egress before the guest resumes, so a failed mint still
+	// fails the restore before the workload runs.
+	envParallelPrep = "ATEOM_MICROVM_PARALLEL_PREP"
 )
 
 // fastRestoreConfig is the parsed set of opt-in restore-latency knobs.
@@ -153,12 +160,15 @@ type fastRestoreConfig struct {
 	// checkpointNice is their thread niceness (0: inherited).
 	checkpointConcurrency int
 	checkpointNice        int
+	// parallelPrep overlaps the egress mint and the config rewrite with the
+	// rest of a restore's set-up.
+	parallelPrep bool
 }
 
 // enabled reports whether any knob is on, for the startup log.
 func (c fastRestoreConfig) enabled() bool {
 	return c.boost || c.parallelWakeup || c.memRestoreMode != "" || c.noBackgroundFetch || c.readahead || c.earlyVMMLaunch || c.tmpfsSlots ||
-		c.activationCPUWeight > 0 || c.steadyCPUWeight > 0 || c.selfCPUWeight > 0 || c.checkpointConcurrency > 0 || c.checkpointNice > 0
+		c.activationCPUWeight > 0 || c.steadyCPUWeight > 0 || c.selfCPUWeight > 0 || c.checkpointConcurrency > 0 || c.checkpointNice > 0 || c.parallelPrep
 }
 
 // logValue renders the config for the startup log.
@@ -189,6 +199,7 @@ func (c fastRestoreConfig) attrs() []any {
 		slog.Int("self_cpu_weight", c.selfCPUWeight),
 		slog.Int("checkpoint_concurrency", c.checkpointConcurrency),
 		slog.Int("checkpoint_nice", c.checkpointNice),
+		slog.Bool("parallel_prep", c.parallelPrep),
 	}
 }
 
@@ -207,6 +218,7 @@ func fastRestoreConfigFromEnv(getenv func(string) string) (fastRestoreConfig, er
 		{envRestoreReadahead, &c.readahead},
 		{envEarlyVMMLaunch, &c.earlyVMMLaunch},
 		{envTmpfsSlots, &c.tmpfsSlots},
+		{envParallelPrep, &c.parallelPrep},
 	} {
 		if *b.dst, err = parseBoolEnv(getenv(b.env), false); err != nil {
 			return fastRestoreConfig{}, fmt.Errorf("%s: %w", b.env, err)
@@ -292,6 +304,22 @@ func (c fastRestoreConfig) steadyWeight() int {
 		return ateomcgroup.DefaultCPUWeight
 	}
 	return 0
+}
+
+// noJoin is a join for work that already ran (or never runs).
+func noJoin() error { return nil }
+
+// runAsync starts fn in its own goroutine and returns a join: it waits for fn
+// the first time it is called and returns fn's error on every call.
+func runAsync(fn func() error) func() error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	var once sync.Once
+	var err error
+	return func() error {
+		once.Do(func() { err = <-done })
+		return err
+	}
 }
 
 // ckptGate is the opt-in throttle on checkpoint deflation (see

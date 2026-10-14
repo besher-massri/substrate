@@ -112,6 +112,21 @@ func setWorkerCPUWeightUnder(root string, weight int) error {
 	return setCPUWeight(filepath.Join(root, workerLeaf), weight)
 }
 
+// SetActorLeafCPUWeight sets the cpu.weight of the named actor's leaf without
+// opening it (and without touching its cpu.max). A leaf that does not exist,
+// or a node without the cpu controller, has nothing to change.
+func SetActorLeafCPUWeight(actorUID string, weight int) error {
+	return setActorLeafCPUWeightUnder(Root, actorUID, weight)
+}
+
+func setActorLeafCPUWeightUnder(root, actorUID string, weight int) error {
+	path, err := actorLeafPath(root, actorUID)
+	if err != nil {
+		return err
+	}
+	return setCPUWeight(path, weight)
+}
+
 func setCPUWeight(path string, weight int) error {
 	if weight < MinCPUWeight || weight > MaxCPUWeight {
 		return fmt.Errorf("cpu.weight %d is outside [%d, %d]", weight, MinCPUWeight, MaxCPUWeight)

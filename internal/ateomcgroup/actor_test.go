@@ -222,3 +222,32 @@ func TestSetWorkerCPUWeight(t *testing.T) {
 		t.Error("setWorkerCPUWeightUnder(0) succeeded, want an error")
 	}
 }
+
+// SetActorLeafCPUWeight weights an existing leaf by name and is a no-op for a
+// leaf that is gone.
+func TestSetActorLeafCPUWeight(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "uid-a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"cpu.max", "cpu.weight"} {
+		if err := os.WriteFile(filepath.Join(root, "uid-a", f), []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := setActorLeafCPUWeightUnder(root, "uid-a", 10000); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "uid-a", "cpu.weight")); string(got) != "10000" {
+		t.Errorf("cpu.weight = %q, want 10000", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "uid-a", "cpu.max")); string(got) != "keep" {
+		t.Errorf("cpu.max changed to %q", got)
+	}
+	if err := setActorLeafCPUWeightUnder(root, "uid-gone", 10000); err != nil {
+		t.Errorf("weighting a missing leaf: %v", err)
+	}
+	if err := setActorLeafCPUWeightUnder(root, "../escape", 10000); err == nil {
+		t.Error("weighting an unsafe leaf name succeeded")
+	}
+}

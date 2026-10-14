@@ -105,6 +105,16 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	actorUID := req.GetActorUid()
 	actorDirs := req.GetActorDirs()
 
+	// Opt-in: pause, snapshot and teardown run at the activation weight so the
+	// actor's VMM and virtiofsd are not starved at the steady one; a checkpoint
+	// that fails puts the still-running actor back to its steady weight.
+	s.raiseLeafForTeardown(ctx, actorUID)
+	defer func() {
+		if err != nil {
+			s.restoreSteadyWeightByUID(context.WithoutCancel(ctx), actorUID)
+		}
+	}()
+
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointing", attribution)
 
 	// Check what the request asks for BEFORE touching the guest: these are
@@ -365,6 +375,9 @@ func listFiles(dir string) ([]string, error) {
 // teardownActor stops the ateom-owned CH VMM for an actor. ra may be
 // nil (e.g. ateom restarted and lost in-memory state).
 func (s *AteomService) teardownActor(ctx context.Context, id string, actorDirs *ateompb.ActorDirs, ra *runningActor, client *ch.Client) error {
+	// Opt-in: let the VMM and virtiofsd exit at the activation weight, not the
+	// steady one (see raiseLeafForTeardown).
+	s.raiseLeafForTeardown(ctx, id)
 	// Stop offering the guest to GetWorkloadStats first, before anything below
 	// makes it stop answering. Clearing it here rather than alongside the
 	// attribution is what keeps a poll that lands mid-teardown on the

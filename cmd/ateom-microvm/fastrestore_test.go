@@ -895,3 +895,48 @@ func TestCheckpointGateNice(t *testing.T) {
 		t.Errorf("checkpoint thread priority = %d (raw), want %d", got, 20-19)
 	}
 }
+
+func TestFastRestoreConfigParallelPrep(t *testing.T) {
+	c, err := fastRestoreConfigFromEnv(envMap(map[string]string{envParallelPrep: "true"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.parallelPrep || !c.enabled() {
+		t.Errorf("config = %+v, want parallelPrep on and enabled", c)
+	}
+	if _, err := fastRestoreConfigFromEnv(envMap(map[string]string{envParallelPrep: "often"})); err == nil {
+		t.Error("parallel prep accepted an invalid value")
+	}
+}
+
+// runAsync's join waits for fn once and keeps returning its result; noJoin
+// never fails.
+func TestRunAsyncJoin(t *testing.T) {
+	if err := noJoin(); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	var runs atomic.Int32
+	join := runAsync(func() error {
+		runs.Add(1)
+		<-release
+		return errors.New("boom")
+	})
+	joined := make(chan error, 1)
+	go func() { joined <- join() }()
+	select {
+	case <-joined:
+		t.Fatal("join returned before fn finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-joined; err == nil || err.Error() != "boom" {
+		t.Fatalf("join = %v, want boom", err)
+	}
+	if err := join(); err == nil || err.Error() != "boom" {
+		t.Errorf("second join = %v, want boom again", err)
+	}
+	if n := runs.Load(); n != 1 {
+		t.Errorf("fn ran %d times, want 1", n)
+	}
+}
