@@ -940,3 +940,19 @@ func TestRunAsyncJoin(t *testing.T) {
 		t.Errorf("fn ran %d times, want 1", n)
 	}
 }
+
+func TestFastRestoreConfigFastSandboxCleanup(t *testing.T) {
+	c, err := fastRestoreConfigFromEnv(envMap(map[string]string{envFastSandboxCleanup: "true"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.fastSandboxCleanup || !c.enabled() {
+		t.Errorf("config = %+v, want fastSandboxCleanup on and enabled", c)
+	}
+	if c, err := fastRestoreConfigFromEnv(envMap(nil)); err != nil || c.fastSandboxCleanup {
+		t.Errorf("default config = %+v, %v; want fastSandboxCleanup off", c, err)
+	}
+	if _, err := fastRestoreConfigFromEnv(envMap(map[string]string{envFastSandboxCleanup: "sometimes"})); err == nil {
+		t.Error("fast sandbox cleanup accepted an invalid value")
+	}
+}

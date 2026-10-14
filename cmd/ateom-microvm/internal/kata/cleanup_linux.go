@@ -18,6 +18,8 @@ package kata
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,6 +30,29 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/agent-substrate/substrate/internal/nodepath"
+)
+
+// CleanupOptions are opt-in shortcuts for CleanupSandboxStateOpts. The zero
+// value is CleanupSandboxState's full sweep.
+type CleanupOptions struct {
+	// SkipIfDirsAbsent skips reading the mount table when none of the sandbox
+	// dirs exists: nothing can be mounted under a path that does not exist in
+	// this mount namespace (an unlinked mountpoint is detached everywhere), and
+	// there is nothing to remove. Reading mountinfo costs time proportional to
+	// every mount of every actor on the node.
+	SkipIfDirsAbsent bool
+	// SkipOrphanScan skips the /proc scan for orphaned VMM/virtiofsd
+	// processes. Only for callers that have already killed every process the
+	// sandbox can have left, e.g. by emptying the actor's cgroup leaf that all
+	// of them were spawned into. The scan reads the cmdline of every process
+	// in the namespace (three per running actor).
+	SkipOrphanScan bool
+}
+
+// readMountinfo and killOrphans are swapped out by tests.
+var (
+	readMountinfo = func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") }
+	killOrphans   = killOrphanedSandboxProcesses
 )
 
 // CleanupSandboxState removes leftover host-side state for a sandbox id (the
@@ -48,12 +73,39 @@ import (
 // next sweep (the stagers tolerate a leftover dir — they unmount stale binds
 // and reuse mountpoints).
 func CleanupSandboxState(ctx context.Context, id string) {
+	CleanupSandboxStateOpts(ctx, id, CleanupOptions{})
+}
+
+// CleanupSandboxStateOpts is CleanupSandboxState with opt-in shortcuts.
+func CleanupSandboxStateOpts(ctx context.Context, id string, opts CleanupOptions) {
 	dirs := []string{
 		filepath.Join("/run/kata-containers/shared/sandboxes", id),
 		filepath.Join(vcVMDir, id),
 	}
+	if !opts.SkipIfDirsAbsent || !allAbsent(dirs) {
+		removeSandboxDirs(ctx, dirs)
+	}
+	if !opts.SkipOrphanScan {
+		killOrphans(ctx, id)
+	}
+}
+
+// allAbsent reports whether none of paths exists. Anything other than a
+// clean "does not exist" counts as present.
+func allAbsent(paths []string) bool {
+	for _, p := range paths {
+		if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+	}
+	return true
+}
+
+// removeSandboxDirs lazily unmounts everything mounted under dirs, then
+// removes each dir whose mounts all detached.
+func removeSandboxDirs(ctx context.Context, dirs []string) {
 	removable := make(map[string]bool, len(dirs))
-	if b, err := os.ReadFile("/proc/self/mountinfo"); err != nil {
+	if b, err := readMountinfo(); err != nil {
 		// Without the mount table there is no telling what is still mounted
 		// under the dirs, so none of them is provably safe to remove.
 		slog.WarnContext(ctx, "Cannot read mountinfo; leaving sandbox dirs in place",
@@ -98,11 +150,14 @@ func CleanupSandboxState(ctx context.Context, id string) {
 				slog.String("dir", d), slog.Any("err", err))
 		}
 	}
-	// Kill orphaned per-sandbox processes (cloud-hypervisor / virtiofsd) left by
-	// a prior killed attempt: a canceled Create leaves the CH it spawned running
-	// (reparented to us) holding guest RAM and stale sockets. Matched strictly by
-	// the sandbox id (an actor UUID) appearing in the cmdline, so nothing
-	// unrelated can match.
+}
+
+// killOrphanedSandboxProcesses kills orphaned per-sandbox processes
+// (cloud-hypervisor / virtiofsd) left by a prior killed attempt: a canceled
+// Create leaves the CH it spawned running (reparented to us) holding guest RAM
+// and stale sockets. Matched strictly by the sandbox id (an actor UUID)
+// appearing in the cmdline, so nothing unrelated can match.
+func killOrphanedSandboxProcesses(ctx context.Context, id string) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return

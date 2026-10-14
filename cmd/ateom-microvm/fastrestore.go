@@ -128,6 +128,13 @@ const (
 	// config and the egress before the guest resumes, so a failed mint still
 	// fails the restore before the workload runs.
 	envParallelPrep = "ATEOM_MICROVM_PARALLEL_PREP"
+	// envFastSandboxCleanup ("true") shortens the sandbox sweep that runs
+	// before every activation and in every teardown: it skips reading the
+	// mount table when the sandbox dirs are already gone, and, with actor
+	// cgroups, skips the /proc scan for orphaned VMM/virtiofsd processes once
+	// the actor's leaf has been emptied (each of them is spawned into it). Both
+	// cost time proportional to every actor on the node.
+	envFastSandboxCleanup = "ATEOM_MICROVM_FAST_SANDBOX_CLEANUP"
 )
 
 // fastRestoreConfig is the parsed set of opt-in restore-latency knobs.
@@ -163,12 +170,15 @@ type fastRestoreConfig struct {
 	// parallelPrep overlaps the egress mint and the config rewrite with the
 	// rest of a restore's set-up.
 	parallelPrep bool
+	// fastSandboxCleanup shortens the per-activation sandbox sweep.
+	fastSandboxCleanup bool
 }
 
 // enabled reports whether any knob is on, for the startup log.
 func (c fastRestoreConfig) enabled() bool {
 	return c.boost || c.parallelWakeup || c.memRestoreMode != "" || c.noBackgroundFetch || c.readahead || c.earlyVMMLaunch || c.tmpfsSlots ||
-		c.activationCPUWeight > 0 || c.steadyCPUWeight > 0 || c.selfCPUWeight > 0 || c.checkpointConcurrency > 0 || c.checkpointNice > 0 || c.parallelPrep
+		c.activationCPUWeight > 0 || c.steadyCPUWeight > 0 || c.selfCPUWeight > 0 || c.checkpointConcurrency > 0 || c.checkpointNice > 0 || c.parallelPrep ||
+		c.fastSandboxCleanup
 }
 
 // logValue renders the config for the startup log.
@@ -200,6 +210,7 @@ func (c fastRestoreConfig) attrs() []any {
 		slog.Int("checkpoint_concurrency", c.checkpointConcurrency),
 		slog.Int("checkpoint_nice", c.checkpointNice),
 		slog.Bool("parallel_prep", c.parallelPrep),
+		slog.Bool("fast_sandbox_cleanup", c.fastSandboxCleanup),
 	}
 }
 
@@ -219,6 +230,7 @@ func fastRestoreConfigFromEnv(getenv func(string) string) (fastRestoreConfig, er
 		{envEarlyVMMLaunch, &c.earlyVMMLaunch},
 		{envTmpfsSlots, &c.tmpfsSlots},
 		{envParallelPrep, &c.parallelPrep},
+		{envFastSandboxCleanup, &c.fastSandboxCleanup},
 	} {
 		if *b.dst, err = parseBoolEnv(getenv(b.env), false); err != nil {
 			return fastRestoreConfig{}, fmt.Errorf("%s: %w", b.env, err)

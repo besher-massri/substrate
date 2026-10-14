@@ -165,16 +165,25 @@ func (s *AteomService) setLeafWeightByUID(ctx context.Context, actorUID string, 
 // cleanupSandboxState kills what is left of the actor's host processes and
 // clears its sandbox directories.
 func (s *AteomService) cleanupSandboxState(ctx context.Context, actorUID string) {
+	// Opt-in shortcuts (fastSandboxCleanup): skip the mount-table read when the
+	// sandbox dirs are already gone, and the /proc orphan scan once the actor's
+	// leaf is empty.
+	opts := kata.CleanupOptions{SkipIfDirsAbsent: s.fast.fastSandboxCleanup}
 	if s.actorCgroups {
 		// Leftover processes exit faster at the activation weight (opt-in).
 		s.raiseLeafForTeardown(ctx, actorUID)
 		killCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := ateomcgroup.KillActorLeaf(killCtx, actorUID); err != nil {
 			slog.WarnContext(ctx, "Failed to kill the actor's leftover processes", slog.Any("err", err))
+		} else {
+			// Every VMM and virtiofsd of the actor is spawned into its leaf
+			// (CLONE_INTO_CGROUP), so an emptied or absent leaf leaves no
+			// orphan for the scan to find.
+			opts.SkipOrphanScan = s.fast.fastSandboxCleanup
 		}
 		cancel()
 	}
-	kata.CleanupSandboxState(ctx, actorUID)
+	kata.CleanupSandboxStateOpts(ctx, actorUID, opts)
 }
 
 // unhostActor removes an actor, its network, and its cgroup. Repeated calls are
