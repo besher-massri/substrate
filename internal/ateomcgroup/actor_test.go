@@ -19,6 +19,7 @@ package ateomcgroup
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -147,5 +148,77 @@ func TestActorLeafSetCPULimit(t *testing.T) {
 	var nilLeaf *ActorLeaf
 	if err := nilLeaf.SetCPULimit(250); err != nil {
 		t.Errorf("SetCPULimit on a nil leaf: %v", err)
+	}
+}
+
+// SetCPUWeight writes cpu.weight on a live leaf (activation and steady-state
+// priority), even after Close; it rejects out-of-range weights, and is a no-op
+// without the cpu controller or on a nil leaf.
+func TestActorLeafSetCPUWeight(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "uid-a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"cpu.max", "cpu.weight"} {
+		if err := os.WriteFile(filepath.Join(root, "uid-a", f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leaf, err := openActorLeaf(root, "uid-a", 250)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leaf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []int{MaxCPUWeight, 10, MinCPUWeight, DefaultCPUWeight} {
+		if err := leaf.SetCPUWeight(w); err != nil {
+			t.Fatalf("SetCPUWeight(%d): %v", w, err)
+		}
+		got, err := os.ReadFile(filepath.Join(root, "uid-a", "cpu.weight"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := strconv.Itoa(w); string(got) != want {
+			t.Errorf("after SetCPUWeight(%d) cpu.weight = %q, want %q", w, got, want)
+		}
+	}
+	for _, w := range []int{0, -1, MaxCPUWeight + 1} {
+		if err := leaf.SetCPUWeight(w); err == nil {
+			t.Errorf("SetCPUWeight(%d) succeeded, want an error", w)
+		}
+	}
+
+	bare, err := openActorLeaf(t.TempDir(), "uid-b", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bare.Close()
+	if err := bare.SetCPUWeight(10); err != nil {
+		t.Errorf("SetCPUWeight without cpu.weight: %v", err)
+	}
+	var nilLeaf *ActorLeaf
+	if err := nilLeaf.SetCPUWeight(10); err != nil {
+		t.Errorf("SetCPUWeight on a nil leaf: %v", err)
+	}
+}
+
+// SetWorkerCPUWeight targets the ateom's own leaf beside the actors'.
+func TestSetWorkerCPUWeight(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, workerLeaf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, workerLeaf, "cpu.weight"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := setWorkerCPUWeightUnder(root, 10000); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, workerLeaf, "cpu.weight")); string(got) != "10000" {
+		t.Errorf("worker leaf cpu.weight = %q, want 10000", got)
+	}
+	if err := setWorkerCPUWeightUnder(root, 0); err == nil {
+		t.Error("setWorkerCPUWeightUnder(0) succeeded, want an error")
 	}
 }

@@ -773,3 +773,125 @@ func TestIsTmpfsMountPoint(t *testing.T) {
 		t.Error("/dev/shm is a tmpfs but not reported as a mount point")
 	}
 }
+
+func TestFastRestoreConfigCPUWeightsAndCheckpointGate(t *testing.T) {
+	c, err := fastRestoreConfigFromEnv(envMap(map[string]string{
+		envActivationCPUWeight:   "10000",
+		envSteadyCPUWeight:       "10",
+		envSelfCPUWeight:         "10000",
+		envCheckpointConcurrency: "2",
+		envCheckpointNice:        "19",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fastRestoreConfig{activationCPUWeight: 10000, steadyCPUWeight: 10, selfCPUWeight: 10000, checkpointConcurrency: 2, checkpointNice: 19}
+	if c != want {
+		t.Errorf("config = %+v, want %+v", c, want)
+	}
+	if !c.enabled() {
+		t.Error("config with knobs set reports disabled")
+	}
+	if c.activationWeight() != 10000 || c.steadyWeight() != 10 {
+		t.Errorf("weights = %d/%d, want 10000/10", c.activationWeight(), c.steadyWeight())
+	}
+	for _, env := range []map[string]string{
+		{envActivationCPUWeight: "10001"},
+		{envSteadyCPUWeight: "-5"},
+		{envSelfCPUWeight: "lots"},
+		{envCheckpointConcurrency: "-1"},
+		{envCheckpointNice: "20"},
+	} {
+		if _, err := fastRestoreConfigFromEnv(envMap(env)); err == nil {
+			t.Errorf("fastRestoreConfigFromEnv(%v) succeeded, want an error", env)
+		}
+	}
+}
+
+// Setting only one of the two leaf weights puts the other back to the kernel
+// default; setting neither leaves cpu.weight alone.
+func TestActivationAndSteadyWeights(t *testing.T) {
+	for _, tc := range []struct {
+		c                  fastRestoreConfig
+		activation, steady int
+	}{
+		{fastRestoreConfig{}, 0, 0},
+		{fastRestoreConfig{activationCPUWeight: 5000}, 5000, 100},
+		{fastRestoreConfig{steadyCPUWeight: 5}, 100, 5},
+		{fastRestoreConfig{activationCPUWeight: 10000, steadyCPUWeight: 10}, 10000, 10},
+	} {
+		if a, s := tc.c.activationWeight(), tc.c.steadyWeight(); a != tc.activation || s != tc.steady {
+			t.Errorf("%+v: weights = %d/%d, want %d/%d", tc.c, a, s, tc.activation, tc.steady)
+		}
+	}
+}
+
+// The gate never runs more than its cap at once and reports queueing.
+func TestCheckpointGateCapsConcurrency(t *testing.T) {
+	if newCheckpointGate(0, 0) != nil {
+		t.Fatal("a gate with nothing set is not nil")
+	}
+	var nilGate *checkpointGate
+	if _, err := nilGate.run(context.Background(), func() error { return errors.New("x") }); err == nil {
+		t.Error("nil gate did not run fn")
+	}
+	g := newCheckpointGate(2, 0)
+	var running, peak atomic.Int32
+	var waited atomic.Int64
+	done := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func() {
+			w, err := g.run(context.Background(), func() error {
+				n := running.Add(1)
+				for {
+					p := peak.Load()
+					if n <= p || peak.CompareAndSwap(p, n) {
+						break
+					}
+				}
+				time.Sleep(10 * time.Millisecond)
+				running.Add(-1)
+				return nil
+			})
+			waited.Add(int64(w))
+			done <- err
+		}()
+	}
+	for i := 0; i < 8; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p := peak.Load(); p != 2 {
+		t.Errorf("peak concurrency = %d, want 2", p)
+	}
+	if waited.Load() == 0 {
+		t.Error("no run reported waiting for a slot")
+	}
+	// A cancelled context gives up waiting for a slot.
+	g1 := newCheckpointGate(1, 0)
+	g1.sem <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := g1.run(ctx, func() error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Errorf("run with a full gate and a cancelled context = %v, want context.Canceled", err)
+	}
+}
+
+// With a niceness set, fn runs on a thread of that niceness, and the caller's
+// thread keeps its own.
+func TestCheckpointGateNice(t *testing.T) {
+	g := newCheckpointGate(0, 19)
+	var got int
+	if _, err := g.run(context.Background(), func() error {
+		p, err := unix.Getpriority(unix.PRIO_PROCESS, unix.Gettid())
+		got = p
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The raw getpriority syscall returns 20 - nice.
+	if got != 20-19 {
+		t.Errorf("checkpoint thread priority = %d (raw), want %d", got, 20-19)
+	}
+}

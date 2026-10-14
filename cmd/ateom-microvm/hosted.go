@@ -109,11 +109,32 @@ func (s *AteomService) hostActor(ctx context.Context, attribution resources.Acto
 }
 
 // actorLeaf opens the actor's cgroup, or returns nil when the worker has none.
+// It is only called to activate the actor (restore or cold boot), so the leaf
+// gets the opt-in activation cpu.weight; the steady one follows the wakeup.
 func (s *AteomService) actorLeaf(actorUID string, size sizing.SandboxSize) (*ateomcgroup.ActorLeaf, error) {
 	if !s.actorCgroups {
 		return nil, nil
 	}
-	return ateomcgroup.OpenActorLeaf(actorUID, size.MilliCPU)
+	leaf, err := ateomcgroup.OpenActorLeaf(actorUID, size.MilliCPU)
+	if err != nil {
+		return nil, err
+	}
+	if w := s.fast.activationWeight(); w > 0 {
+		if err := leaf.SetCPUWeight(w); err != nil {
+			slog.Warn("Could not set the activating actor's cpu.weight", slog.String("id", actorUID), slog.Int("weight", w), slog.Any("err", err))
+		}
+	}
+	return leaf, nil
+}
+
+// applySteadyCPUWeight gives an actor whose wakeup probe passed its opt-in
+// steady-state cpu.weight. A failure only costs the priority, so it is logged.
+func (s *AteomService) applySteadyCPUWeight(ctx context.Context, actorUID string, leaf *ateomcgroup.ActorLeaf) {
+	if w := s.fast.steadyWeight(); w > 0 {
+		if err := leaf.SetCPUWeight(w); err != nil {
+			slog.WarnContext(ctx, "Could not set the actor's steady-state cpu.weight", slog.String("id", actorUID), slog.Int("weight", w), slog.Any("err", err))
+		}
+	}
 }
 
 // cleanupSandboxState kills what is left of the actor's host processes and

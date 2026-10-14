@@ -307,8 +307,13 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 		cacheFile := filepath.Join(cacheDir, "memory-ranges")
 		if _, err := os.Stat(cacheFile); err == nil {
 			tDeflate := time.Now()
-			// Read the base from its tmpfs mirror when the slot pool staged one.
-			if err := ch.DeflateAgainstBase(ctx, goldenBaseReadPath(cacheFile), checkpointMem); err != nil {
+			// Opt-in: queue behind the worker's other deflations and run at a
+			// lower priority (ckptGate), so activations keep the CPU.
+			deflateWait, err := ckptGate.run(ctx, func() error {
+				// Read the base from its tmpfs mirror when the slot pool staged one.
+				return ch.DeflateAgainstBase(ctx, goldenBaseReadPath(cacheFile), checkpointMem)
+			})
+			if err != nil {
 				return 0, fmt.Errorf("while deflating snapshot against golden base: %w", err)
 			}
 			marker := []byte("1\n")
@@ -318,8 +323,11 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 			if err := os.WriteFile(filepath.Join(checkpointDir, goldenDeltaFile), marker, 0o600); err != nil {
 				return 0, fmt.Errorf("while writing %s: %w", goldenDeltaFile, err)
 			}
-			slog.InfoContext(ctx, "Deflated warm snapshot against golden base",
-				slog.String("id", actorUID), slog.String("base_id", baseID), slog.Duration("deflate", time.Since(tDeflate)))
+			deflateAttrs := []any{slog.String("id", actorUID), slog.String("base_id", baseID), slog.Duration("deflate", time.Since(tDeflate))}
+			if ckptGate != nil {
+				deflateAttrs = append(deflateAttrs, slog.Duration("deflate_wait", deflateWait))
+			}
+			slog.InfoContext(ctx, "Deflated warm snapshot against golden base", deflateAttrs...)
 		}
 	}
 

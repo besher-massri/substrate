@@ -594,6 +594,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 			return fmt.Errorf("while restoring the actor's CPU limit after boot: %w", err)
 		}
 	}
+	s.applySteadyCPUWeight(ctx, actorUID, leaf)
 
 	// Everything from BootVM onward, split. ateom used to log only the total, which
 	// hid where a cold boot actually goes: it is not the guest booting.

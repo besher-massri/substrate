@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -78,6 +79,45 @@ func (l *ActorLeaf) SetCPULimit(milliCPU int64) error {
 	}
 	if err := writeExisting(filepath.Join(l.path, "cpu.max"), cpuMax(milliCPU)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("while limiting cgroup %q: %w", l.path, err)
+	}
+	return nil
+}
+
+// Bounds of cgroup v2 cpu.weight; the kernel gives every new cgroup
+// DefaultCPUWeight.
+const (
+	MinCPUWeight     = 1
+	DefaultCPUWeight = 100
+	MaxCPUWeight     = 10000
+)
+
+// SetCPUWeight sets the leaf's cpu.weight: its share of contended CPU relative
+// to its siblings (the other actors' leaves and the ateom's own leaf). Like
+// SetCPULimit it works after Close, and a nil leaf or a node without the cpu
+// controller has nothing to change.
+func (l *ActorLeaf) SetCPUWeight(weight int) error {
+	if l == nil {
+		return nil
+	}
+	return setCPUWeight(l.path, weight)
+}
+
+// SetWorkerCPUWeight sets the cpu.weight of the leaf holding the ateom's own
+// processes (see Delegate), relative to the actors' leaves beside it.
+func SetWorkerCPUWeight(weight int) error {
+	return setWorkerCPUWeightUnder(Root, weight)
+}
+
+func setWorkerCPUWeightUnder(root string, weight int) error {
+	return setCPUWeight(filepath.Join(root, workerLeaf), weight)
+}
+
+func setCPUWeight(path string, weight int) error {
+	if weight < MinCPUWeight || weight > MaxCPUWeight {
+		return fmt.Errorf("cpu.weight %d is outside [%d, %d]", weight, MinCPUWeight, MaxCPUWeight)
+	}
+	if err := writeExisting(filepath.Join(path, "cpu.weight"), strconv.Itoa(weight)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("while weighting cgroup %q: %w", path, err)
 	}
 	return nil
 }

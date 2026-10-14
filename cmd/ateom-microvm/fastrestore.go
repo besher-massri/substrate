@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
+	"github.com/agent-substrate/substrate/internal/ateomcgroup"
 )
 
 // Opt-in restore-latency knobs. Every one of them defaults to off, which keeps
@@ -95,6 +97,30 @@ const (
 	// restores from detaching their slot (see acquireGoldenSlotOverlay), which
 	// cost a 168 MiB slot copy on the node disk per warm restore.
 	envTmpfsSlots = "ATEOM_MICROVM_TMPFS_SLOTS"
+	// envActivationCPUWeight (1-10000) is the cgroup cpu.weight of an actor's
+	// leaf while it is being activated (restored or cold-booted), until its
+	// wakeup probe passes; envSteadyCPUWeight (1-10000) is its weight from then
+	// on. The kernel gives every leaf 100. The actors' leaves are siblings of
+	// each other and of the ateom's own leaf, so contended CPU goes to them in
+	// proportion to their weights: 10000 while activating against 10 for each
+	// running actor gives an activation ~1000x the share of a running guest,
+	// while running actors keep sharing equally among themselves. Setting one
+	// of the two makes the other default to 100.
+	envActivationCPUWeight = "ATEOM_MICROVM_ACTIVATION_CPU_WEIGHT"
+	envSteadyCPUWeight     = "ATEOM_MICROVM_STEADY_CPU_WEIGHT"
+	// envSelfCPUWeight (1-10000) is the cpu.weight of the ateom's own leaf
+	// (see ateomcgroup.Delegate), which does the host side of every activation
+	// (rootfs, network and cgroup set-up, the delta overlay) beside the actors.
+	envSelfCPUWeight = "ATEOM_MICROVM_SELF_CPU_WEIGHT"
+	// envCheckpointConcurrency (>= 1) caps how many of this worker's
+	// checkpoints deflate their memory image against the golden base at once;
+	// envCheckpointNice (1-19) runs each deflation on a thread of that
+	// niceness, below the ateom's own restore work. Checkpoint packaging then
+	// cannot burst across many cores while activations need them. Note that a
+	// deflation still delays the checkpoint (and the RPC that waits for it,
+	// PauseActor included) while it queues or runs slower.
+	envCheckpointConcurrency = "ATEOM_MICROVM_CHECKPOINT_CONCURRENCY"
+	envCheckpointNice        = "ATEOM_MICROVM_CHECKPOINT_NICE"
 )
 
 // fastRestoreConfig is the parsed set of opt-in restore-latency knobs.
@@ -118,11 +144,21 @@ type fastRestoreConfig struct {
 	earlyVMMLaunch bool
 	// tmpfsSlots keeps the golden-base slot pool and base mirrors on a tmpfs.
 	tmpfsSlots bool
+	// activationCPUWeight, steadyCPUWeight and selfCPUWeight are cgroup
+	// cpu.weight values (0: unset).
+	activationCPUWeight int
+	steadyCPUWeight     int
+	selfCPUWeight       int
+	// checkpointConcurrency caps concurrent checkpoint deflations (0: no cap);
+	// checkpointNice is their thread niceness (0: inherited).
+	checkpointConcurrency int
+	checkpointNice        int
 }
 
 // enabled reports whether any knob is on, for the startup log.
 func (c fastRestoreConfig) enabled() bool {
-	return c.boost || c.parallelWakeup || c.memRestoreMode != "" || c.noBackgroundFetch || c.readahead || c.earlyVMMLaunch || c.tmpfsSlots
+	return c.boost || c.parallelWakeup || c.memRestoreMode != "" || c.noBackgroundFetch || c.readahead || c.earlyVMMLaunch || c.tmpfsSlots ||
+		c.activationCPUWeight > 0 || c.steadyCPUWeight > 0 || c.selfCPUWeight > 0 || c.checkpointConcurrency > 0 || c.checkpointNice > 0
 }
 
 // logValue renders the config for the startup log.
@@ -148,6 +184,11 @@ func (c fastRestoreConfig) attrs() []any {
 		slog.Bool("restore_readahead", c.readahead),
 		slog.Bool("early_vmm_launch", c.earlyVMMLaunch),
 		slog.Bool("tmpfs_slots", c.tmpfsSlots),
+		slog.Int("activation_cpu_weight", c.activationCPUWeight),
+		slog.Int("steady_cpu_weight", c.steadyCPUWeight),
+		slog.Int("self_cpu_weight", c.selfCPUWeight),
+		slog.Int("checkpoint_concurrency", c.checkpointConcurrency),
+		slog.Int("checkpoint_nice", c.checkpointNice),
 	}
 }
 
@@ -176,6 +217,21 @@ func fastRestoreConfigFromEnv(getenv func(string) string) (fastRestoreConfig, er
 		return fastRestoreConfig{}, fmt.Errorf("%s: %w", envOnDemandBackgroundFetch, err)
 	}
 	c.noBackgroundFetch = !bgFetch
+	for _, n := range []struct {
+		env    string
+		dst    *int
+		lo, hi int
+	}{
+		{envActivationCPUWeight, &c.activationCPUWeight, ateomcgroup.MinCPUWeight, ateomcgroup.MaxCPUWeight},
+		{envSteadyCPUWeight, &c.steadyCPUWeight, ateomcgroup.MinCPUWeight, ateomcgroup.MaxCPUWeight},
+		{envSelfCPUWeight, &c.selfCPUWeight, ateomcgroup.MinCPUWeight, ateomcgroup.MaxCPUWeight},
+		{envCheckpointConcurrency, &c.checkpointConcurrency, 1, math.MaxInt32},
+		{envCheckpointNice, &c.checkpointNice, 1, 19},
+	} {
+		if *n.dst, err = parseIntEnv(getenv(n.env), n.lo, n.hi); err != nil {
+			return fastRestoreConfig{}, fmt.Errorf("%s: %w", n.env, err)
+		}
+	}
 	switch v := strings.ToLower(strings.TrimSpace(getenv(envMemoryRestoreMode))); v {
 	case "", "auto":
 	case "copy", "eager":
@@ -198,6 +254,100 @@ func parseBoolEnv(v string, def bool) (bool, error) {
 		return def, nil
 	}
 	return strconv.ParseBool(v)
+}
+
+// parseIntEnv parses an integer env value in [lo, hi]; unset or "0" is 0 (off).
+func parseIntEnv(v string, lo, hi int) (int, error) {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "0" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < lo || n > hi {
+		return 0, fmt.Errorf("want an integer in [%d, %d] (0 or unset for off), got %q", lo, hi, v)
+	}
+	return n, nil
+}
+
+// activationWeight is the cpu.weight an actor's leaf gets while it is being
+// activated, or 0 to leave the leaf's weight alone.
+func (c fastRestoreConfig) activationWeight() int {
+	switch {
+	case c.activationCPUWeight > 0:
+		return c.activationCPUWeight
+	case c.steadyCPUWeight > 0:
+		// A reused leaf may still hold a steady weight from its last activation.
+		return ateomcgroup.DefaultCPUWeight
+	}
+	return 0
+}
+
+// steadyWeight is the cpu.weight an actor's leaf gets once its wakeup probe
+// passes, or 0 to leave the leaf's weight alone.
+func (c fastRestoreConfig) steadyWeight() int {
+	switch {
+	case c.steadyCPUWeight > 0:
+		return c.steadyCPUWeight
+	case c.activationCPUWeight > 0:
+		return ateomcgroup.DefaultCPUWeight
+	}
+	return 0
+}
+
+// ckptGate is the opt-in throttle on checkpoint deflation (see
+// envCheckpointConcurrency), set once at startup; nil means none.
+var ckptGate *checkpointGate
+
+// checkpointGate caps concurrent checkpoint work and lowers its priority.
+type checkpointGate struct {
+	sem  chan struct{} // nil: no cap
+	nice int           // 0: inherited priority
+}
+
+// newCheckpointGate returns the gate for the given cap and niceness, or nil
+// when neither is set.
+func newCheckpointGate(concurrency, nice int) *checkpointGate {
+	if concurrency <= 0 && nice <= 0 {
+		return nil
+	}
+	g := &checkpointGate{nice: nice}
+	if concurrency > 0 {
+		g.sem = make(chan struct{}, concurrency)
+	}
+	return g
+}
+
+// run runs fn once a slot is free (returning how long it waited for one) and,
+// with a niceness set, on a dedicated thread of that niceness. A nil gate runs
+// fn directly.
+func (g *checkpointGate) run(ctx context.Context, fn func() error) (waited time.Duration, err error) {
+	if g == nil {
+		return 0, fn()
+	}
+	if g.sem != nil {
+		t := time.Now()
+		select {
+		case g.sem <- struct{}{}:
+		case <-ctx.Done():
+			return time.Since(t), ctx.Err()
+		}
+		waited = time.Since(t)
+		defer func() { <-g.sem }()
+	}
+	if g.nice <= 0 {
+		return waited, fn()
+	}
+	done := make(chan error, 1)
+	go func() {
+		// Never unlocked: the thread exits with this goroutine instead of going
+		// back to the scheduler's pool with the lowered priority.
+		runtime.LockOSThread()
+		if err := unix.Setpriority(unix.PRIO_PROCESS, unix.Gettid(), g.nice); err != nil {
+			slog.DebugContext(ctx, "could not lower the checkpoint thread's priority", slog.Any("err", err))
+		}
+		done <- fn()
+	}()
+	return waited, <-done
 }
 
 // parseCPUBoost parses envActivationCPUBoost: "max" means no cap (0), "<n>m"

@@ -244,6 +244,17 @@ func do(ctx context.Context) error {
 	if fast.tmpfsSlots {
 		goldenTmpfsRoot = setupGoldenSlotTmpfs(ctx)
 	}
+	// Opt-in CPU priority for the ateom's own leaf, beside the actors' leaves.
+	if fast.selfCPUWeight > 0 {
+		if !actorCgroups {
+			slog.WarnContext(ctx, "ateom cpu.weight requested but the worker cgroup is not delegated; ignoring it", slog.Int("weight", fast.selfCPUWeight))
+		} else if err := ateomcgroup.SetWorkerCPUWeight(fast.selfCPUWeight); err != nil {
+			slog.WarnContext(ctx, "Could not set the ateom leaf's cpu.weight", slog.Int("weight", fast.selfCPUWeight), slog.Any("err", err))
+		} else {
+			slog.InfoContext(ctx, "Set the ateom leaf's cpu.weight", slog.Int("weight", fast.selfCPUWeight))
+		}
+	}
+	ckptGate = newCheckpointGate(fast.checkpointConcurrency, fast.checkpointNice)
 	// The controller sets both from the downward API.
 	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {

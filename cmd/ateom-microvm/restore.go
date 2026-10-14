@@ -624,6 +624,7 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			return fmt.Errorf("while restoring the actor's CPU limit after activation: %w", err)
 		}
 	}
+	s.applySteadyCPUWeight(ctx, actorUID, leaf)
 
 	// Where a resume goes. Like the boot phases, this used to be a single total,
 	// which hid that a first (cold) restore and a later (warm) one differ by more
