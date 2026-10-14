@@ -135,6 +135,18 @@ const (
 	// the actor's leaf has been emptied (each of them is spawned into it). Both
 	// cost time proportional to every actor on the node.
 	envFastSandboxCleanup = "ATEOM_MICROVM_FAST_SANDBOX_CLEANUP"
+	// envZeroCopyRestore ("true") restores a warm snapshot without copying
+	// guest RAM when its image was overlaid onto an idle golden slot on the
+	// tmpfs: the snapshot is rewritten (ch.UseFileBackedMemory) so that
+	// cloud-hypervisor maps the slot itself as the guest's RAM, and vm.restore
+	// copies nothing. The slot then leaves the pool with the actor (a fresh one
+	// is staged in the background) and is deleted once the actor's VMM has
+	// exited. The checkpoint writes memory-ranges from the slot (its delta
+	// against the golden base) and puts the snapshot back into the standard
+	// format (ch.CanonicalizeFileBackedSnapshot), so every restore path can
+	// still use it. It needs envTmpfsSlots, and sizes that tmpfs to the node's
+	// memory: a full tmpfs would kill the VMM on the guest's next page fault.
+	envZeroCopyRestore = "ATEOM_MICROVM_ZERO_COPY_RESTORE"
 )
 
 // fastRestoreConfig is the parsed set of opt-in restore-latency knobs.
@@ -172,13 +184,19 @@ type fastRestoreConfig struct {
 	parallelPrep bool
 	// fastSandboxCleanup shortens the per-activation sandbox sweep.
 	fastSandboxCleanup bool
+	// zeroCopyRestore maps an idle tmpfs golden slot as a restored guest's
+	// RAM instead of copying it (needs tmpfsSlots).
+	zeroCopyRestore bool
+	// zeroCopyNeedsTmpfs records that zero-copy restores were asked for
+	// without tmpfsSlots, so they stay off (logged at startup).
+	zeroCopyNeedsTmpfs bool
 }
 
 // enabled reports whether any knob is on, for the startup log.
 func (c fastRestoreConfig) enabled() bool {
 	return c.boost || c.parallelWakeup || c.memRestoreMode != "" || c.noBackgroundFetch || c.readahead || c.earlyVMMLaunch || c.tmpfsSlots ||
 		c.activationCPUWeight > 0 || c.steadyCPUWeight > 0 || c.selfCPUWeight > 0 || c.checkpointConcurrency > 0 || c.checkpointNice > 0 || c.parallelPrep ||
-		c.fastSandboxCleanup
+		c.fastSandboxCleanup || c.zeroCopyRestore
 }
 
 // logValue renders the config for the startup log.
@@ -211,6 +229,7 @@ func (c fastRestoreConfig) attrs() []any {
 		slog.Int("checkpoint_nice", c.checkpointNice),
 		slog.Bool("parallel_prep", c.parallelPrep),
 		slog.Bool("fast_sandbox_cleanup", c.fastSandboxCleanup),
+		slog.Bool("zero_copy_restore", c.zeroCopyRestore),
 	}
 }
 
@@ -231,6 +250,7 @@ func fastRestoreConfigFromEnv(getenv func(string) string) (fastRestoreConfig, er
 		{envTmpfsSlots, &c.tmpfsSlots},
 		{envParallelPrep, &c.parallelPrep},
 		{envFastSandboxCleanup, &c.fastSandboxCleanup},
+		{envZeroCopyRestore, &c.zeroCopyRestore},
 	} {
 		if *b.dst, err = parseBoolEnv(getenv(b.env), false); err != nil {
 			return fastRestoreConfig{}, fmt.Errorf("%s: %w", b.env, err)
@@ -267,6 +287,10 @@ func fastRestoreConfigFromEnv(getenv func(string) string) (fastRestoreConfig, er
 		c.allowPrefault = true
 	default:
 		return fastRestoreConfig{}, fmt.Errorf("%s: want auto, copy, ondemand or ondemand-prefault, got %q", envMemoryRestoreMode, v)
+	}
+	if c.zeroCopyRestore && !c.tmpfsSlots {
+		// Guest RAM can only live in a slot on the tmpfs.
+		c.zeroCopyRestore, c.zeroCopyNeedsTmpfs = false, true
 	}
 	return c, nil
 }
@@ -873,7 +897,47 @@ func recoverInterruptedOverlay(outFile string) {
 	_ = os.Rename(deltaBackup, outFile)
 }
 
-// acquireGoldenSlotOverlay overlays deltaFile's populated pages onto a
+// goldenSlotLease is a restore's hold on the image acquireGoldenSlot built at
+// outFile. commit or abort (whichever runs first; the other is then a no-op)
+// ends it. slot and pool are set only when the image is a pool slot (not a
+// merge on the node disk), fromIdle when that slot was pre-staged.
+type goldenSlotLease struct {
+	commit func(eager, preserve bool) (keepDelta bool)
+	abort  func()
+
+	slot     *goldenSlot
+	pool     *baseSlotPool
+	fromIdle bool
+	claimed  *atomic.Bool
+}
+
+// claimForVM hands the lease's slot to the VM about to map it as guest RAM
+// (envZeroCopyRestore). From then on commit and abort still do the restore
+// directory's bookkeeping (on a preserved restore, commit puts the delta back
+// and keeps the golden-delta marker; abort always puts it back), but they
+// never reset, reuse or detach the slot: the caller deletes it once the VMM
+// that maps it is gone. A fresh slot is staged in the background to take its
+// place in the pool. It returns the slot's path, or "" when there is no slot
+// to claim.
+func (l *goldenSlotLease) claimForVM() string {
+	if l == nil || l.slot == nil || l.claimed == nil || !l.claimed.CompareAndSwap(false, true) {
+		return ""
+	}
+	go l.pool.replenishOneSlot()
+	return l.slot.path
+}
+
+// acquireGoldenSlotOverlay is acquireGoldenSlot for callers that only commit
+// or abort.
+func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile string) (commit func(eager, preserve bool) (keepDelta bool), abort func(), err error) {
+	l, err := acquireGoldenSlot(ctx, baseFile, deltaFile, outFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	return l.commit, l.abort, nil
+}
+
+// acquireGoldenSlot overlays deltaFile's populated pages onto a
 // pre-staged golden-base slot file (~7 MiB write instead of a 168 MiB base copy)
 // and links it at outFile for vm.restore. The original delta is kept at
 // outFile+".delta.bak" until commit or abort.
@@ -896,28 +960,31 @@ func recoverInterruptedOverlay(outFile string) {
 //     stays a complete image owned by the actor (copied off the tmpfs first if
 //     outFile is a symlink), and a fresh slot is staged in the background.
 //
+// A slot claimed for the VM (claimForVM) is never reset or detached: commit
+// and abort then only put the restore directory in order.
+//
 // Defer abort() so any failure before commit restores deltaFile at outFile and
 // returns the reset slot to the pool.
-func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile string) (commit func(eager, preserve bool) (keepDelta bool), abort func(), err error) {
-	noopCommit := func(bool, bool) bool { return false }
+func acquireGoldenSlot(ctx context.Context, baseFile, deltaFile, outFile string) (*goldenSlotLease, error) {
+	noopLease := &goldenSlotLease{commit: func(bool, bool) bool { return false }, abort: func() {}}
 	if os.Getenv("ATEOM_MICROVM_DISABLE_GOLDEN_SLOT_POOL") == "true" {
 		if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return noopCommit, func() {}, nil
+		return noopLease, nil
 	}
 	recoverInterruptedOverlay(outFile)
 	maybePrewarmGoldenSlots(baseFile)
 	bi, err := os.Stat(baseFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("stat base %q: %w", baseFile, err)
+		return nil, fmt.Errorf("stat base %q: %w", baseFile, err)
 	}
 	di, err := os.Stat(deltaFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("stat delta %q: %w", deltaFile, err)
+		return nil, fmt.Errorf("stat delta %q: %w", deltaFile, err)
 	}
 	if bi.Size() != di.Size() {
-		return nil, nil, fmt.Errorf("acquireGoldenSlotOverlay: size mismatch base=%d delta=%d", bi.Size(), di.Size())
+		return nil, fmt.Errorf("acquireGoldenSlotOverlay: size mismatch base=%d delta=%d", bi.Size(), di.Size())
 	}
 
 	pool := goldenSlotPool(ctx, baseFile)
@@ -935,6 +1002,7 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 		}
 		break
 	}
+	fromIdle := slot != nil
 	if slot == nil {
 		slotPath := filepath.Join(pool.slotDir, fmt.Sprintf("slot-%d", pool.nextID.Add(1)))
 		err := os.MkdirAll(pool.slotDir, 0o700)
@@ -944,16 +1012,16 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 		if err != nil {
 			_ = os.Remove(slotPath)
 			if !pool.inTmpfs {
-				return nil, nil, fmt.Errorf("staging golden slot: %w", err)
+				return nil, fmt.Errorf("staging golden slot: %w", err)
 			}
 			// The tmpfs is full or failing: rebuild the image on the node disk
 			// as before the slot pool existed, rather than failing the restore.
 			slog.WarnContext(ctx, "Could not stage a golden slot on the tmpfs; merging on the node disk",
 				slog.String("base", baseFile), slog.Any("err", err))
 			if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
-				return nil, nil, err
+				return nil, err
 			}
-			return noopCommit, func() {}, nil
+			return noopLease, nil
 		}
 		slot = &goldenSlot{path: slotPath}
 	}
@@ -961,13 +1029,13 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 	df, err := os.Open(deltaFile)
 	if err != nil {
 		pool.resetAndReturnSlot(slot, nil)
-		return nil, nil, err
+		return nil, err
 	}
 	sf, err := os.OpenFile(slot.path, os.O_RDWR, 0o600)
 	if err != nil {
 		df.Close()
 		_ = os.Remove(slot.path)
-		return nil, nil, err
+		return nil, err
 	}
 	dirtyRanges, oerr := ch.OverlaySparseRegionsRecorded(df, sf)
 	scloseErr := sf.Close()
@@ -975,25 +1043,25 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 	if oerr != nil || scloseErr != nil {
 		_ = os.Remove(slot.path)
 		if oerr != nil {
-			return nil, nil, oerr
+			return nil, oerr
 		}
-		return nil, nil, scloseErr
+		return nil, scloseErr
 	}
 
 	deltaBackup := outFile + ".delta.bak"
 	_ = os.Remove(deltaBackup)
 	if err := os.Rename(outFile, deltaBackup); err != nil {
 		go pool.resetAndReturnSlot(slot, dirtyRanges)
-		return nil, nil, fmt.Errorf("backup delta %q: %w", outFile, err)
+		return nil, fmt.Errorf("backup delta %q: %w", outFile, err)
 	}
 	symlinked, err := linkSlot(slot.path, outFile)
 	if err != nil {
 		_ = os.Rename(deltaBackup, outFile)
 		go pool.resetAndReturnSlot(slot, dirtyRanges)
 		if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return noopCommit, func() {}, nil
+		return noopLease, nil
 	}
 
 	// Detaching keeps outFile a complete image without the slot file; it may
@@ -1012,9 +1080,14 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 		_ = os.Remove(slot.path)
 		go pool.replenishOneSlot()
 	}
+	claimed := new(atomic.Bool)
 	var once sync.Once
 	commitFn := func(eager, preserve bool) (keepDelta bool) {
 		once.Do(func() {
+			if claimed.Load() {
+				keepDelta = commitClaimedSlot(ctx, outFile, deltaBackup, preserve)
+				return
+			}
 			switch {
 			case eager && !preserve:
 				_ = os.Remove(deltaBackup)
@@ -1041,8 +1114,29 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 		once.Do(func() {
 			_ = os.Remove(outFile)
 			_ = os.Rename(deltaBackup, outFile)
-			go pool.resetAndReturnSlot(slot, dirtyRanges)
+			if !claimed.Load() {
+				go pool.resetAndReturnSlot(slot, dirtyRanges)
+			}
 		})
 	}
-	return commitFn, abortFn, nil
+	return &goldenSlotLease{commit: commitFn, abort: abortFn, slot: slot, pool: pool, fromIdle: fromIdle, claimed: claimed}, nil
+}
+
+// commitClaimedSlot is commit for a slot the VM maps as guest RAM: the
+// restore directory is put in order as for an eager restore, and the slot is
+// left alone. A preserved snapshot gets its delta back (keepDelta). Should
+// that rename fail, outFile stays a symlink next to the delta backup, which
+// the next restore from that snapshot puts back (recoverInterruptedOverlay);
+// it is never copied from, since the slot is live guest RAM.
+func commitClaimedSlot(ctx context.Context, outFile, deltaBackup string, preserve bool) (keepDelta bool) {
+	if !preserve {
+		_ = os.Remove(deltaBackup)
+		_ = os.Remove(outFile)
+		return false
+	}
+	if err := os.Rename(deltaBackup, outFile); err != nil {
+		slog.WarnContext(ctx, "Could not put the golden delta back; the next restore from this snapshot will",
+			slog.String("delta", deltaBackup), slog.Any("err", err))
+	}
+	return true
 }

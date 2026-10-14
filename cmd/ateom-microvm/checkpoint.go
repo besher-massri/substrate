@@ -289,6 +289,17 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 	}
 	dSnapshot := time.Since(tSnapshot)
 
+	// Opt-in zero-copy restore: guest RAM is a golden slot file, which
+	// cloud-hypervisor does not dump; memory-ranges is written from the slot
+	// below, and the snapshot then put back into the standard format.
+	slot := ""
+	if ra != nil && ra.memSlot != "" {
+		if err := checkSlotSnapshot(checkpointDir, ra); err != nil {
+			return 0, err
+		}
+		slot = ra.memSlot
+	}
+
 	// Diff-snapshot completion for an OnDemand-restored actor: CH's snapshot here is
 	// sparse — only the pages faulted in since the OnDemand restore — so on its own
 	// it's INCOMPLETE (the un-faulted pages were being demand-paged from the restore
@@ -311,7 +322,18 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 	}
 
 	checkpointMem := filepath.Join(checkpointDir, "memory-ranges")
+	slotCopied := false
+	copySlot := func() error {
+		if slot == "" || slotCopied {
+			return nil
+		}
+		slotCopied = true
+		return copySlotMemory(ctx, actorUID, ra, checkpointMem)
+	}
 	if actorUID == baseID {
+		if err := copySlot(); err != nil {
+			return 0, err
+		}
 		ensureGoldenBaseCached(ctx, checkpointDir, baseID, checkpointMem)
 	} else if cacheDir, ok := goldenBaseCacheDir(checkpointDir, baseID); ok {
 		cacheFile := filepath.Join(cacheDir, "memory-ranges")
@@ -319,11 +341,23 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 			tDeflate := time.Now()
 			// Opt-in: queue behind the worker's other deflations and run at a
 			// lower priority (ckptGate), so activations keep the CPU.
+			var dFromSlot time.Duration
 			deflateWait, err := ckptGate.run(ctx, func() error {
 				// Read the base from its tmpfs mirror when the slot pool staged one.
-				return ch.DeflateAgainstBase(ctx, goldenBaseReadPath(cacheFile), checkpointMem)
+				base := goldenBaseReadPath(cacheFile)
+				if slot != "" {
+					// The delta straight from guest RAM: no full image is written.
+					t := time.Now()
+					err := ch.CreateDeltaAgainstBase(ctx, base, slot, checkpointMem)
+					dFromSlot = time.Since(t)
+					return err
+				}
+				return ch.DeflateAgainstBase(ctx, base, checkpointMem)
 			})
 			if err != nil {
+				if slot != "" {
+					_ = os.Remove(checkpointMem)
+				}
 				return 0, fmt.Errorf("while deflating snapshot against golden base: %w", err)
 			}
 			marker := []byte("1\n")
@@ -337,7 +371,20 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 			if ckptGate != nil {
 				deflateAttrs = append(deflateAttrs, slog.Duration("deflate_wait", deflateWait))
 			}
+			if slot != "" {
+				deflateAttrs = append(deflateAttrs, slog.String("checkpoint_mode", "delta_from_slot"),
+					slog.Duration("checkpoint_delta_from_slot", dFromSlot))
+			}
 			slog.InfoContext(ctx, "Deflated warm snapshot against golden base", deflateAttrs...)
+		} else if err := copySlot(); err != nil {
+			return 0, err
+		}
+	} else if err := copySlot(); err != nil {
+		return 0, err
+	}
+	if slot != "" {
+		if err := ch.CanonicalizeFileBackedSnapshot(checkpointDir, ra.origMemory); err != nil {
+			return 0, fmt.Errorf("while putting the snapshot back into the standard format: %w", err)
 		}
 	}
 
@@ -429,6 +476,12 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, actorDirs *
 	// the upper-dir removal below (removing a live overlay's upperdir would
 	// corrupt the mount rather than delete the files).
 	s.cleanupSandboxState(ctx, id)
+
+	// Opt-in zero-copy restore: the guest's RAM was a golden slot file; with
+	// the VMM and virtiofsd gone, nothing maps it any more.
+	if ra != nil {
+		s.discardMemSlot(ctx, id, ra)
+	}
 
 	// Remove the rootfs upper dir: ateom owns it — atelet's actor-dir reset
 	// doesn't know it — and its absence is what marks a worker as holding no

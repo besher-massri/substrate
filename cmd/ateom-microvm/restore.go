@@ -237,6 +237,16 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 // caller from their tar.
 func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootParams, scope ateompb.SnapshotFidelity, restoreDir string, preserveRestoreDir bool, tStart time.Time) (retErr error) {
 	actorUID := p.actorUID
+	// Opt-in zero-copy restore: set once restoreDir maps a claimed golden slot
+	// as guest RAM (startZeroCopyRestore). Deferred first so that, when the
+	// restore fails, it runs last: after the defers below have killed the VMM
+	// and the virtiofsd, which may map the slot.
+	var zc *zeroCopyRestore
+	defer func() {
+		if retErr != nil && zc != nil {
+			zc.abandon(context.WithoutCancel(ctx), actorUID)
+		}
+	}()
 
 	rr := s.resolveRuntime(p.assetPaths)
 	var err error
@@ -332,9 +342,8 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	deltaMarker := filepath.Join(restoreDir, goldenDeltaFile)
 	restoreMem := filepath.Join(restoreDir, "memory-ranges")
 	type reconstructResult struct {
-		commit func(eager, preserve bool) (keepDelta bool)
-		abort  func()
-		err    error
+		lease *goldenSlotLease
+		err   error
 	}
 	reconstructDone := make(chan reconstructResult, 1)
 	reconstructJoined := false
@@ -347,14 +356,14 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			}
 			cacheFile := filepath.Join(cacheDir, "memory-ranges")
 			tReconstruct := time.Now()
-			commitFn, abortFn, rerr := acquireGoldenSlotOverlay(ctx, cacheFile, restoreMem, restoreMem)
+			lease, rerr := acquireGoldenSlot(ctx, cacheFile, restoreMem, restoreMem)
 			if rerr != nil {
 				reconstructDone <- reconstructResult{err: fmt.Errorf("while reconstructing warm snapshot from golden base %q: %w", srcID, rerr)}
 				return
 			}
 			slog.InfoContext(ctx, "Reconstructed warm snapshot from golden base",
 				slog.String("id", actorUID), slog.String("base_id", srcID), slog.Duration("reconstruct", time.Since(tReconstruct)))
-			reconstructDone <- reconstructResult{commit: commitFn, abort: abortFn}
+			reconstructDone <- reconstructResult{lease: lease}
 			return
 		}
 		ensureGoldenBaseCached(ctx, restoreDir, srcID, restoreMem)
@@ -370,8 +379,8 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	}()
 	defer func() {
 		if !reconstructJoined {
-			if res := <-reconstructDone; res.abort != nil {
-				res.abort()
+			if res := <-reconstructDone; res.lease != nil {
+				res.lease.abort()
 			}
 		}
 	}()
@@ -549,8 +558,8 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 
 	recRes := <-reconstructDone
 	reconstructJoined = true
-	if recRes.abort != nil {
-		defer recRes.abort()
+	if recRes.lease != nil {
+		defer recRes.lease.abort()
 	}
 	if recRes.err != nil {
 		return recRes.err
@@ -571,9 +580,26 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		return err
 	}
 	tLaunch := time.Now()
+	// Opt-in zero-copy: map the golden slot the image was overlaid onto as
+	// guest RAM instead of copying it (counted in vm_restore).
+	var dZeroCopy time.Duration
+	zcFallback := ""
+	if s.fast.zeroCopyRestore {
+		var zerr error
+		zc, zcFallback, zerr = startZeroCopyRestore(ctx, actorUID, restoreDir, recRes.lease)
+		dZeroCopy = time.Since(tLaunch)
+		if zerr != nil {
+			return zerr
+		}
+	}
 	memMode, noBackgroundFetch := restoreMemMode(ctx, client.Info()), false
 	if s.fast.memRestoreMode != "" || s.fast.noBackgroundFetch {
 		memMode, noBackgroundFetch = s.fast.pickRestoreMemMode(ctx, client.Info())
+	}
+	if zc != nil {
+		// Guest RAM is the slot: Copy mode finds nothing to copy. Never
+		// OnDemand, which would page guest RAM in from memory-ranges.
+		memMode, noBackgroundFetch = ch.MemRestoreEager, false
 	}
 	slog.InfoContext(ctx, "restoring guest memory",
 		slog.String("mode", memMode), slog.String("vmm_version", client.Info().Version))
@@ -584,12 +610,21 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	if err := client.RestoreWithNetFDsOpts(ctx, restoreDir, restoredNets, restoreOpts); err != nil {
 		return fmt.Errorf("while restoring VM with net FDs: %w", err)
 	}
-	if recRes.commit != nil {
+	if recRes.lease != nil {
 		// The marker stays only when the restore directory got its golden delta
 		// back (a preserved snapshot restored from a tmpfs slot); otherwise its
-		// memory-ranges is now a complete image, or gone.
-		if keepDelta := recRes.commit(memMode == ch.MemRestoreEager, preserveRestoreDir); !keepDelta {
+		// memory-ranges is now a complete image, or gone. A slot claimed for
+		// zero-copy stays the guest's RAM (claimForVM).
+		if keepDelta := recRes.lease.commit(memMode == ch.MemRestoreEager, preserveRestoreDir); !keepDelta {
 			_ = os.Remove(deltaMarker)
+		}
+	}
+	if zc != nil && preserveRestoreDir {
+		// cloud-hypervisor has read the snapshot: put the preserved copy back
+		// into the standard format for whoever restores it next.
+		if err := zc.revert(); err != nil {
+			slog.ErrorContext(ctx, "Could not put the preserved snapshot back into the standard format after a zero-copy restore",
+				slog.String("id", actorUID), slog.String("dir", restoreDir), slog.Any("err", err))
 		}
 	}
 	tVMRestore := time.Now()
@@ -712,6 +747,13 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 			slog.Duration("prep_leaf", dLeaf),
 			slog.Duration("lowers_virtiofsd", dVirtiofsd),
 			slog.Duration("egress_wait", dEgressWait))
+		if s.fast.zeroCopyRestore {
+			// Whether guest RAM is the golden slot itself, and if not why.
+			phaseAttrs = append(phaseAttrs,
+				slog.Bool("zero_copy", zc != nil),
+				slog.String("zero_copy_fallback", zcFallback),
+				slog.Duration("prep_zero_copy", dZeroCopy))
+		}
 	}
 	slog.InfoContext(ctx, "Actor restore phases", phaseAttrs...)
 	// The joinable per-actor record the benchmarking tooling aggregates. The
@@ -748,6 +790,10 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		// shutdown with InvalidContainerId, so these must be what the guest runs.
 		workloadIDs: workloadIDs(ctrs),
 		guestAgent:  guestAC,
+	}
+	if zc != nil {
+		ra.memSlot, ra.memSlotDev, ra.memSlotIno = zc.slot, zc.slotDev, zc.slotIno
+		ra.memSlotBase, ra.origMemory = zc.slotBase, zc.origMemory
 	}
 
 	// Re-attach stdout/stderr forwarding for each container over the agent

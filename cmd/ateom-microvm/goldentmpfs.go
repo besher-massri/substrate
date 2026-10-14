@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -50,49 +52,95 @@ const (
 // setupGoldenSlotTmpfs prepares the tmpfs directory for envTmpfsSlots and
 // returns it, or "" (with a warning) when there is none to use, in which case
 // the slot pool stays on the node disk as without the knob.
-func setupGoldenSlotTmpfs(ctx context.Context) string {
-	dir, huge, mountErr := mountGoldenSlotTmpfs(goldenTmpfsMountDir, goldenTmpfsSize)
+//
+// zeroCopy (envZeroCopyRestore) sizes the tmpfs to the node's memory instead
+// of goldenTmpfsSize, since restored guests' RAM then lives on it: a full
+// tmpfs turns the guest's next page fault into a SIGBUS that kills its VMM,
+// so the pod's memory limit must be what binds, as for a memfd. It reports
+// whether the tmpfs can hold guest RAM: ateom's own mount, of that size, with
+// 2 MiB pages (on 4 KiB host pages every guest page touch is an EPT fault,
+// which made a restored guest's wakeup ~75 ms slower on a nested-virt bench).
+func setupGoldenSlotTmpfs(ctx context.Context, zeroCopy bool) (dir string, guestRAMReady bool) {
+	size := int64(goldenTmpfsSize)
+	if zeroCopy {
+		mt, err := memTotalBytes()
+		if err != nil {
+			slog.WarnContext(ctx, "Could not read the node's memory size; zero-copy restores stay off", slog.Any("err", err))
+			zeroCopy = false
+		} else {
+			size = mt
+		}
+	}
+	dir, huge, mountErr := mountGoldenSlotTmpfs(goldenTmpfsMountDir, size, zeroCopy)
 	if mountErr == nil {
 		slog.InfoContext(ctx, "Golden slot tmpfs mounted", slog.String("dir", dir),
-			slog.Int64("size_bytes", goldenTmpfsSize), slog.String("huge", huge))
-		return dir
+			slog.Int64("size_bytes", size), slog.String("huge", huge))
+		return dir, zeroCopy && huge == "within_size"
 	}
 	if free, ok := tmpfsFreeBytes("/dev/shm"); ok && free >= goldenTmpfsMinFree {
 		if err := os.MkdirAll(goldenTmpfsShmDir, 0o700); err == nil {
 			slog.InfoContext(ctx, "Golden slot tmpfs: using /dev/shm", slog.String("dir", goldenTmpfsShmDir),
 				slog.Int64("free_bytes", free), slog.Any("mount_err", mountErr))
-			return goldenTmpfsShmDir
+			return goldenTmpfsShmDir, false
 		}
 	}
 	slog.WarnContext(ctx, "Golden slot tmpfs unavailable; the golden slot pool stays on the node disk",
 		slog.Any("mount_err", mountErr))
-	return ""
+	return "", false
 }
 
 // mountGoldenSlotTmpfs mounts a private tmpfs of size bytes on dir (unless one
 // is already mounted there) and reports the huge= policy it got. It asks for
 // huge=within_size first, so the base mirror and slots sit in 2 MiB pages
 // where the kernel can provide them, and retries without on EINVAL (a kernel
-// without shmem THP).
-func mountGoldenSlotTmpfs(dir string, size int64) (mounted, huge string, err error) {
+// without shmem THP). With resize, a tmpfs already mounted on dir is
+// remounted to size (and huge=within_size) instead of taken as it is.
+func mountGoldenSlotTmpfs(dir string, size int64, resize bool) (mounted, huge string, err error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
-	if isTmpfsMountPoint(dir) {
-		return dir, "existing", nil
-	}
 	const flags = unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC
+	var remount uintptr
+	if isTmpfsMountPoint(dir) {
+		if !resize {
+			return dir, "existing", nil
+		}
+		remount = unix.MS_REMOUNT
+	}
 	opts := fmt.Sprintf("size=%d,mode=0700", size)
 	huge = "within_size"
-	err = unix.Mount("ateom-golden-slots", dir, "tmpfs", flags, opts+",huge="+huge)
+	err = unix.Mount("ateom-golden-slots", dir, "tmpfs", flags|remount, opts+",huge="+huge)
 	if errors.Is(err, unix.EINVAL) {
 		huge = "never"
-		err = unix.Mount("ateom-golden-slots", dir, "tmpfs", flags, opts)
+		err = unix.Mount("ateom-golden-slots", dir, "tmpfs", flags|remount, opts)
 	}
 	if err != nil {
 		return "", "", fmt.Errorf("mount tmpfs on %s: %w", dir, err)
 	}
 	return dir, huge, nil
+}
+
+// memTotalBytes is MemTotal from /proc/meminfo, in bytes.
+func memTotalBytes() (int64, error) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	return parseMemTotal(string(b))
+}
+
+func parseMemTotal(meminfo string) (int64, error) {
+	for _, line := range strings.Split(meminfo, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "MemTotal:" {
+			kb, err := strconv.ParseInt(f[1], 10, 64)
+			if err != nil || kb <= 0 || (len(f) > 2 && f[2] != "kB") {
+				return 0, fmt.Errorf("bad MemTotal line %q", line)
+			}
+			return kb << 10, nil
+		}
+	}
+	return 0, errors.New("no MemTotal in /proc/meminfo")
 }
 
 // isTmpfsMountPoint reports whether dir is the root of a tmpfs mount.

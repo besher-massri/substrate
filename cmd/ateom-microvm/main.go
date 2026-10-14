@@ -241,8 +241,18 @@ func do(ctx context.Context) error {
 	if fast.enabled() {
 		slog.InfoContext(ctx, "Opt-in restore latency settings", fast.attrs()...)
 	}
+	if fast.zeroCopyNeedsTmpfs {
+		slog.WarnContext(ctx, "Zero-copy restores need the tmpfs golden slots; they stay off",
+			slog.String("needs", envTmpfsSlots+"=true"))
+	}
 	if fast.tmpfsSlots {
-		goldenTmpfsRoot = setupGoldenSlotTmpfs(ctx)
+		var guestRAMReady bool
+		goldenTmpfsRoot, guestRAMReady = setupGoldenSlotTmpfs(ctx, fast.zeroCopyRestore)
+		if fast.zeroCopyRestore && !guestRAMReady {
+			slog.WarnContext(ctx, "The golden slot tmpfs cannot hold guest RAM (it must be ateom's own mount, sized to the node, with huge=within_size); zero-copy restores stay off",
+				slog.String("dir", goldenTmpfsRoot))
+			ateomService.fast.zeroCopyRestore = false
+		}
 	}
 	// Opt-in CPU priority for the ateom's own leaf, beside the actors' leaves.
 	if fast.selfCPUWeight > 0 {

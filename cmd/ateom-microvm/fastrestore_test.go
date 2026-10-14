@@ -424,6 +424,7 @@ func TestAcquireGoldenSlotOverlay(t *testing.T) {
 	if !bytes.Equal(rolledBack, deltaContent) {
 		t.Fatalf("abort did not restore original delta file")
 	}
+	waitIdleSlots(t, goldenSlotPool(ctx, baseFile), 1)
 }
 
 func TestFastRestoreConfigTmpfsSlots(t *testing.T) {
@@ -716,7 +717,8 @@ func TestAcquireGoldenSlotOverlayTmpfsOnDemandMaterializes(t *testing.T) {
 func TestAcquireGoldenSlotOverlayRecoversInterruptedOverlay(t *testing.T) {
 	ctx := context.Background()
 	f := newSlotTestFixture(t)
-	useTmpfsSlots(t)
+	root := useTmpfsSlots(t)
+	pool := getOrCreateBaseSlotPool(f.baseFile, root)
 
 	restoreMem := filepath.Join(f.dir, "local-snapshot", "memory-ranges")
 	if err := os.MkdirAll(filepath.Dir(restoreMem), 0o700); err != nil {
@@ -740,6 +742,7 @@ func TestAcquireGoldenSlotOverlayRecoversInterruptedOverlay(t *testing.T) {
 	if !commit(true, true) {
 		t.Fatal("preserved eager commit did not keep the delta")
 	}
+	waitIdleSlots(t, pool, 1)
 }
 
 // When the base cannot be mirrored onto the tmpfs, the disk pool serves.
