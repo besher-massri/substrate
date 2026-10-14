@@ -307,7 +307,8 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 		cacheFile := filepath.Join(cacheDir, "memory-ranges")
 		if _, err := os.Stat(cacheFile); err == nil {
 			tDeflate := time.Now()
-			if err := ch.DeflateAgainstBase(ctx, cacheFile, checkpointMem); err != nil {
+			// Read the base from its tmpfs mirror when the slot pool staged one.
+			if err := ch.DeflateAgainstBase(ctx, goldenBaseReadPath(cacheFile), checkpointMem); err != nil {
 				return 0, fmt.Errorf("while deflating snapshot against golden base: %w", err)
 			}
 			marker := []byte("1\n")

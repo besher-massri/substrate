@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 )
 
@@ -392,7 +394,9 @@ func TestAcquireGoldenSlotOverlay(t *testing.T) {
 			abort()
 			t.Fatalf("round %d reconstructed bytes mismatch with target", round)
 		}
-		commit(true)
+		if commit(true, false) {
+			t.Fatalf("round %d: an unpreserved eager commit kept the delta", round)
+		}
 		abort() // no-op after commit
 
 		if _, err := os.Stat(restoreMem); !os.IsNotExist(err) {
@@ -419,5 +423,353 @@ func TestAcquireGoldenSlotOverlay(t *testing.T) {
 	}
 	if !bytes.Equal(rolledBack, deltaContent) {
 		t.Fatalf("abort did not restore original delta file")
+	}
+}
+
+func TestFastRestoreConfigTmpfsSlots(t *testing.T) {
+	c, err := fastRestoreConfigFromEnv(envMap(map[string]string{envTmpfsSlots: "true"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.tmpfsSlots || !c.enabled() {
+		t.Errorf("config = %+v, want tmpfsSlots on and enabled", c)
+	}
+	for _, v := range []string{"", "false", "0"} {
+		c, err := fastRestoreConfigFromEnv(envMap(map[string]string{envTmpfsSlots: v}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.tmpfsSlots {
+			t.Errorf("%s=%q turned tmpfsSlots on", envTmpfsSlots, v)
+		}
+	}
+	if _, err := fastRestoreConfigFromEnv(envMap(map[string]string{envTmpfsSlots: "ram"})); err == nil {
+		t.Errorf("%s=ram accepted, want an error", envTmpfsSlots)
+	}
+}
+
+// slotTestFixture is a golden base (pages 1 and 3 populated) under a fake
+// <ateRoot>/golden-base-cache/<baseID>/, and helpers to build warm deltas.
+type slotTestFixture struct {
+	t        *testing.T
+	dir      string
+	baseFile string
+	base     []byte
+}
+
+const slotTestPage = 4096
+const slotTestSize = 8 * slotTestPage
+
+func newSlotTestFixture(t *testing.T) *slotTestFixture {
+	t.Helper()
+	dir := t.TempDir()
+	f := &slotTestFixture{t: t, dir: dir, baseFile: filepath.Join(dir, "golden-base-cache", "base1", "memory-ranges")}
+	if err := os.MkdirAll(filepath.Dir(f.baseFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bf, err := os.Create(f.baseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bf.Truncate(slotTestSize); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bf.WriteAt(bytes.Repeat([]byte{0x11}, slotTestPage), 1*slotTestPage); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bf.WriteAt(bytes.Repeat([]byte{0x33}, slotTestPage), 3*slotTestPage); err != nil {
+		t.Fatal(err)
+	}
+	if err := bf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if f.base, err = os.ReadFile(f.baseFile); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the background prewarm out of the way: the tests count slots.
+	goldenPrewarmStarted.Store(f.baseFile, struct{}{})
+	return f
+}
+
+// delta writes a warm delta of a guest that changed pages 2 and 5 (to b) and
+// zeroed page 3, at path; it returns the full image the delta stands for and
+// the delta's own bytes.
+func (f *slotTestFixture) delta(path string, b byte) (full, delta []byte) {
+	f.t.Helper()
+	target := path + ".target"
+	full = append([]byte(nil), f.base...)
+	copy(full[2*slotTestPage:3*slotTestPage], bytes.Repeat([]byte{b}, slotTestPage))
+	copy(full[3*slotTestPage:4*slotTestPage], make([]byte, slotTestPage))
+	copy(full[5*slotTestPage:6*slotTestPage], bytes.Repeat([]byte{b + 1}, slotTestPage))
+	if err := os.WriteFile(target, full, 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := ch.CreateDeltaAgainstBase(context.Background(), f.baseFile, target, path); err != nil {
+		f.t.Fatal(err)
+	}
+	delta, err := os.ReadFile(path)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return full, delta
+}
+
+// useTmpfsSlots points the slot pool at a temp "tmpfs" dir and makes hard
+// links between it and the restore dir fail with EXDEV, as across a real tmpfs.
+func useTmpfsSlots(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	prevRoot, prevLink := goldenTmpfsRoot, linkFile
+	goldenTmpfsRoot = root
+	linkFile = func(oldname, newname string) error {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: unix.EXDEV}
+	}
+	t.Cleanup(func() { goldenTmpfsRoot, linkFile = prevRoot, prevLink })
+	return root
+}
+
+// waitIdleSlots waits for the pool to hold n idle slots and returns them
+// (drained), failing the test on timeout.
+func waitIdleSlots(t *testing.T, pool *baseSlotPool, n int) []*goldenSlot {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(pool.idle) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("pool has %d idle slots, want %d", len(pool.idle), n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	var out []*goldenSlot
+	for len(pool.idle) > 0 {
+		out = append(out, <-pool.idle)
+	}
+	return out
+}
+
+func isSymlinkUnder(t *testing.T, path, root string) bool {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(root, target)
+	return err == nil && filepath.IsLocal(rel)
+}
+
+// A tmpfs pool mirrors the base, links slots by symlink, and on a preserved
+// eager restore puts the delta back (keeping the marker) and recycles the slot.
+func TestAcquireGoldenSlotOverlayTmpfsPreservedEager(t *testing.T) {
+	ctx := context.Background()
+	f := newSlotTestFixture(t)
+	root := useTmpfsSlots(t)
+	pool := getOrCreateBaseSlotPool(f.baseFile, root)
+
+	for round := 0; round < 3; round++ {
+		restoreMem := filepath.Join(f.dir, "local-snapshot", "memory-ranges")
+		if err := os.MkdirAll(filepath.Dir(restoreMem), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		full, delta := f.delta(restoreMem, byte(0xA0+round))
+		before, err := os.Stat(restoreMem)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		commit, abort, err := acquireGoldenSlotOverlay(ctx, f.baseFile, restoreMem, restoreMem)
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if !isSymlinkUnder(t, restoreMem, root) {
+			abort()
+			t.Fatalf("round %d: restoreMem is not a symlink into the tmpfs pool", round)
+		}
+		got, err := os.ReadFile(restoreMem) // what cloud-hypervisor reads
+		if err != nil || !bytes.Equal(got, full) {
+			abort()
+			t.Fatalf("round %d: reconstructed image mismatch (err %v)", round, err)
+		}
+		if !pool.staged.Load() || goldenBaseReadPath(f.baseFile) != pool.baseFile {
+			t.Fatalf("round %d: base mirror not staged (read path %q)", round, goldenBaseReadPath(f.baseFile))
+		}
+		if mirror, err := os.ReadFile(pool.baseFile); err != nil || !bytes.Equal(mirror, f.base) {
+			t.Fatalf("round %d: base mirror mismatch (err %v)", round, err)
+		}
+
+		if !commit(true, true) {
+			t.Fatalf("round %d: preserved eager commit did not keep the delta", round)
+		}
+		abort() // no-op after commit
+		after, err := os.Lstat(restoreMem)
+		if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
+			t.Fatalf("round %d: restoreMem is not the original delta again (err %v)", round, err)
+		}
+		if got, _ := os.ReadFile(restoreMem); !bytes.Equal(got, delta) {
+			t.Fatalf("round %d: delta content changed", round)
+		}
+		if _, err := os.Lstat(restoreMem + ".delta.bak"); !os.IsNotExist(err) {
+			t.Fatalf("round %d: delta backup left behind", round)
+		}
+		// The slot comes back reset to the base and is reused next round.
+		for _, s := range waitIdleSlots(t, pool, 1) {
+			if b, err := os.ReadFile(s.path); err != nil || !bytes.Equal(b, f.base) {
+				t.Fatalf("round %d: recycled slot %s is not the base again (err %v)", round, s.path, err)
+			}
+			pool.idle <- s
+		}
+	}
+}
+
+func TestAcquireGoldenSlotOverlayTmpfsEagerAndAbort(t *testing.T) {
+	ctx := context.Background()
+	f := newSlotTestFixture(t)
+	root := useTmpfsSlots(t)
+	pool := getOrCreateBaseSlotPool(f.baseFile, root)
+
+	restoreMem := filepath.Join(f.dir, "restore-state", "memory-ranges")
+	if err := os.MkdirAll(filepath.Dir(restoreMem), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f.delta(restoreMem, 0xC0)
+	commit, _, err := acquireGoldenSlotOverlay(ctx, f.baseFile, restoreMem, restoreMem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit(true, false) {
+		t.Fatal("unpreserved eager commit kept the delta")
+	}
+	if _, err := os.Lstat(restoreMem); !os.IsNotExist(err) {
+		t.Fatalf("restoreMem still exists after an unpreserved eager commit (err %v)", err)
+	}
+	slots := waitIdleSlots(t, pool, 1)
+	for _, s := range slots {
+		pool.idle <- s
+	}
+
+	// abort puts the delta back and returns the slot.
+	_, delta := f.delta(restoreMem, 0xD0)
+	_, abort, err := acquireGoldenSlotOverlay(ctx, f.baseFile, restoreMem, restoreMem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abort()
+	if fi, err := os.Lstat(restoreMem); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("restoreMem not a regular file after abort (err %v)", err)
+	}
+	if got, _ := os.ReadFile(restoreMem); !bytes.Equal(got, delta) {
+		t.Fatal("abort did not restore the delta")
+	}
+	for _, s := range waitIdleSlots(t, pool, 1) {
+		if b, _ := os.ReadFile(s.path); !bytes.Equal(b, f.base) {
+			t.Fatalf("slot %s returned by abort is not the base", s.path)
+		}
+	}
+}
+
+// An OnDemand commit detaches the slot: a symlinked outFile is first replaced
+// by a regular copy, so nothing dangles once the slot file is gone.
+func TestAcquireGoldenSlotOverlayTmpfsOnDemandMaterializes(t *testing.T) {
+	ctx := context.Background()
+	f := newSlotTestFixture(t)
+	root := useTmpfsSlots(t)
+
+	restoreMem := filepath.Join(f.dir, "local-snapshot", "memory-ranges")
+	if err := os.MkdirAll(filepath.Dir(restoreMem), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	full, _ := f.delta(restoreMem, 0xE0)
+	commit, _, err := acquireGoldenSlotOverlay(ctx, f.baseFile, restoreMem, restoreMem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slotPath, err := os.Readlink(restoreMem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit(false, true) {
+		t.Fatal("OnDemand commit kept the delta")
+	}
+	fi, err := os.Lstat(restoreMem)
+	if err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("restoreMem not materialized as a regular file (err %v)", err)
+	}
+	if got, _ := os.ReadFile(restoreMem); !bytes.Equal(got, full) {
+		t.Fatal("materialized image mismatch")
+	}
+	if _, err := os.Stat(slotPath); !os.IsNotExist(err) {
+		t.Fatalf("detached slot %s still exists (err %v)", slotPath, err)
+	}
+	if _, err := os.Lstat(restoreMem + ".delta.bak"); !os.IsNotExist(err) {
+		t.Fatal("delta backup left behind")
+	}
+	_ = root
+}
+
+// A restore that died with outFile symlinked into a (now gone) slot gets its
+// delta back on the next attempt.
+func TestAcquireGoldenSlotOverlayRecoversInterruptedOverlay(t *testing.T) {
+	ctx := context.Background()
+	f := newSlotTestFixture(t)
+	useTmpfsSlots(t)
+
+	restoreMem := filepath.Join(f.dir, "local-snapshot", "memory-ranges")
+	if err := os.MkdirAll(filepath.Dir(restoreMem), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	full, _ := f.delta(restoreMem, 0x70)
+	if err := os.Rename(restoreMem, restoreMem+".delta.bak"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(f.dir, "gone", "slot-1"), restoreMem); err != nil {
+		t.Fatal(err)
+	}
+	commit, abort, err := acquireGoldenSlotOverlay(ctx, f.baseFile, restoreMem, restoreMem)
+	if err != nil {
+		t.Fatalf("acquire after an interrupted overlay: %v", err)
+	}
+	defer abort()
+	if got, err := os.ReadFile(restoreMem); err != nil || !bytes.Equal(got, full) {
+		t.Fatalf("reconstructed image mismatch (err %v)", err)
+	}
+	if !commit(true, true) {
+		t.Fatal("preserved eager commit did not keep the delta")
+	}
+}
+
+// When the base cannot be mirrored onto the tmpfs, the disk pool serves.
+func TestGoldenSlotPoolFallsBackToDisk(t *testing.T) {
+	f := newSlotTestFixture(t)
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := goldenTmpfsRoot
+	goldenTmpfsRoot = filepath.Join(notADir, "root")
+	t.Cleanup(func() { goldenTmpfsRoot = prev })
+
+	pool := goldenSlotPool(context.Background(), f.baseFile)
+	if pool.inTmpfs {
+		t.Fatal("got the tmpfs pool although its mirror cannot be staged")
+	}
+	if pool.baseFile != f.baseFile || filepath.Dir(pool.slotDir) != filepath.Dir(f.baseFile) {
+		t.Errorf("disk pool = base %q slots %q, want them next to %q", pool.baseFile, pool.slotDir, f.baseFile)
+	}
+	if got := goldenBaseReadPath(f.baseFile); got != f.baseFile {
+		t.Errorf("goldenBaseReadPath = %q, want the disk base", got)
+	}
+}
+
+func TestIsTmpfsMountPoint(t *testing.T) {
+	if isTmpfsMountPoint(t.TempDir()) {
+		t.Error("a fresh temp dir reported as a tmpfs mount point")
+	}
+	if _, ok := tmpfsFreeBytes("/dev/shm"); ok && !isTmpfsMountPoint("/dev/shm") {
+		t.Error("/dev/shm is a tmpfs but not reported as a mount point")
 	}
 }

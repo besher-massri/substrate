@@ -241,6 +241,9 @@ func do(ctx context.Context) error {
 	if fast.enabled() {
 		slog.InfoContext(ctx, "Opt-in restore latency settings", fast.attrs()...)
 	}
+	if fast.tmpfsSlots {
+		goldenTmpfsRoot = setupGoldenSlotTmpfs(ctx)
+	}
 	// The controller sets both from the downward API.
 	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {

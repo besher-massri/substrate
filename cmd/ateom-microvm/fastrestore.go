@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -85,6 +86,15 @@ const (
 	// while the rootfs, virtiofsd and tap are still being set up, instead of
 	// after them. The VMM only needs its cgroup leaf and api-socket path.
 	envEarlyVMMLaunch = "ATEOM_MICROVM_EARLY_VMM_LAUNCH"
+	// envTmpfsSlots ("true") keeps the golden-base slot pool, and a mirror of
+	// each golden base it is built from, on a tmpfs (see goldentmpfs.go)
+	// instead of the node disk. Warm restores then overlay their delta onto a
+	// RAM-backed slot, vm.restore copies guest RAM from memory, and checkpoints
+	// deflate against the RAM mirror: no slot write, hole punch or base read
+	// touches ext4 or its journal. It also stops preserved (node-cache)
+	// restores from detaching their slot (see acquireGoldenSlotOverlay), which
+	// cost a 168 MiB slot copy on the node disk per warm restore.
+	envTmpfsSlots = "ATEOM_MICROVM_TMPFS_SLOTS"
 )
 
 // fastRestoreConfig is the parsed set of opt-in restore-latency knobs.
@@ -106,11 +116,13 @@ type fastRestoreConfig struct {
 	readahead bool
 	// earlyVMMLaunch overlaps the VMM launch with rootfs/tap set-up.
 	earlyVMMLaunch bool
+	// tmpfsSlots keeps the golden-base slot pool and base mirrors on a tmpfs.
+	tmpfsSlots bool
 }
 
 // enabled reports whether any knob is on, for the startup log.
 func (c fastRestoreConfig) enabled() bool {
-	return c.boost || c.parallelWakeup || c.memRestoreMode != "" || c.noBackgroundFetch || c.readahead || c.earlyVMMLaunch
+	return c.boost || c.parallelWakeup || c.memRestoreMode != "" || c.noBackgroundFetch || c.readahead || c.earlyVMMLaunch || c.tmpfsSlots
 }
 
 // logValue renders the config for the startup log.
@@ -135,6 +147,7 @@ func (c fastRestoreConfig) attrs() []any {
 		slog.Bool("ondemand_no_background_fetch", c.noBackgroundFetch),
 		slog.Bool("restore_readahead", c.readahead),
 		slog.Bool("early_vmm_launch", c.earlyVMMLaunch),
+		slog.Bool("tmpfs_slots", c.tmpfsSlots),
 	}
 }
 
@@ -152,6 +165,7 @@ func fastRestoreConfigFromEnv(getenv func(string) string) (fastRestoreConfig, er
 		{envParallelWakeup, &c.parallelWakeup},
 		{envRestoreReadahead, &c.readahead},
 		{envEarlyVMMLaunch, &c.earlyVMMLaunch},
+		{envTmpfsSlots, &c.tmpfsSlots},
 	} {
 		if *b.dst, err = parseBoolEnv(getenv(b.env), false); err != nil {
 			return fastRestoreConfig{}, fmt.Errorf("%s: %w", b.env, err)
@@ -368,55 +382,187 @@ func isRestoringError(err error) bool {
 const (
 	goldenSlotPoolCap      = 8
 	goldenSlotPrewarmCount = 6
+	// A tmpfs pool recycles its slots on every eager restore, preserved ones
+	// included (they are never detached, see acquireGoldenSlotOverlay), so it
+	// can afford a deeper pool for restore bursts: ~170 MiB of RAM per slot.
+	goldenTmpfsSlotPoolCap      = 12
+	goldenTmpfsSlotPrewarmCount = 8
 )
 
-var goldenPools sync.Map // baseFile string -> *baseSlotPool
+// goldenTmpfsRoot is the tmpfs directory holding the golden base mirrors and
+// slot pools when envTmpfsSlots is on (see setupGoldenSlotTmpfs); "" keeps
+// them on the node disk next to the golden-base cache. Set once at startup,
+// before any restore or checkpoint runs.
+var goldenTmpfsRoot string
+
+// linkFile is os.Link; tests swap it to simulate a cross-filesystem link.
+var linkFile = os.Link
+
+var goldenPools sync.Map // poolKey(baseFile, tmpfsRoot) -> *baseSlotPool
+
+// goldenPrewarmStarted records the golden bases whose pool prewarm has been
+// started (baseFile -> struct{}), so it is kicked off once per base.
+var goldenPrewarmStarted sync.Map
 
 type goldenSlot struct {
 	path string
 }
 
 type baseSlotPool struct {
-	baseFile    string
-	slotDir     string
-	idle        chan *goldenSlot
-	prewarmOnce sync.Once
-	nextID      atomic.Uint64
+	// srcFile is the node's golden-base cache file this pool serves (the
+	// immutable <ateRoot>/golden-base-cache/<baseID>/memory-ranges).
+	srcFile string
+	// baseFile is what slots are staged and reset from: srcFile itself, or its
+	// mirror on the tmpfs (inTmpfs).
+	baseFile string
+	slotDir  string
+	inTmpfs  bool
+	prewarm  int
+	idle     chan *goldenSlot
+	nextID   atomic.Uint64
+
+	// stageOnce mirrors srcFile to baseFile for a tmpfs pool; stageErr is its
+	// outcome, staged reports success without waiting.
+	stageOnce sync.Once
+	stageErr  error
+	staged    atomic.Bool
 }
 
-func getOrCreateBaseSlotPool(baseFile string) *baseSlotPool {
-	if v, ok := goldenPools.Load(baseFile); ok {
+func poolKey(baseFile, tmpfsRoot string) string {
+	return tmpfsRoot + "\x00" + baseFile
+}
+
+// newBaseSlotPool describes the pool for baseFile: on the node disk next to
+// it, or under tmpfsRoot when that is set. The tmpfs directory is named after
+// the base id plus a hash of baseFile, so two caches never share a mirror.
+func newBaseSlotPool(baseFile, tmpfsRoot string) *baseSlotPool {
+	pid := os.Getpid()
+	p := &baseSlotPool{
+		srcFile:  baseFile,
+		baseFile: baseFile,
+		slotDir:  filepath.Join(filepath.Dir(baseFile), fmt.Sprintf("slots-%d", pid)),
+		prewarm:  goldenSlotPrewarmCount,
+	}
+	capacity := goldenSlotPoolCap
+	if tmpfsRoot != "" {
+		sum := sha256.Sum256([]byte(baseFile))
+		dir := filepath.Join(tmpfsRoot, fmt.Sprintf("%s-%x", filepath.Base(filepath.Dir(baseFile)), sum[:4]))
+		p.baseFile = filepath.Join(dir, "base-memory-ranges")
+		p.slotDir = filepath.Join(dir, fmt.Sprintf("slots-%d", pid))
+		p.inTmpfs = true
+		p.prewarm = goldenTmpfsSlotPrewarmCount
+		capacity = goldenTmpfsSlotPoolCap
+	}
+	p.idle = make(chan *goldenSlot, capacity)
+	return p
+}
+
+func getOrCreateBaseSlotPool(baseFile, tmpfsRoot string) *baseSlotPool {
+	key := poolKey(baseFile, tmpfsRoot)
+	if v, ok := goldenPools.Load(key); ok {
 		return v.(*baseSlotPool)
 	}
-	baseDir := filepath.Dir(baseFile)
-	slotDir := filepath.Join(baseDir, fmt.Sprintf("slots-%d", os.Getpid()))
-	pool := &baseSlotPool{
-		baseFile: baseFile,
-		slotDir:  slotDir,
-		idle:     make(chan *goldenSlot, goldenSlotPoolCap),
-	}
-	actual, loaded := goldenPools.LoadOrStore(baseFile, pool)
+	pool := newBaseSlotPool(baseFile, tmpfsRoot)
+	actual, loaded := goldenPools.LoadOrStore(key, pool)
 	if loaded {
 		return actual.(*baseSlotPool)
 	}
-	// Best-effort cleanup of slot directories from dead ateom-microvm PIDs.
-	if entries, err := os.ReadDir(baseDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() || !strings.HasPrefix(e.Name(), "slots-") {
-				continue
-			}
-			pidStr := strings.TrimPrefix(e.Name(), "slots-")
-			pid, perr := strconv.Atoi(pidStr)
-			if perr != nil || pid == os.Getpid() {
-				continue
-			}
-			if kerr := unix.Kill(pid, 0); errors.Is(kerr, unix.ESRCH) {
-				_ = os.RemoveAll(filepath.Join(baseDir, e.Name()))
+	if !pool.inTmpfs {
+		// Best-effort cleanup of slot directories from dead ateom-microvm PIDs.
+		// (A tmpfs pool's directory dies with this process's mount namespace.)
+		baseDir := filepath.Dir(baseFile)
+		if entries, err := os.ReadDir(baseDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || !strings.HasPrefix(e.Name(), "slots-") {
+					continue
+				}
+				pidStr := strings.TrimPrefix(e.Name(), "slots-")
+				pid, perr := strconv.Atoi(pidStr)
+				if perr != nil || pid == os.Getpid() {
+					continue
+				}
+				if kerr := unix.Kill(pid, 0); errors.Is(kerr, unix.ESRCH) {
+					_ = os.RemoveAll(filepath.Join(baseDir, e.Name()))
+				}
 			}
 		}
 	}
-	_ = os.MkdirAll(slotDir, 0o700)
+	_ = os.MkdirAll(pool.slotDir, 0o700)
 	return pool
+}
+
+// ready stages a tmpfs pool's mirror of the golden base on first use and
+// reports whether the pool can serve slots. A disk pool is always ready.
+func (p *baseSlotPool) ready(ctx context.Context) bool {
+	if !p.inTmpfs {
+		return true
+	}
+	p.stageOnce.Do(func() {
+		t := time.Now()
+		// Shared by every caller, so not bound to the first one's deadline.
+		if err := mirrorGoldenBase(context.WithoutCancel(ctx), p.srcFile, p.baseFile); err != nil {
+			p.stageErr = err
+			_ = os.RemoveAll(filepath.Dir(p.baseFile))
+			slog.WarnContext(ctx, "Could not mirror the golden base onto the slot tmpfs; using the node disk for it",
+				slog.String("base", p.srcFile), slog.Any("err", err))
+			return
+		}
+		p.staged.Store(true)
+		slog.InfoContext(ctx, "Mirrored golden base onto the slot tmpfs",
+			slog.String("base", p.srcFile), slog.String("mirror", p.baseFile), slog.Duration("took", time.Since(t)))
+	})
+	return p.stageErr == nil
+}
+
+// mirrorGoldenBase copies the immutable golden base src to dst (temp file +
+// rename), keeping its holes, unless dst already holds a copy of that size.
+func mirrorGoldenBase(ctx context.Context, src, dst string) error {
+	si, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if di, err := os.Stat(dst); err == nil && di.Mode().IsRegular() && di.Size() == si.Size() {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	tmp := dst + ".tmp"
+	_ = os.Remove(tmp)
+	if err := ch.CopySparseFileFast(ctx, src, tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// goldenSlotPool returns the pool serving the golden base baseFile: the tmpfs
+// one when envTmpfsSlots set a tmpfs up and the base could be mirrored onto it
+// (mirroring it on first use), else the one on the node disk.
+func goldenSlotPool(ctx context.Context, baseFile string) *baseSlotPool {
+	if root := goldenTmpfsRoot; root != "" {
+		if p := getOrCreateBaseSlotPool(baseFile, root); p.ready(ctx) {
+			return p
+		}
+	}
+	return getOrCreateBaseSlotPool(baseFile, "")
+}
+
+// goldenBaseReadPath is where to read the golden base baseFile from: its tmpfs
+// mirror once one is staged, else baseFile itself. Never stages anything.
+func goldenBaseReadPath(baseFile string) string {
+	if root := goldenTmpfsRoot; root != "" {
+		if v, ok := goldenPools.Load(poolKey(baseFile, root)); ok {
+			if p := v.(*baseSlotPool); p.staged.Load() {
+				return p.baseFile
+			}
+		}
+	}
+	return baseFile
 }
 
 // maybePrewarmGoldenSlots asynchronously populates reusable golden-base slot
@@ -426,17 +572,21 @@ func maybePrewarmGoldenSlots(baseFile string) {
 	if os.Getenv("ATEOM_MICROVM_DISABLE_GOLDEN_SLOT_POOL") == "true" {
 		return
 	}
+	if _, started := goldenPrewarmStarted.Load(baseFile); started {
+		return
+	}
 	if _, err := os.Stat(baseFile); err != nil {
 		return
 	}
-	pool := getOrCreateBaseSlotPool(baseFile)
-	pool.prewarmOnce.Do(func() {
-		go func() {
-			for i := 0; i < goldenSlotPrewarmCount; i++ {
-				pool.replenishOneSlot()
-			}
-		}()
-	})
+	if _, started := goldenPrewarmStarted.LoadOrStore(baseFile, struct{}{}); started {
+		return
+	}
+	go func() {
+		pool := goldenSlotPool(context.Background(), baseFile)
+		for i := 0; i < pool.prewarm; i++ {
+			pool.replenishOneSlot()
+		}
+	}()
 }
 
 func (p *baseSlotPool) replenishOneSlot() {
@@ -483,22 +633,90 @@ func (p *baseSlotPool) resetAndReturnSlot(slot *goldenSlot, dirtyRanges []ch.Byt
 	}
 }
 
+// linkSlot makes outFile name the slot file. A hard link is used when both are
+// on one filesystem; a slot on the tmpfs is on another one (EXDEV), so outFile
+// becomes a symlink to it instead: cloud-hypervisor opens memory-ranges with a
+// plain open(2), which follows it.
+func linkSlot(slotPath, outFile string) (symlinked bool, err error) {
+	err = linkFile(slotPath, outFile)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, unix.EXDEV) {
+		return false, err
+	}
+	if err := os.Symlink(slotPath, outFile); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// materializeSlot replaces outFile (a symlink to slotPath) with a regular copy
+// of the slot, atomically, so outFile stays a complete image after the slot
+// file goes away.
+func materializeSlot(ctx context.Context, slotPath, outFile string) error {
+	tmp := outFile + ".materialize"
+	_ = os.Remove(tmp)
+	if err := ch.CopySparseFileFast(ctx, slotPath, tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, outFile); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// recoverInterruptedOverlay undoes what a restore that died between linking a
+// slot at outFile and its commit/abort left behind when that link is a symlink
+// (into a tmpfs that may be gone): it puts the original delta back.
+func recoverInterruptedOverlay(outFile string) {
+	deltaBackup := outFile + ".delta.bak"
+	fi, err := os.Lstat(outFile)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return
+	}
+	if _, err := os.Lstat(deltaBackup); err != nil {
+		return
+	}
+	_ = os.Rename(deltaBackup, outFile)
+}
+
 // acquireGoldenSlotOverlay overlays deltaFile's populated pages onto a
 // pre-staged golden-base slot file (~7 MiB write instead of a 168 MiB base copy)
-// and links it at outFile for vm.restore.
+// and links it at outFile for vm.restore. The original delta is kept at
+// outFile+".delta.bak" until commit or abort.
 //
-// Call commit(true) once an eager vm.restore finishes (unlinks outFile and
-// asynchronously resets the modified ~7 MiB ranges of the slot for reuse), or
-// commit(false) for OnDemand/preserved restores (detaches the slot so outFile
-// remains owned exclusively by the actor). Defer abort() so any failure before
-// commit restores deltaFile at outFile and returns the reset slot to the pool.
-func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile string) (commit func(eager bool), abort func(), err error) {
+// Once vm.restore has finished, call commit(eager, preserve), where eager says
+// guest RAM was copied in full (so nothing reads outFile any more) and
+// preserve says the restore directory is a preserved snapshot (for example
+// the node-local actor snapshot cache). It returns whether outFile holds the
+// original delta again, in which case the caller must keep the golden-delta
+// marker; otherwise outFile is now a complete image (or gone) and the marker
+// must go:
+//
+//   - eager, not preserved: outFile is unlinked and the slot's modified
+//     ~7 MiB is reset in the background for reuse.
+//   - eager, preserved, tmpfs pool: the delta is put back at outFile and the
+//     slot is reset for reuse. A RAM-backed slot is never detached, and no
+//     symlink into it is ever left behind.
+//   - otherwise (OnDemand, where the VMM keeps paging from the slot inode, or a
+//     preserved restore from a disk pool): the slot is detached so outFile
+//     stays a complete image owned by the actor (copied off the tmpfs first if
+//     outFile is a symlink), and a fresh slot is staged in the background.
+//
+// Defer abort() so any failure before commit restores deltaFile at outFile and
+// returns the reset slot to the pool.
+func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile string) (commit func(eager, preserve bool) (keepDelta bool), abort func(), err error) {
+	noopCommit := func(bool, bool) bool { return false }
 	if os.Getenv("ATEOM_MICROVM_DISABLE_GOLDEN_SLOT_POOL") == "true" {
 		if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
 			return nil, nil, err
 		}
-		return func(bool) {}, func() {}, nil
+		return noopCommit, func() {}, nil
 	}
+	recoverInterruptedOverlay(outFile)
 	maybePrewarmGoldenSlots(baseFile)
 	bi, err := os.Stat(baseFile)
 	if err != nil {
@@ -512,7 +730,7 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 		return nil, nil, fmt.Errorf("acquireGoldenSlotOverlay: size mismatch base=%d delta=%d", bi.Size(), di.Size())
 	}
 
-	pool := getOrCreateBaseSlotPool(baseFile)
+	pool := goldenSlotPool(ctx, baseFile)
 	var slot *goldenSlot
 	for {
 		select {
@@ -528,13 +746,24 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 		break
 	}
 	if slot == nil {
-		if err := os.MkdirAll(pool.slotDir, 0o700); err != nil {
-			return nil, nil, err
-		}
 		slotPath := filepath.Join(pool.slotDir, fmt.Sprintf("slot-%d", pool.nextID.Add(1)))
-		if err := ch.CopySparseFileFast(ctx, baseFile, slotPath); err != nil {
+		err := os.MkdirAll(pool.slotDir, 0o700)
+		if err == nil {
+			err = ch.CopySparseFileFast(ctx, pool.baseFile, slotPath)
+		}
+		if err != nil {
 			_ = os.Remove(slotPath)
-			return nil, nil, fmt.Errorf("staging golden slot: %w", err)
+			if !pool.inTmpfs {
+				return nil, nil, fmt.Errorf("staging golden slot: %w", err)
+			}
+			// The tmpfs is full or failing: rebuild the image on the node disk
+			// as before the slot pool existed, rather than failing the restore.
+			slog.WarnContext(ctx, "Could not stage a golden slot on the tmpfs; merging on the node disk",
+				slog.String("base", baseFile), slog.Any("err", err))
+			if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
+				return nil, nil, err
+			}
+			return noopCommit, func() {}, nil
 		}
 		slot = &goldenSlot{path: slotPath}
 	}
@@ -567,27 +796,56 @@ func acquireGoldenSlotOverlay(ctx context.Context, baseFile, deltaFile, outFile 
 		go pool.resetAndReturnSlot(slot, dirtyRanges)
 		return nil, nil, fmt.Errorf("backup delta %q: %w", outFile, err)
 	}
-	if err := os.Link(slot.path, outFile); err != nil {
+	symlinked, err := linkSlot(slot.path, outFile)
+	if err != nil {
 		_ = os.Rename(deltaBackup, outFile)
 		go pool.resetAndReturnSlot(slot, dirtyRanges)
 		if err := ch.MergeSparseOverlay(ctx, baseFile, deltaFile, outFile); err != nil {
 			return nil, nil, err
 		}
-		return func(bool) {}, func() {}, nil
+		return noopCommit, func() {}, nil
 	}
 
+	// Detaching keeps outFile a complete image without the slot file; it may
+	// copy the slot, so it must not be bound to the restore's deadline.
+	bg := context.WithoutCancel(ctx)
+	detach := func() {
+		_ = os.Remove(deltaBackup)
+		if symlinked {
+			if err := materializeSlot(bg, slot.path, outFile); err != nil {
+				// outFile still points at the slot: leave the slot file in place.
+				slog.WarnContext(ctx, "Could not copy the golden slot off the tmpfs; keeping it",
+					slog.String("slot", slot.path), slog.Any("err", err))
+				return
+			}
+		}
+		_ = os.Remove(slot.path)
+		go pool.replenishOneSlot()
+	}
 	var once sync.Once
-	commitFn := func(eager bool) {
+	commitFn := func(eager, preserve bool) (keepDelta bool) {
 		once.Do(func() {
-			_ = os.Remove(deltaBackup)
-			if eager {
+			switch {
+			case eager && !preserve:
+				_ = os.Remove(deltaBackup)
 				_ = os.Remove(outFile)
 				go pool.resetAndReturnSlot(slot, dirtyRanges)
-			} else {
-				_ = os.Remove(slot.path)
-				go pool.replenishOneSlot()
+			case eager && pool.inTmpfs:
+				// Guest RAM is already copied, so nothing reads outFile any more:
+				// the preserved snapshot gets its own delta back.
+				if err := os.Rename(deltaBackup, outFile); err != nil {
+					slog.WarnContext(ctx, "Could not put the golden delta back; detaching the slot instead",
+						slog.String("delta", deltaBackup), slog.Any("err", err))
+					detach()
+					return
+				}
+				keepDelta = true
+				go pool.resetAndReturnSlot(slot, dirtyRanges)
+			default:
+				detach()
 			}
 		})
+		return keepDelta
 	}
 	abortFn := func() {
 		once.Do(func() {

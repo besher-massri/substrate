@@ -295,7 +295,7 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 	deltaMarker := filepath.Join(restoreDir, goldenDeltaFile)
 	restoreMem := filepath.Join(restoreDir, "memory-ranges")
 	type reconstructResult struct {
-		commit func(eager bool)
+		commit func(eager, preserve bool) (keepDelta bool)
 		abort  func()
 		err    error
 	}
@@ -541,8 +541,12 @@ func (s *AteomService) restoreMemoryFidelity(ctx context.Context, p actorBootPar
 		return fmt.Errorf("while restoring VM with net FDs: %w", err)
 	}
 	if recRes.commit != nil {
-		_ = os.Remove(deltaMarker)
-		recRes.commit(memMode == ch.MemRestoreEager && !preserveRestoreDir)
+		// The marker stays only when the restore directory got its golden delta
+		// back (a preserved snapshot restored from a tmpfs slot); otherwise its
+		// memory-ranges is now a complete image, or gone.
+		if keepDelta := recRes.commit(memMode == ch.MemRestoreEager, preserveRestoreDir); !keepDelta {
+			_ = os.Remove(deltaMarker)
+		}
 	}
 	tVMRestore := time.Now()
 	if err := client.Resume(ctx); err != nil {
