@@ -237,6 +237,47 @@ func TestWaitAll_SkipsContainersWithoutProbe(t *testing.T) {
 	}
 }
 
+// WaitFast uses a short per-attempt timeout on initial polls so a first
+// connection attempt that stalls (e.g. a TCP SYN dropped while a restored
+// sandbox finishes attaching its veth) retries in ~15ms rather than waiting the
+// full 250ms RequestTimeout.
+func TestWaitFast_RecoversQuicklyFromStalledFirstAttempt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ip, port := splitHostPort(t, srv.URL)
+	probe := &ateompb.WakeupProbe{
+		HttpGet:        &ateompb.HTTPGetAction{Path: "/readyz", Port: int32(port)},
+		TimeoutSeconds: 2,
+	}
+
+	var attempts atomic.Int32
+	baseDialer := &net.Dialer{}
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if attempts.Add(1) == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return baseDialer.DialContext(ctx, network, addr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := WaitAllFast(ctx, []*ateompb.Container{{Name: "app", WakeupProbe: probe}}, ip, dial); err != nil {
+		t.Fatalf("WaitAllFast returned error: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= RequestTimeout {
+		t.Errorf("WaitAllFast took %v after stalled first dial, want < %v", elapsed, RequestTimeout)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Errorf("dial attempts = %d, want >= 2", got)
+	}
+}
+
 func splitHostPort(t *testing.T, raw string) (string, int) {
 	t.Helper()
 	u, err := url.Parse(raw)

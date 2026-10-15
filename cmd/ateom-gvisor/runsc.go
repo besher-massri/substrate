@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/agent-substrate/substrate/internal/ocispec"
@@ -45,6 +46,9 @@ type runsc struct {
 	durableVolumes []string
 	// containers are the workload's containers, from the request.
 	containers []*ateompb.Container
+
+	specMu       sync.Mutex
+	specsWritten map[string]bool
 }
 
 // durableVolumeNames returns the sorted, deduplicated durable-dir volume names
@@ -91,10 +95,33 @@ func (r *runsc) writeSpec(containerName string) error {
 	return ocispec.Save(ociBundlePath(r.actorDirs, containerName), spec)
 }
 
+// ensureSpec writes the OCI spec for containerName once per runsc instance, so
+// parallel preparation and cmdCreate/cmdRestore do not rewrite config.json.
+func (r *runsc) ensureSpec(containerName string) error {
+	r.specMu.Lock()
+	if r.specsWritten[containerName] {
+		r.specMu.Unlock()
+		return nil
+	}
+	r.specMu.Unlock()
+
+	if err := r.writeSpec(containerName); err != nil {
+		return err
+	}
+
+	r.specMu.Lock()
+	if r.specsWritten == nil {
+		r.specsWritten = map[string]bool{}
+	}
+	r.specsWritten[containerName] = true
+	r.specMu.Unlock()
+	return nil
+}
+
 func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName string, additionalArgs []string) error {
 	slog.InfoContext(ctx, "About to run runsc create", slog.String("container", containerName))
 
-	if err := r.writeSpec(containerName); err != nil {
+	if err := r.ensureSpec(containerName); err != nil {
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 
@@ -306,7 +333,7 @@ func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
 func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, checkpointPath string) error {
 	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
 
-	if err := r.writeSpec(containerName); err != nil {
+	if err := r.ensureSpec(containerName); err != nil {
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 

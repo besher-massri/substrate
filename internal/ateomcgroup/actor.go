@@ -116,15 +116,35 @@ func setWorkerCPUWeightUnder(root string, weight int) error {
 // opening it (and without touching its cpu.max). A leaf that does not exist,
 // or a node without the cpu controller, has nothing to change.
 func SetActorLeafCPUWeight(actorUID string, weight int) error {
-	return setActorLeafCPUWeightUnder(Root, actorUID, weight)
+	return SetActorLeafCPUWeightUnder(Root, actorUID, weight)
 }
 
-func setActorLeafCPUWeightUnder(root, actorUID string, weight int) error {
+// SetActorLeafCPUWeightUnder is SetActorLeafCPUWeight for a leaf under root.
+func SetActorLeafCPUWeightUnder(root, actorUID string, weight int) error {
 	path, err := actorLeafPath(root, actorUID)
 	if err != nil {
 		return err
 	}
 	return setCPUWeight(path, weight)
+}
+
+// SetActorLeafCPULimit replaces the named actor leaf's CPU cap with milliCPU
+// (0 removes it) without opening the leaf. A leaf that does not exist, or a
+// node without the cpu controller, has nothing to change.
+func SetActorLeafCPULimit(actorUID string, milliCPU int64) error {
+	return SetActorLeafCPULimitUnder(Root, actorUID, milliCPU)
+}
+
+// SetActorLeafCPULimitUnder is SetActorLeafCPULimit for a leaf under root.
+func SetActorLeafCPULimitUnder(root, actorUID string, milliCPU int64) error {
+	path, err := actorLeafPath(root, actorUID)
+	if err != nil {
+		return err
+	}
+	if err := writeExisting(filepath.Join(path, "cpu.max"), cpuMax(milliCPU)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("while limiting cgroup %q: %w", path, err)
+	}
+	return nil
 }
 
 func setCPUWeight(path string, weight int) error {

@@ -235,7 +235,7 @@ func TestSetActorLeafCPUWeight(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := setActorLeafCPUWeightUnder(root, "uid-a", 10000); err != nil {
+	if err := SetActorLeafCPUWeightUnder(root, "uid-a", 10000); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(filepath.Join(root, "uid-a", "cpu.weight")); string(got) != "10000" {
@@ -244,10 +244,44 @@ func TestSetActorLeafCPUWeight(t *testing.T) {
 	if got, _ := os.ReadFile(filepath.Join(root, "uid-a", "cpu.max")); string(got) != "keep" {
 		t.Errorf("cpu.max changed to %q", got)
 	}
-	if err := setActorLeafCPUWeightUnder(root, "uid-gone", 10000); err != nil {
+	if err := SetActorLeafCPUWeightUnder(root, "uid-gone", 10000); err != nil {
 		t.Errorf("weighting a missing leaf: %v", err)
 	}
-	if err := setActorLeafCPUWeightUnder(root, "../escape", 10000); err == nil {
+	if err := SetActorLeafCPUWeightUnder(root, "../escape", 10000); err == nil {
 		t.Error("weighting an unsafe leaf name succeeded")
+	}
+	if err := SetActorLeafCPUWeightUnder(root, "uid-a", 250); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "uid-a", "cpu.weight")); string(got) != "250" {
+		t.Errorf("cpu.weight = %q, want 250", got)
+	}
+}
+
+func TestSetActorLeafCPULimitUnder(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "uid-a-_pause"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "uid-a-_pause", "cpu.max"), []byte("25000 100000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetActorLeafCPULimitUnder(root, "uid-a-_pause", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "uid-a-_pause", "cpu.max")); string(got) != "max 100000" {
+		t.Errorf("cpu.max = %q, want max 100000", got)
+	}
+	if err := SetActorLeafCPULimitUnder(root, "uid-a-_pause", 250); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "uid-a-_pause", "cpu.max")); string(got) != "25000 100000" {
+		t.Errorf("cpu.max = %q, want 25000 100000", got)
+	}
+	if err := SetActorLeafCPULimitUnder(root, "uid-gone", 250); err != nil {
+		t.Errorf("limiting a missing leaf: %v", err)
+	}
+	if err := SetActorLeafCPULimitUnder(root, "../escape", 250); err == nil {
+		t.Error("limiting an unsafe leaf name succeeded")
 	}
 }

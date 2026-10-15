@@ -130,3 +130,22 @@ func TestStopContainersLeavesTheSandboxToCleanup(t *testing.T) {
 	}
 	assertCalls(t, f, want...)
 }
+
+func TestCleanupContainersFast_SkipsStateOnHappyPath(t *testing.T) {
+	f := newFakeRunsc("app", "_pause")
+
+	if err := cleanupContainersWithMode(context.Background(), f, appContainers, true); err != nil {
+		t.Fatalf("cleanupContainersWithMode(fast): %v", err)
+	}
+
+	assertCalls(t, f, "delete app", "delete _pause")
+	if len(f.containers) != 0 {
+		t.Errorf("containers survived fast cleanup: %v", slices.Sorted(maps.Keys(f.containers)))
+	}
+	// Repeated fast cleanup remains idempotent when containers are already gone.
+	f.calls = nil
+	if err := cleanupContainersWithMode(context.Background(), f, appContainers, true); err != nil {
+		t.Fatalf("repeated cleanupContainersWithMode(fast): %v", err)
+	}
+	assertCalls(t, f, "delete app", "list", "delete _pause", "list")
+}

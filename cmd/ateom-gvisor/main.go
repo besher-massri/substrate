@@ -53,7 +53,6 @@ import (
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/internal/sizing"
 	"github.com/agent-substrate/substrate/internal/version"
-	"github.com/agent-substrate/substrate/internal/wakeupprobe"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -199,6 +198,19 @@ func do(ctx context.Context) error {
 	if _, err := ateomcgroup.Delegate(ctx); err != nil {
 		return fmt.Errorf("while setting up cgroup delegation: %w", err)
 	}
+	fastCfg, err := fastRestoreConfigFromEnv(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("invalid fast restore config: %w", err)
+	}
+	if fastCfg.selfCPUWeight > 0 {
+		if err := ateomcgroup.SetWorkerCPUWeight(fastCfg.selfCPUWeight); err != nil {
+			slog.WarnContext(ctx, "Failed to set ateom worker cgroup cpu.weight",
+				slog.Int("weight", fastCfg.selfCPUWeight), slog.Any("err", err))
+		}
+	}
+	if fastCfg.enabled() {
+		slog.InfoContext(ctx, "gVisor fast-restore optimizations enabled", fastCfg.attrs()...)
+	}
 
 	go reaper.Run(ctx)
 	slog.InfoContext(ctx, "Child process reaper launched")
@@ -220,6 +232,8 @@ func do(ctx context.Context) error {
 		return err
 	}
 	ateomService := NewService(tunnel, actorLogger, *maxActors)
+	ateomService.fast = fastCfg
+	ateomService.actorCgroups = true
 	// The controller sets both from the downward API.
 	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -325,6 +339,13 @@ type AteomService struct {
 	// own cgroup scope, which ateomcgroup.Delegate prepares. A field rather
 	// than a constant so tests can point GetWorkloadStats at a fixture tree.
 	cgroupRoot string
+
+	// fast holds opt-in restore/checkpoint latency knobs configured via
+	// ATEOM_GVISOR_* environment variables.
+	fast fastRestoreConfig
+	// actorCgroups is true when the pod cgroup has been delegated for per-actor
+	// sandbox leaves (or in tests that point cgroupRoot at a fixture tree).
+	actorCgroups bool
 
 	// readSandboxCgroup overrides cgroupstats.Read when set. Only tests set it:
 	// it is the seam that lets them interleave a lifecycle transition with the
@@ -588,26 +609,87 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	//   * Correct runsc version is downloaded and placed on disk.
 	//   * All OCI bundles are set up, including for the pause container.
 
-	egress, err := s.tunnel.PrepareEgress(ctx, ateomstats.ActorAttributionFromRequest(req), req.GetEgressGateway())
-	if err != nil {
-		return nil, err
-	}
-	// Publish attribution before boot so stats can include startup usage.
-	hosted, err := s.hostActor(ctx, attribution, req.GetActorDirs())
-	if err != nil {
-		return nil, err
-	}
+	containers := req.GetSpec().GetContainers()
 	rcmd := &runsc{
 		path:           req.GetRunscPath(),
 		actorUID:       req.GetActorUid(),
 		actorDirs:      req.GetActorDirs(),
 		size:           sizing.FromLimits(req.GetCpuMilli(), req.GetMemoryBytes()),
 		durableVolumes: durableVolumeNames(req.GetSpec()),
-		containers:     req.GetSpec().GetContainers(),
+		containers:     containers,
+	}
+
+	var egress *ateomtunnel.ActorEgress
+	var hosted *hostedActor
+	joinPauseSetup := noJoin
+	appSetupJoins := make([]func() error, len(containers))
+	for i := range appSetupJoins {
+		appSetupJoins[i] = noJoin
+	}
+	if s.fast.parallelPrep {
+		var egressErr, hostErr error
+		joinEgress := runAsync(func() error {
+			egress, egressErr = s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
+			return egressErr
+		})
+		joinHost := runAsync(func() error {
+			hosted, hostErr = s.hostActor(ctx, attribution, req.GetActorDirs())
+			return hostErr
+		})
+		joinPauseSetup = runAsync(func() error {
+			if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ocispec.PauseContainer)); err != nil {
+				return err
+			}
+			return rcmd.ensureSpec(ocispec.PauseContainer)
+		})
+		for i, ac := range containers {
+			name := ac.GetName()
+			appSetupJoins[i] = runAsync(func() error {
+				if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), name)); err != nil {
+					return err
+				}
+				return rcmd.ensureSpec(name)
+			})
+		}
+		if err := joinEgress(); err != nil {
+			_ = joinHost()
+			_ = joinPauseSetup()
+			for _, j := range appSetupJoins {
+				_ = j()
+			}
+			if hostErr == nil && hosted != nil {
+				_ = s.unhostActor(ctx, req.GetActorUid())
+			}
+			_ = imagecache.UnmountAllUnder(req.GetActorDirs().GetOciBundleDir())
+			return nil, err
+		}
+		if err := joinHost(); err != nil {
+			_ = joinPauseSetup()
+			for _, j := range appSetupJoins {
+				_ = j()
+			}
+			_ = imagecache.UnmountAllUnder(req.GetActorDirs().GetOciBundleDir())
+			return nil, err
+		}
+	} else {
+		var err error
+		egress, err = s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
+		if err != nil {
+			return nil, err
+		}
+		// Publish attribution before boot so stats can include startup usage.
+		hosted, err = s.hostActor(ctx, attribution, req.GetActorDirs())
+		if err != nil {
+			return nil, err
+		}
 	}
 	var containersToDelete []string
 	defer func() {
 		if retErr != nil {
+			_ = joinPauseSetup()
+			for _, j := range appSetupJoins {
+				_ = j()
+			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
 			if err := s.tunnel.Deactivate(cleanupCtx, ateomstats.ActorAttributionFromRequest(req)); err != nil {
@@ -632,26 +714,35 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	// upper — because mounting is ateom's job (atelet runs with no
 	// capabilities); runsc's gofer resolves the mount in this pod's mount
 	// namespace.
-	if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ocispec.PauseContainer)); err != nil {
+	if s.fast.parallelPrep {
+		if err := joinPauseSetup(); err != nil {
+			return nil, fmt.Errorf("while composing pause rootfs: %w", err)
+		}
+	} else if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ocispec.PauseContainer)); err != nil {
 		return nil, fmt.Errorf("while composing pause rootfs: %w", err)
 	}
 	containersToDelete = append(containersToDelete, ocispec.PauseContainer)
 	if err := rcmd.cmdCreate(ctx, os.Stdout, ocispec.PauseContainer, nil); err != nil {
 		return nil, fmt.Errorf("while creating pause container: %w", err)
 	}
+	s.applyActivationCgroup(ctx, req.GetActorUid(), rcmd.size.MilliCPU)
 	if err := rcmd.cmdStart(ctx, os.Stdout, ocispec.PauseContainer); err != nil {
 		return nil, fmt.Errorf("while starting pause container: %w", err)
 	}
 
 	// Create and start each application container, each with its own log pipe so
 	// every line is tagged with the originating container (ate.actor.container.name).
-	for _, ac := range req.GetSpec().GetContainers() {
+	for i, ac := range containers {
 		pw, err := s.actorLogger.StartJSONLogPipe(attribution, ac.GetName())
 		if err != nil {
 			return nil, fmt.Errorf("while starting json log pipe for %q: %w", ac.GetName(), err)
 		}
 		defer pw.Close()
-		if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ac.GetName())); err != nil {
+		if s.fast.parallelPrep {
+			if err := appSetupJoins[i](); err != nil {
+				return nil, fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
+			}
+		} else if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ac.GetName())); err != nil {
 			return nil, fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
 		}
 		containersToDelete = append(containersToDelete, ac.GetName())
@@ -664,9 +755,10 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	}
 
 	// Block until every wakeup-probe-enabled container reports 200.
-	if err := wakeupprobe.WaitAll(ctx, req.GetSpec().GetContainers(), ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid()))); err != nil {
+	if err := s.waitForWakeupProbes(ctx, containers, req.GetActorUid()); err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
+	s.applySteadyCgroup(ctx, req.GetActorUid(), rcmd.size.MilliCPU)
 	if err := s.tunnel.Activate(ateomstats.ActorAttributionFromRequest(req), s.sandboxDialer(req.GetActorUid()), egress); err != nil {
 		return nil, err
 	}
@@ -745,6 +837,14 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while creating checkpoint directory: %w", err)
 	}
 
+	s.raiseSandboxCgroupForTeardown(ctx, req.GetActorUid())
+	teardownStarted := false
+	defer func() {
+		if !teardownStarted {
+			s.restoreSteadyCgroupByUID(ctx, req.GetActorUid())
+		}
+	}()
+
 	// durableFiles are the durable-dir tars written below: the VOLUMES subset.
 	var durableFiles []string
 	// Always take durable-dir snapshot if at least one container has a durable-dir volume mount.
@@ -798,7 +898,9 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Cleanup the containers after checkpointing. This also unhosts the actor,
 	// before the snapshot listing below can fail.
 	// This is best-effort cleanup for actor containers that may have been left behind after checkpointing.
-	if err := s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers()); err != nil {
+	teardownStarted = true
+	alreadyStopped := fidelity == ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+	if err := s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers(), alreadyStopped); err != nil {
 		slog.WarnContext(ctx, "failed to terminate workload after checkpoint",
 			slog.String("actor", attribution.Ref.String()),
 			slog.String("actorUID", attribution.UID),
@@ -848,12 +950,38 @@ func stopContainers(ctx context.Context, rcmd containerRuntime, containers []*at
 }
 
 func cleanupContainers(ctx context.Context, rcmd containerRuntime, containers []*ateompb.Container) error {
+	return cleanupContainersWithMode(ctx, rcmd, containers, false)
+}
+
+func cleanupContainersWithMode(ctx context.Context, rcmd containerRuntime, containers []*ateompb.Container, fast bool) error {
 	// Application containers first, the pause (root) container last.
 	names := make([]string, 0, len(containers)+1)
 	for _, ctr := range containers {
 		names = append(names, ctr.GetName())
 	}
 	names = append(names, ocispec.PauseContainer)
+
+	if fast {
+		// `runsc delete -force` kills running containers and returns exit code 0 if
+		// a container does not exist (`os.IsNotExist(err) && d.force` in
+		// runsc/cmd/delete.go). Skipping the pre-delete `runsc state` probe avoids
+		// N+1 redundant CLI subprocesses on the happy path; if `runsc delete` still
+		// errors, fall back to `isContainerAlreadyGone` to preserve idempotency.
+		for _, name := range names {
+			if err := rcmd.cmdDelete(ctx, name); err != nil {
+				gone, listErr := isContainerAlreadyGone(ctx, rcmd, name)
+				if listErr != nil {
+					return errors.Join(fmt.Errorf("while deleting %q container: %w", name, err), listErr)
+				}
+				if gone {
+					slog.InfoContext(ctx, "runsc container already destroyed, skipping its cleanup", slog.String("container", name))
+					continue
+				}
+				return fmt.Errorf("while deleting %q container: %w", name, err)
+			}
+		}
+		return nil
+	}
 
 	// Check state of all containers to mimic containerd.
 	// Without this, `runsc delete` occasionally throws an error.
@@ -951,27 +1079,103 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	//   * All OCI bundles are set up, including for the pause container.
 	//   * Checkpoint downloaded and placed on disk
 
-	egress, err := s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
-	timing.egressPrepare = lap(&tLast)
-	if err != nil {
-		return nil, err
-	}
-	hosted, err := s.hostActor(ctx, attribution, req.GetActorDirs())
-	timing.netSetup = lap(&tLast)
-	if err != nil {
-		return nil, err
-	}
 	rcmd := &runsc{
 		path:           req.GetRunscPath(),
 		actorUID:       req.GetActorUid(),
 		actorDirs:      req.GetActorDirs(),
 		size:           sizing.FromLimits(req.GetCpuMilli(), req.GetMemoryBytes()),
 		durableVolumes: durableVolumeNames(req.GetSpec()),
-		containers:     req.GetSpec().GetContainers(),
+		containers:     containers,
+	}
+	checkpointDir := req.GetActorDirs().GetRestoreDir()
+	hasDurable := hasDurableVolumes(containers)
+
+	var egress *ateomtunnel.ActorEgress
+	var hosted *hostedActor
+	joinDurable := noJoin
+	joinPauseSetup := noJoin
+	appSetupJoins := make([]func() error, len(containers))
+	for i := range appSetupJoins {
+		appSetupJoins[i] = noJoin
+	}
+	if s.fast.parallelPrep {
+		var egressErr, hostErr error
+		joinEgress := runAsync(func() error {
+			egress, egressErr = s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
+			return egressErr
+		})
+		joinHost := runAsync(func() error {
+			hosted, hostErr = s.hostActor(ctx, attribution, req.GetActorDirs())
+			return hostErr
+		})
+		if hasDurable {
+			volDir := req.GetActorDirs().GetDurableDirVolumeMountsDir()
+			vols := rcmd.durableVolumes
+			joinDurable = runAsync(func() error {
+				return untarDurableVolumes(volDir, checkpointDir, vols)
+			})
+		}
+		joinPauseSetup = runAsync(func() error {
+			if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ocispec.PauseContainer)); err != nil {
+				return err
+			}
+			return rcmd.ensureSpec(ocispec.PauseContainer)
+		})
+		for i, ac := range containers {
+			name := ac.GetName()
+			appSetupJoins[i] = runAsync(func() error {
+				if err := imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), name)); err != nil {
+					return err
+				}
+				return rcmd.ensureSpec(name)
+			})
+		}
+		err = joinEgress()
+		timing.egressPrepare = lap(&tLast)
+		if err != nil {
+			_ = joinHost()
+			_ = joinDurable()
+			_ = joinPauseSetup()
+			for _, j := range appSetupJoins {
+				_ = j()
+			}
+			if hostErr == nil && hosted != nil {
+				_ = s.unhostActor(ctx, req.GetActorUid())
+			}
+			_ = imagecache.UnmountAllUnder(req.GetActorDirs().GetOciBundleDir())
+			return nil, err
+		}
+		err = joinHost()
+		timing.netSetup = lap(&tLast)
+		if err != nil {
+			_ = joinDurable()
+			_ = joinPauseSetup()
+			for _, j := range appSetupJoins {
+				_ = j()
+			}
+			_ = imagecache.UnmountAllUnder(req.GetActorDirs().GetOciBundleDir())
+			return nil, err
+		}
+	} else {
+		egress, err = s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
+		timing.egressPrepare = lap(&tLast)
+		if err != nil {
+			return nil, err
+		}
+		hosted, err = s.hostActor(ctx, attribution, req.GetActorDirs())
+		timing.netSetup = lap(&tLast)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var containersToDelete []string
 	defer func() {
 		if retErr != nil {
+			_ = joinDurable()
+			_ = joinPauseSetup()
+			for _, j := range appSetupJoins {
+				_ = j()
+			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
 			if err := s.tunnel.Deactivate(cleanupCtx, attribution); err != nil {
@@ -988,10 +1192,14 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			}
 		}
 	}()
-	checkpointDir := req.GetActorDirs().GetRestoreDir()
 
-	if hasDurableVolumes(containers) {
-		err := untarDurableVolumes(req.GetActorDirs().GetDurableDirVolumeMountsDir(), checkpointDir, durableVolumeNames(req.GetSpec()))
+	if hasDurable {
+		var err error
+		if s.fast.parallelPrep {
+			err = joinDurable()
+		} else {
+			err = untarDurableVolumes(req.GetActorDirs().GetDurableDirVolumeMountsDir(), checkpointDir, rcmd.durableVolumes)
+		}
 		timing.durableDir = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while restoring durable-dir volumes: %w", err)
@@ -1000,7 +1208,11 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	// Compose the pause rootfs before create (see RunWorkload). runsc restore
 	// only needs the rootfs to hold the correct content; whether it came from
 	// an untar or an overlay of cached layers is transparent to it.
-	err = imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ocispec.PauseContainer))
+	if s.fast.parallelPrep {
+		err = joinPauseSetup()
+	} else {
+		err = imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ocispec.PauseContainer))
+	}
 	timing.pauseRootfs = lap(&tLast)
 	if err != nil {
 		return nil, fmt.Errorf("while composing pause rootfs: %w", err)
@@ -1015,6 +1227,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		if err != nil {
 			return nil, fmt.Errorf("while creating pause container: %w", err)
 		}
+		s.applyActivationCgroup(ctx, req.GetActorUid(), rcmd.size.MilliCPU)
 		err = rcmd.cmdStart(ctx, os.Stdout, ocispec.PauseContainer)
 		timing.pauseRestore = lap(&tLast)
 		if err != nil {
@@ -1028,6 +1241,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		if err != nil {
 			return nil, fmt.Errorf("while creating pause container: %w", err)
 		}
+		s.applyActivationCgroup(ctx, req.GetActorUid(), rcmd.size.MilliCPU)
 		err = rcmd.cmdRestore(ctx, os.Stdout, ocispec.PauseContainer, checkpointDir)
 		timing.pauseRestore = lap(&tLast)
 		if err != nil {
@@ -1040,14 +1254,18 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	// Create and restore each application container, each with its own log pipe so
 	// every line is tagged with the originating container (ate.actor.container.name).
 	// app_create includes starting that pipe.
-	for _, ac := range containers {
+	for i, ac := range containers {
 		pw, err := s.actorLogger.StartJSONLogPipe(attribution, ac.GetName())
 		timing.appCreate += lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while starting json log pipe for %q: %w", ac.GetName(), err)
 		}
 		defer pw.Close()
-		err = imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ac.GetName()))
+		if s.fast.parallelPrep {
+			err = appSetupJoins[i]()
+		} else {
+			err = imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ac.GetName()))
+		}
 		timing.appRootfs += lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
@@ -1077,11 +1295,12 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}
 
 	// Block until every wakeup-probe-enabled container reports 200.
-	err = wakeupprobe.WaitAll(ctx, containers, ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid())))
+	err = s.waitForWakeupProbes(ctx, containers, req.GetActorUid())
 	timing.wakeupProbe = lap(&tLast)
 	if err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
+	s.applySteadyCgroup(ctx, req.GetActorUid(), rcmd.size.MilliCPU)
 	err = s.tunnel.Activate(attribution, s.sandboxDialer(req.GetActorUid()), egress)
 	timing.activate = lap(&tLast)
 	if err != nil {
@@ -1113,7 +1332,8 @@ func (s *AteomService) TerminateWorkload(ctx context.Context, req *ateompb.Termi
 	if hosted != nil {
 		s.readFinal(ctx, hosted)
 	}
-	err := s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers())
+	s.raiseSandboxCgroupForTeardown(ctx, attribution.UID)
+	err := s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers(), false)
 	s.recordFinalIfEnded(ctx, hosted)
 	if err != nil {
 		return nil, fmt.Errorf("failed to terminate workload: %w", err)
@@ -1124,7 +1344,7 @@ func (s *AteomService) TerminateWorkload(ctx context.Context, req *ateompb.Termi
 	return &ateompb.TerminateWorkloadResponse{}, nil
 }
 
-func (s *AteomService) terminateWorkload(ctx context.Context, actorRef resources.ActorRef, actorUID, runscPath string, actorDirs *ateompb.ActorDirs, containers []*ateompb.Container) error {
+func (s *AteomService) terminateWorkload(ctx context.Context, actorRef resources.ActorRef, actorUID, runscPath string, actorDirs *ateompb.ActorDirs, containers []*ateompb.Container, alreadyStopped bool) error {
 	var errs []error
 	if err := s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: actorRef, UID: actorUID}); err != nil {
 		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
@@ -1142,11 +1362,16 @@ func (s *AteomService) terminateWorkload(ctx context.Context, actorRef resources
 	defer cancel()
 	// Stop the containers before deleting them, to avoid leaving a live container
 	// with no bundle on disk. Best-effort: if they are already stopped, the
-	// delete succeeds anyway.
-	stopContainers(cleanupCtx, rcmd, containers)
+	// delete succeeds anyway. When fastCleanup is enabled after a MEMORY
+	// checkpoint, `runsc checkpoint` (without --leave-running) has already
+	// stopped the sandbox and `runsc delete -force` kills any remaining
+	// processes, so we can skip the redundant `runsc kill` + `runsc wait` RPCs.
+	if !(s.fast.fastCleanup && alreadyStopped) {
+		stopContainers(cleanupCtx, rcmd, containers)
+	}
 	// Keep this as best-effort cleanup: atelet resets the bundle and checkpoint
 	// directories after uploading the snapshot.
-	if err := cleanupContainers(cleanupCtx, rcmd, containers); err != nil {
+	if err := cleanupContainersWithMode(cleanupCtx, rcmd, containers, s.fast.fastCleanup); err != nil {
 		errs = append(errs, fmt.Errorf("while cleaning up runsc containers: %w", err))
 	}
 
