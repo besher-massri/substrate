@@ -21,9 +21,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent-substrate/substrate/internal/ateomcgroup"
 	"github.com/agent-substrate/substrate/internal/ateomnet"
@@ -199,6 +202,19 @@ func (c fastRestoreConfig) steadyWeight() int {
 	return 0
 }
 
+// minSteadyMilliCPU is the minimum steady-state cgroup CFS quota (1000m = 1 full
+// core per 100ms period) restored after an activation boost on gVisor sandboxes,
+// matching sizing.go's 1-core burst floor so systrap threads do not starve under
+// fractional actor CPU limits.
+const minSteadyMilliCPU int64 = 1000
+
+func steadyMilliCPU(actorMilli int64) int64 {
+	if actorMilli <= 0 {
+		return 0
+	}
+	return max(actorMilli, minSteadyMilliCPU)
+}
+
 func (c fastRestoreConfig) activationMilliCPU(actorMilli int64) int64 {
 	if !c.boost || actorMilli <= 0 {
 		return actorMilli
@@ -206,11 +222,11 @@ func (c fastRestoreConfig) activationMilliCPU(actorMilli int64) int64 {
 	if c.boostMilliCPU == 0 {
 		return 0
 	}
-	return max(actorMilli, c.boostMilliCPU)
+	return max(steadyMilliCPU(actorMilli), c.boostMilliCPU)
 }
 
 func (c fastRestoreConfig) boosted(actorMilli int64) bool {
-	return c.activationMilliCPU(actorMilli) != actorMilli
+	return c.boost && actorMilli > 0 && c.activationMilliCPU(actorMilli) != steadyMilliCPU(actorMilli)
 }
 
 func noJoin() error { return nil }
@@ -261,8 +277,9 @@ func (s *AteomService) applyActivationCgroup(ctx context.Context, actorUID strin
 	}
 }
 
-// applySteadyCgroup restores the actor's declared CPU limit and steady
-// cpu.weight once the wakeup probe passes.
+// applySteadyCgroup restores the actor's declared CPU limit (subject to the
+// 1000m gVisor systrap burst floor) and steady cpu.weight once the wakeup probe
+// passes.
 func (s *AteomService) applySteadyCgroup(ctx context.Context, actorUID string, actorMilli int64) {
 	if !s.actorCgroups {
 		return
@@ -270,9 +287,10 @@ func (s *AteomService) applySteadyCgroup(ctx context.Context, actorUID string, a
 	leaf := sandboxCgroupLeafName(actorUID)
 	root := s.cgroupRootDir()
 	if s.fast.boosted(actorMilli) {
-		if err := ateomcgroup.SetActorLeafCPULimitUnder(root, leaf, actorMilli); err != nil {
+		steadyMilli := steadyMilliCPU(actorMilli)
+		if err := ateomcgroup.SetActorLeafCPULimitUnder(root, leaf, steadyMilli); err != nil {
 			slog.WarnContext(ctx, "Could not restore steady cpu.max on sandbox cgroup",
-				slog.String("actorUID", actorUID), slog.Int64("milliCPU", actorMilli), slog.Any("err", err))
+				slog.String("actorUID", actorUID), slog.Int64("milliCPU", steadyMilli), slog.Any("err", err))
 		}
 	}
 	if w := s.fast.steadyWeight(); w > 0 {
@@ -323,10 +341,95 @@ func (s *AteomService) restoreSteadyCgroupByUID(ctx context.Context, actorUID st
 	s.applySteadyCgroup(ctx, actorUID, actorMilli)
 }
 
-func (s *AteomService) waitForWakeupProbes(ctx context.Context, containers []*ateompb.Container, actorUID string) error {
-	dial := wakeupprobe.DialFunc(s.sandboxDialer(actorUID))
-	if s.fast.fastWakeupProbe {
-		return wakeupprobe.WaitAllFast(ctx, containers, ateomnet.ActorVethIP, dial)
+const (
+	// minUncompressedAppPagesBytes is the minimum size of an uncompressed
+	// `pages.img` file when at least one application subcontainer is running
+	// alongside `/pause` (an empty `/pause`-only sandbox writes 21 pages =
+	// 86,016 bytes).
+	minUncompressedAppPagesBytes int64 = 128 * 1024
+	// minCompressedAppPagesBytes is the minimum size of a zstd-compressed
+	// `pages.img.zstd` file when at least one application subcontainer is
+	// running alongside `/pause` (an empty `/pause`-only sandbox compresses to
+	// ~4–12 KiB, whereas any live application container is several MiB).
+	minCompressedAppPagesBytes int64 = 32 * 1024
+	// wakeupLivenessCheckDelay is how long waitForWakeupProbes waits before
+	// spawning a background `runsc wait` check on application containers, so
+	// normal fast restores (<250ms) spawn zero extra subprocesses while a dead
+	// or un-restored application container fails in ~250ms instead of 30s.
+	wakeupLivenessCheckDelay = 250 * time.Millisecond
+)
+
+// verifyMemoryCheckpointPages fails fast when a MEMORY checkpoint directory for
+// an actor with application containers contains only `/pause` pages because the
+// application container exited before `runsc checkpoint`.
+func verifyMemoryCheckpointPages(checkpointDir string, appContainers int) error {
+	if appContainers <= 0 || checkpointDir == "" {
+		return nil
 	}
-	return wakeupprobe.WaitAll(ctx, containers, ateomnet.ActorVethIP, dial)
+	if info, err := os.Stat(filepath.Join(checkpointDir, "pages.img")); err == nil {
+		if info.Size() <= minUncompressedAppPagesBytes {
+			return fmt.Errorf("application container exited before memory checkpoint: %s/pages.img is only %d bytes (<= %d bytes pause-only threshold)",
+				checkpointDir, info.Size(), minUncompressedAppPagesBytes)
+		}
+		return nil
+	}
+	if info, err := os.Stat(filepath.Join(checkpointDir, "pages.img.zstd")); err == nil {
+		if info.Size() <= minCompressedAppPagesBytes {
+			return fmt.Errorf("application container exited before memory checkpoint: %s/pages.img.zstd is only %d bytes (<= %d bytes pause-only threshold)",
+				checkpointDir, info.Size(), minCompressedAppPagesBytes)
+		}
+		return nil
+	}
+	return nil
+}
+
+func (s *AteomService) waitForWakeupProbes(ctx context.Context, rcmd *runsc, containers []*ateompb.Container, actorUID string) error {
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var exitedErr error
+	var exitedOnce sync.Once
+	if rcmd != nil && rcmd.path != "" && len(containers) > 0 {
+		go func() {
+			timer := time.NewTimer(wakeupLivenessCheckDelay)
+			defer timer.Stop()
+			select {
+			case <-probeCtx.Done():
+				return
+			case <-timer.C:
+			}
+			for _, ac := range containers {
+				name := ac.GetName()
+				if name == "" {
+					continue
+				}
+				go func(containerName string) {
+					err := rcmd.cmdWait(probeCtx, containerName)
+					if probeCtx.Err() != nil {
+						return
+					}
+					exitedOnce.Do(func() {
+						if err != nil {
+							exitedErr = fmt.Errorf("application container %q not running during wakeup probe: %w", containerName, err)
+						} else {
+							exitedErr = fmt.Errorf("application container %q exited before wakeup probe succeeded", containerName)
+						}
+						cancel()
+					})
+				}(name)
+			}
+		}()
+	}
+
+	dial := wakeupprobe.DialFunc(s.sandboxDialer(actorUID))
+	var err error
+	if s.fast.fastWakeupProbe {
+		err = wakeupprobe.WaitAllFast(probeCtx, containers, ateomnet.ActorVethIP, dial)
+	} else {
+		err = wakeupprobe.WaitAll(probeCtx, containers, ateomnet.ActorVethIP, dial)
+	}
+	if exitedErr != nil {
+		return exitedErr
+	}
+	return err
 }

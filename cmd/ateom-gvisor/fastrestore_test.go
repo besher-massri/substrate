@@ -176,10 +176,10 @@ func TestSandboxCgroupLifecycleBoostAndSteadyRestore(t *testing.T) {
 		t.Errorf("activation cpu.weight = %q, want \"10000\"", got)
 	}
 
-	// 2. After wakeup probe: applySteadyCgroup restores 250m cap and weight 100.
+	// 2. After wakeup probe: applySteadyCgroup restores the 1000m floor (100000 100000) and weight 100.
 	s.applySteadyCgroup(ctx, actorUID, 250)
-	if got, _ := os.ReadFile(cpuMaxPath); string(got) != "25000 100000" {
-		t.Errorf("steady cpu.max = %q, want \"25000 100000\"", got)
+	if got, _ := os.ReadFile(cpuMaxPath); string(got) != "100000 100000" {
+		t.Errorf("steady cpu.max = %q, want \"100000 100000\" (1000m floor)", got)
 	}
 	if got, _ := os.ReadFile(cpuWeightPath); string(got) != "100" {
 		t.Errorf("steady cpu.weight = %q, want \"100\"", got)
@@ -194,14 +194,60 @@ func TestSandboxCgroupLifecycleBoostAndSteadyRestore(t *testing.T) {
 		t.Errorf("teardown cpu.weight = %q, want \"10000\"", got)
 	}
 
-	// 4. If checkpoint fails before teardown: restoreSteadyCgroupByUID restores steady limits.
+	// 4. If checkpoint fails before teardown: restoreSteadyCgroupByUID restores steady limits (1000m floor).
 	s.restoreSteadyCgroupByUID(ctx, actorUID)
-	if got, _ := os.ReadFile(cpuMaxPath); string(got) != "25000 100000" {
-		t.Errorf("restored steady cpu.max = %q, want \"25000 100000\"", got)
+	if got, _ := os.ReadFile(cpuMaxPath); string(got) != "100000 100000" {
+		t.Errorf("restored steady cpu.max = %q, want \"100000 100000\" (1000m floor)", got)
 	}
 	if got, _ := os.ReadFile(cpuWeightPath); string(got) != "100" {
 		t.Errorf("restored steady cpu.weight = %q, want \"100\"", got)
 	}
+
+	// 5. An actor with MilliCPU > 1000 keeps its declared limit (e.g. 2000m -> 200000 100000).
+	s.applySteadyCgroup(ctx, actorUID, 2000)
+	if got, _ := os.ReadFile(cpuMaxPath); string(got) != "200000 100000" {
+		t.Errorf("steady cpu.max for 2000m = %q, want \"200000 100000\"", got)
+	}
+}
+
+func TestVerifyMemoryCheckpointPages(t *testing.T) {
+	t.Run("rejects 86016-byte pause-only pages.img", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "pages.img"), make([]byte, 86016), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dir, 1); err == nil {
+			t.Fatal("verifyMemoryCheckpointPages succeeded on 86,016-byte pause-only pages.img, want error")
+		}
+	})
+
+	t.Run("rejects tiny pause-only pages.img.zstd", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "pages.img.zstd"), make([]byte, 8192), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dir, 1); err == nil {
+			t.Fatal("verifyMemoryCheckpointPages succeeded on 8,192-byte pause-only pages.img.zstd, want error")
+		}
+	})
+
+	t.Run("accepts normal app pages.img and pages.img.zstd", func(t *testing.T) {
+		dirRaw := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dirRaw, "pages.img"), make([]byte, 256*1024), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dirRaw, 1); err != nil {
+			t.Fatalf("verifyMemoryCheckpointPages(256KiB pages.img) = %v, want nil", err)
+		}
+
+		dirZstd := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dirZstd, "pages.img.zstd"), make([]byte, 128*1024), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dirZstd, 1); err != nil {
+			t.Fatalf("verifyMemoryCheckpointPages(128KiB pages.img.zstd) = %v, want nil", err)
+		}
+	})
 }
 
 func TestEnsureSpecWritesOncePerContainer(t *testing.T) {

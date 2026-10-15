@@ -755,7 +755,7 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	}
 
 	// Block until every wakeup-probe-enabled container reports 200.
-	if err := s.waitForWakeupProbes(ctx, containers, req.GetActorUid()); err != nil {
+	if err := s.waitForWakeupProbes(ctx, rcmd, containers, req.GetActorUid()); err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
 	s.applySteadyCgroup(ctx, req.GetActorUid(), rcmd.size.MilliCPU)
@@ -882,6 +882,13 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		timing.checkpoint = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while checkpointing pause: %w", err)
+		}
+		if err := verifyMemoryCheckpointPages(checkpointPath, len(req.GetSpec().GetContainers())); err != nil {
+			teardownStarted = true
+			_ = s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers(), true)
+			timing.teardown = lap(&tLast)
+			s.recordFinalIfEnded(ctx, hosted)
+			return nil, fmt.Errorf("while verifying memory checkpoint: %w", err)
 		}
 		if hasDurableVolumes(req.GetSpec().GetContainers()) {
 			var err error
@@ -1088,6 +1095,11 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		containers:     containers,
 	}
 	checkpointDir := req.GetActorDirs().GetRestoreDir()
+	if fidelity == ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+		if err := verifyMemoryCheckpointPages(checkpointDir, len(containers)); err != nil {
+			return nil, fmt.Errorf("while verifying memory checkpoint before restore: %w", err)
+		}
+	}
 	hasDurable := hasDurableVolumes(containers)
 
 	var egress *ateomtunnel.ActorEgress
@@ -1295,7 +1307,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}
 
 	// Block until every wakeup-probe-enabled container reports 200.
-	err = s.waitForWakeupProbes(ctx, containers, req.GetActorUid())
+	err = s.waitForWakeupProbes(ctx, rcmd, containers, req.GetActorUid())
 	timing.wakeupProbe = lap(&tLast)
 	if err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
