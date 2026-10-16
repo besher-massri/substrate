@@ -484,7 +484,7 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	// host upper, mounted into the shared dir) + durable-dir and CSI volumes (if any),
 	// and start the ONE virtiofsd that serves them all. CH connects to it at vm.create
 	// and demand-pages for the actor's lifetime, so ateworker owns the process (killed in teardownActor).
-	leaf, err := s.actorLeaf(actorUID, p.size)
+	leaf, err := s.actorLeafForActivation(actorUID, p.size)
 	if err != nil {
 		return err
 	}
@@ -591,6 +591,7 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	if err := wakeupprobe.WaitAll(ctx, containers, actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
 		return fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
+	s.applySteadyCPU(ctx, leaf, p.size)
 
 	// Everything from BootVM onward, split. ateworker used to log only the total, which
 	// hid where a cold boot actually goes: it is not the guest booting.

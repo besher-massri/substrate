@@ -228,6 +228,19 @@ func do(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("while delegating the worker cgroup: %w", err)
 	}
+	cpuPriority, err := cpuPriorityConfigFromEnv(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("invalid CPU priority config: %w", err)
+	}
+	if cpuPriority.enabled() {
+		slog.InfoContext(ctx, "ateworker-microvm CPU priority config enabled", cpuPriority.attrs()...)
+	}
+	if actorCgroups && cpuPriority.selfCPUWeight > 0 {
+		if err := cgroup.SetWorkerCPUWeight(cpuPriority.selfCPUWeight); err != nil {
+			slog.WarnContext(ctx, "Could not set cpu.weight on worker cgroup",
+				slog.Int("weight", cpuPriority.selfCPUWeight), slog.Any("err", err))
+		}
+	}
 
 	tunnel, err := tunnel.Start(ctx, *tunnelConfig, actornet.ActorHTTPUpstream)
 	if err != nil {
@@ -235,6 +248,7 @@ func do(ctx context.Context) error {
 	}
 	ateworkerService := NewService(*podUID, *chBinary, *guestDebug, *vmmMemReserve, *maxActors, tunnel, actorLogger)
 	ateworkerService.actorCgroups = actorCgroups
+	ateworkerService.cpuPriority = cpuPriority
 	// The controller sets both from the downward API.
 	pool := workerstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -384,12 +398,15 @@ type AteWorkerService struct {
 	// actorCgroups is set when the worker's cgroup is delegated, so each actor's
 	// VMM and virtiofsd run in a leaf of their own.
 	actorCgroups bool
+	// cpuPriority holds opt-in cgroup CPU priority and activation boost knobs.
+	cpuPriority cpuPriorityConfig
 }
 
 var _ ateworkerpb.WorkerServer = (*AteWorkerService)(nil)
 
 // NewService creates a new AteWorkerService.
 func NewService(podUID, chBinary string, guestDebug bool, memReserveMiB, maxActors int, tunnel *tunnel.Tunnel, actorLogger *actorlog.ActorLogger) *AteWorkerService {
+	cpuPriority, _ := cpuPriorityConfigFromEnv(os.Getenv)
 	return &AteWorkerService{
 		locks:         actorlock.New(),
 		inFlight:      actorlock.NewInFlight(),
@@ -402,6 +419,7 @@ func NewService(podUID, chBinary string, guestDebug bool, memReserveMiB, maxActo
 		memReserveMiB: memReserveMiB,
 		tunnel:        tunnel,
 		actorLogger:   actorLogger,
+		cpuPriority:   cpuPriority,
 	}
 }
 

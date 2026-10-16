@@ -27,6 +27,7 @@ import (
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/nodepath"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/sizing"
 )
 
 // specFile is the OCI spec file name within a bundle.
@@ -69,7 +70,8 @@ func ociResources(r *ateworkerpb.ResourceLimits) *specs.LinuxResources {
 		out.Memory = &specs.LinuxMemory{Limit: &b}
 	}
 	if m := r.GetCpuMillis(); m > 0 {
-		quota := max(m*cpuQuotaPeriodUS/1000, cpuQuotaMinUS)
+		effectiveMillis := sizing.EffectiveContainerMilliCPU(m)
+		quota := max(effectiveMillis*cpuQuotaPeriodUS/1000, cpuQuotaMinUS)
 		period := uint64(cpuQuotaPeriodUS)
 		out.CPU = &specs.LinuxCPU{Quota: &quota, Period: &period}
 	}
