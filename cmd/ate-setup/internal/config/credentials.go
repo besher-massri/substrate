@@ -40,18 +40,42 @@ func (c *Config) EnsureClusterCredentials(ctx context.Context) error {
 			"set them in %s or pass --context to use an already-configured cluster", devEnvFile)
 	}
 
+	if c.Kubeconfig != "" {
+		if info, err := os.Stat(c.Kubeconfig); err == nil && info.Size() > 0 {
+			probe := exec.CommandContext(ctx, "kubectl", "get", "ns", "default", "--request-timeout=30s")
+			probe.Env = c.ScriptEnv()
+			if err := probe.Run(); err == nil {
+				log.Infof("Reusing existing reachable KUBECONFIG %s for cluster %s", c.Kubeconfig, c.ClusterName)
+				return nil
+			}
+		}
+	}
+
 	log.Stepf("gcloud container clusters get-credentials %s", c.ClusterName)
 	defer log.Elapsed(time.Now(), "gcloud get-credentials")
-	cmd := exec.CommandContext(ctx, "gcloud", "container", "clusters", "get-credentials",
-		c.ClusterName,
-		"--location", c.ClusterLocation,
-		"--project", c.ProjectID,
-	)
-	cmd.Env = c.ScriptEnv()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("while fetching credentials for cluster %s: %w", c.ClusterName, err)
+	backoffs := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 45 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt <= len(backoffs); attempt++ {
+		cmd := exec.CommandContext(ctx, "gcloud", "container", "clusters", "get-credentials",
+			c.ClusterName,
+			"--location", c.ClusterLocation,
+			"--project", c.ProjectID,
+		)
+		cmd.Env = c.ScriptEnv()
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		lastErr = cmd.Run()
+		if lastErr == nil {
+			return nil
+		}
+		if attempt < len(backoffs) {
+			log.Warnf("gcloud get-credentials attempt %d/%d failed: %v; retrying in %s", attempt+1, len(backoffs)+1, lastErr, backoffs[attempt])
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoffs[attempt]):
+			}
+		}
 	}
-	return nil
+	return fmt.Errorf("while fetching credentials for cluster %s: %w", c.ClusterName, lastErr)
 }

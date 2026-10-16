@@ -80,6 +80,8 @@
 # Runs `runner.py -f <file> -t <duration> -u <users> --name <name>` in a
 # Job, with --tag set to the build commit hash and --dest from the
 # orchestrator's --dest flag. `file`, `duration` and `users` are required.
+# Optional `cpuCores` (integer >= 0) and `cpuDutyCycle` (float in [0.0, 1.0])
+# append `--cpu-cores <N>` and `--cpu-duty-cycle <F>` to `flags`.
 # Optional `flags` is a list of arbitrary strings appended to runner.py's
 # argv; runner.py forwards them to locust verbatim.
 #

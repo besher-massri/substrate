@@ -79,7 +79,16 @@ STORAGE_CLASS_NAME="${STORAGE_CLASS_NAME:-}"
 OTLP_ENDPOINT=""
 # The timeout, in whole seconds, for waiting for the worker pods to be
 # ready.
-WAIT_TIMEOUT_SECS=300
+if [[ -z "${WAIT_TIMEOUT_SECS:-}" ]]; then
+  if [[ "${ATE_INSTALL_CLUSTER_SIZE:-${SCALE_PROFILE:-}}" == "size10" ]]; then
+    WAIT_TIMEOUT_SECS=900
+  else
+    WAIT_TIMEOUT_SECS=300
+  fi
+fi
+# Optional zone to pin the WorkerPool pods to (e.g., to guarantee homogeneous
+# CPU microarchitecture for golden snapshot creation and restore).
+ACTOR_IMAGE_ZONE="${ACTOR_IMAGE_ZONE:-}"
 # fake-atelet's tuning on the fake data plane, as FAKE_ATELET_<FLAG>=VALUE
 # entries for the fake-atelet-tuning ConfigMap; --fake-atelet-env adds one.
 FAKE_ATELET_ENV=()
@@ -96,6 +105,7 @@ usage() {
   echo "  --actor-memory SIZE         Memory limit for the benchmark ActorTemplates (default: 256Mi,"
   echo "                              the smallest size microvm admits)"
   echo "  --actor-cpu CPU             CPU limit for the benchmark ActorTemplates (default: 1)"
+  echo "  --actor-image-zone ZONE     Optional topology.kubernetes.io/zone nodeSelector for WorkerPool pods"
   echo "  --worker-memory SIZE        Memory request and limit for each WorkerPool pod"
   echo "                              (default: unset, the pod is unsized)"
   echo "  --storage-class-name NAME   StorageClass for the glutton-storage external volume. Setting it"
@@ -124,8 +134,13 @@ resolve_otlp_endpoint() {
   if [[ -n "${OTLP_ENDPOINT}" ]]; then
     return 0
   fi
-  OTLP_ENDPOINT="$(kubectl get configmap ate-otel-config --namespace=ate-system \
-    -o jsonpath='{.data.OTEL_EXPORTER_OTLP_ENDPOINT}' 2>/dev/null || true)"
+  for _retry in 1 2 3 4 5; do
+    OTLP_ENDPOINT="$(kubectl get configmap ate-otel-config --namespace=ate-system \
+      --request-timeout=60s \
+      -o jsonpath='{.data.OTEL_EXPORTER_OTLP_ENDPOINT}' 2>/dev/null || true)"
+    [[ -n "${OTLP_ENDPOINT}" ]] && break
+    sleep 5
+  done
   if [[ -z "${OTLP_ENDPOINT}" ]]; then
     echo "Error: cannot read OTEL_EXPORTER_OTLP_ENDPOINT from the ate-otel-config" >&2
     echo "ConfigMap in ate-system. Deploy ate-system first, or give --otlp-endpoint." >&2
@@ -156,6 +171,13 @@ substitute() {
   # One flow-style line, so an unset WORKER_MEMORY leaves only a blank line.
   if [[ -n "${WORKER_MEMORY}" ]]; then
     worker_resources="resources: {requests: {memory: \"${WORKER_MEMORY}\"}, limits: {memory: \"${WORKER_MEMORY}\"}}"
+  fi
+  if [[ -n "${ACTOR_IMAGE_ZONE}" ]]; then
+    if [[ -n "${worker_resources}" ]]; then
+      worker_resources="${worker_resources}\n    nodeSelector: {\"topology.kubernetes.io/zone\": \"${ACTOR_IMAGE_ZONE}\"}"
+    else
+      worker_resources="nodeSelector: {\"topology.kubernetes.io/zone\": \"${ACTOR_IMAGE_ZONE}\"}"
+    fi
   fi
   sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
       -e "s|\${WORKER_COUNT}|${WORKER_COUNT}|g" \
@@ -272,6 +294,36 @@ deploy() {
     exit 1
   fi
   echo "Deploying workloads (worker_count=${WORKER_COUNT}, actor_memory=${ACTOR_MEMORY}, actor_cpu=${ACTOR_CPU}, worker_memory=${WORKER_MEMORY:-unset}, storage_class=${STORAGE_CLASS_NAME:-none}, otlp_endpoint=${OTLP_ENDPOINT})..."
+  local full_worker_count="${WORKER_COUNT}"
+  local orig_actor_image_zone="${ACTOR_IMAGE_ZONE}"
+  local bootstrap_zone=""
+  if ! fake_data_plane && ((WORKER_COUNT > 4)); then
+    if [[ -n "${ACTOR_IMAGE_ZONE}" ]]; then
+      local zone_nodes
+      zone_nodes="$(kubectl get nodes -l "topology.kubernetes.io/zone=${ACTOR_IMAGE_ZONE}" --no-headers 2>/dev/null | wc -l || echo 0)"
+      if ((zone_nodes > 0 && zone_nodes < WORKER_COUNT)); then
+        bootstrap_zone="${ACTOR_IMAGE_ZONE}"
+        orig_actor_image_zone=""
+      fi
+    else
+      local worker_zones
+      worker_zones="$(kubectl get nodes -l worker-node-pool=true -o jsonpath='{range .items[*]}{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}{end}' 2>/dev/null | sort -u | grep . || true)"
+      local num_zones
+      num_zones="$(grep -c . <<<"${worker_zones}" || true)"
+      if ((num_zones > 1)); then
+        if grep -qx "us-east1-c" <<<"${worker_zones}"; then
+          bootstrap_zone="us-east1-c"
+        else
+          bootstrap_zone="$(head -n1 <<<"${worker_zones}")"
+        fi
+      fi
+    fi
+  fi
+  if [[ -n "${bootstrap_zone}" ]]; then
+    echo "Bootstrapping 4 workers in zone ${bootstrap_zone} first for golden snapshot CPUID homogeneity across zones..."
+    WORKER_COUNT=4
+    ACTOR_IMAGE_ZONE="${bootstrap_zone}"
+  fi
   substitute "${POOL_MANIFEST}" | hack/run-tool.sh ko apply -f -
   echo "Waiting for worker pool to be ready (timeout: ${WAIT_TIMEOUT_SECS}s)..."
   if fake_data_plane; then
@@ -299,16 +351,34 @@ deploy() {
   # automation deletes the actors between the tests; it also removes the old
   # golden actor and snapshot server-side.
   for template in "${TEMPLATES[@]}"; do
-    run_kubectl_ate delete actor-template "${template}" -a benchmark-workloads \
-      >/dev/null 2>&1 || true
-    # ko resolve builds the ko:// image references and replaces them with
-    # pushed digests before the manifest reaches kubectl-ate.
-    substitute "$(template_manifest "${template}")" \
-      | hack/run-tool.sh ko resolve -f - \
-      | run_kubectl_ate create actor-template -f -
+    for _tmpl_try in 1 2 3; do
+      run_kubectl_ate delete actor-template "${template}" -a benchmark-workloads \
+        >/dev/null 2>&1 || true
+      # ko resolve builds the ko:// image references and replaces them with
+      # pushed digests before the manifest reaches kubectl-ate.
+      if substitute "$(template_manifest "${template}")" \
+        | hack/run-tool.sh ko resolve -f - \
+        | run_kubectl_ate create actor-template -f -; then
+        break
+      fi
+      if [[ "${_tmpl_try}" -eq 3 ]]; then
+        echo "Failed to create actor-template ${template} after 3 attempts" >&2
+        exit 1
+      fi
+      echo "[WARN] create actor-template ${template} attempt ${_tmpl_try} failed; retrying in 15s..." >&2
+      sleep 15
+    done
   done
 
   wait_templates_ready
+  if [[ -n "${bootstrap_zone}" ]]; then
+    WORKER_COUNT="${full_worker_count}"
+    ACTOR_IMAGE_ZONE="${orig_actor_image_zone}"
+    echo "Golden snapshots ready; scaling WorkerPool to full worker_count=${WORKER_COUNT} across all zones..."
+    substitute "${POOL_MANIFEST}" | hack/run-tool.sh ko apply -f -
+    kubectl rollout status deployment/benchmark-worker \
+      --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
+  fi
 }
 
 delete() {
@@ -373,6 +443,13 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --actor-cpu=*)
       ACTOR_CPU="${1#*=}"
+      ;;
+    --actor-image-zone)
+      shift
+      ACTOR_IMAGE_ZONE="$1"
+      ;;
+    --actor-image-zone=*)
+      ACTOR_IMAGE_ZONE="${1#*=}"
       ;;
     --worker-memory)
       shift

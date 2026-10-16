@@ -86,6 +86,7 @@ func loadEnv(t *testing.T) {
 		"KUBECTL_CONTEXT",
 		"MEMORYSTORE_INSTANCE",
 		"PROJECT_ID",
+		"SCALE_PROFILE",
 		"ATE_API_POSTGRES_CLOUDSQL_INSTANCE",
 	} {
 		// Unset, not blanked. An exported empty variable is a value a channel
@@ -150,6 +151,11 @@ func TestLoadClusterSize(t *testing.T) {
 		{
 			name:     "environment",
 			env:      map[string]string{"ATE_INSTALL_CLUSTER_SIZE": ClusterSizeSize10},
+			wantSize: ClusterSizeSize10,
+		},
+		{
+			name:     "scale profile fallback",
+			env:      map[string]string{"SCALE_PROFILE": ClusterSizeSize10},
 			wantSize: ClusterSizeSize10,
 		},
 		{

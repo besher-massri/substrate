@@ -97,11 +97,44 @@ const (
 	workerCapacityVolume        = "worker-capacity"
 )
 
+// WorkerPassthroughEnv extracts opt-in worker and object-mount tuning
+// environment variables (ATEWORKER_*, ATEOM_*, and
+// ATE_ENABLE_ACTOR_CPU_BURST_FLOOR) from environ in sorted key order so the
+// controller can propagate them to worker pods.
+func WorkerPassthroughEnv(environ []string) []corev1.EnvVar {
+	byName := make(map[string]string)
+	for _, entry := range environ {
+		k, v, ok := strings.Cut(entry, "=")
+		if !ok || v == "" {
+			continue
+		}
+		if strings.HasPrefix(k, "ATEWORKER_") ||
+			strings.HasPrefix(k, "ATEOM_") ||
+			k == "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR" ||
+			k == "ATE_ACTOR_CPU_LIMIT_FLOOR" {
+			byName[k] = v
+		}
+	}
+	if len(byName) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(byName))
+	for k := range byName {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	out := make([]corev1.EnvVar, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, corev1.EnvVar{Name: k, Value: byName[k]})
+	}
+	return out
+}
+
 // buildDeploymentApplyConfig constructs the SSA apply configuration for the
 // Deployment managed by a WorkerPool. Only fields owned by this controller
 // are declared here. otel, when it carries an endpoint, is propagated to the
 // worker container so it pushes telemetry to that collector.
-func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy string) *appsv1ac.DeploymentApplyConfiguration {
+func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy string, passthroughEnv ...corev1.EnvVar) *appsv1ac.DeploymentApplyConfiguration {
 	labels := map[string]string{}
 	annotations := map[string]string{}
 	if wp.Spec.Template != nil {
@@ -181,7 +214,7 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSetti
 				WithPath("/readyz").
 				WithPort(intstr.FromString("readyz")))).
 		WithSecurityContext(workerSecurityContext(wp.Spec.DefaultSandboxClass())).
-		WithEnv(workerContainerEnv(otel)...).
+		WithEnv(workerContainerEnv(otel, passthroughEnv...)...).
 		WithVolumeMounts(
 			corev1ac.VolumeMount().
 				WithName(workerCapacityVolume).
@@ -284,7 +317,7 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSetti
 // workerContainerEnv adds the OTLP endpoint and resource identity only when
 // telemetry is configured. Every ref precedes OTEL_RESOURCE_ATTRIBUTES so its
 // $(...) substitutions resolve.
-func workerContainerEnv(otel workerOTelSettings) []*corev1ac.EnvVarApplyConfiguration {
+func workerContainerEnv(otel workerOTelSettings, passthroughEnv ...corev1.EnvVar) []*corev1ac.EnvVarApplyConfiguration {
 	// The pool pair labels every usage record, telemetry export or not. A
 	// worker pod runs in its WorkerPool's namespace.
 	envs := []*corev1ac.EnvVarApplyConfiguration{
@@ -292,38 +325,52 @@ func workerContainerEnv(otel workerOTelSettings) []*corev1ac.EnvVarApplyConfigur
 		fieldRefEnv("POD_NAMESPACE", "metadata.namespace"),
 		fieldRefEnv("WORKER_POOL_NAME", "metadata.labels['"+workerPoolLabel+"']"),
 	}
-	if otel.Endpoint == "" {
-		return envs
-	}
-	envs = append(envs,
-		fieldRefEnv("POD_NAME", "metadata.name"),
-		fieldRefEnv("NODE_NAME", "spec.nodeName"),
-		corev1ac.EnvVar().WithName("OTEL_EXPORTER_OTLP_ENDPOINT").WithValue(otel.Endpoint),
-		corev1ac.EnvVar().WithName("OTEL_RESOURCE_ATTRIBUTES").WithValue(workerOTelResourceAttributes),
-	)
-	if otel.MetricExportInterval != "" {
-		envs = append(envs, corev1ac.EnvVar().
-			WithName("OTEL_METRIC_EXPORT_INTERVAL").
-			WithValue(otel.MetricExportInterval))
-	}
-	if otel.MetricExportTimeout != "" {
-		envs = append(envs, corev1ac.EnvVar().
-			WithName("OTEL_METRIC_EXPORT_TIMEOUT").
-			WithValue(otel.MetricExportTimeout))
-	}
-	if otel.LogsExporter != "" {
-		envs = append(envs, corev1ac.EnvVar().
-			WithName("OTEL_LOGS_EXPORTER").
-			WithValue(otel.LogsExporter))
-	}
-	if otel.TracesSampler != "" {
-		envs = append(envs, corev1ac.EnvVar().
-			WithName("OTEL_TRACES_SAMPLER").
-			WithValue(otel.TracesSampler))
-		if otel.TracesSamplerArg != "" {
+	if otel.Endpoint != "" {
+		envs = append(envs,
+			fieldRefEnv("POD_NAME", "metadata.name"),
+			fieldRefEnv("NODE_NAME", "spec.nodeName"),
+			corev1ac.EnvVar().WithName("OTEL_EXPORTER_OTLP_ENDPOINT").WithValue(otel.Endpoint),
+			corev1ac.EnvVar().WithName("OTEL_RESOURCE_ATTRIBUTES").WithValue(workerOTelResourceAttributes),
+		)
+		if otel.MetricExportInterval != "" {
 			envs = append(envs, corev1ac.EnvVar().
-				WithName("OTEL_TRACES_SAMPLER_ARG").
-				WithValue(otel.TracesSamplerArg))
+				WithName("OTEL_METRIC_EXPORT_INTERVAL").
+				WithValue(otel.MetricExportInterval))
+		}
+		if otel.MetricExportTimeout != "" {
+			envs = append(envs, corev1ac.EnvVar().
+				WithName("OTEL_METRIC_EXPORT_TIMEOUT").
+				WithValue(otel.MetricExportTimeout))
+		}
+		if otel.LogsExporter != "" {
+			envs = append(envs, corev1ac.EnvVar().
+				WithName("OTEL_LOGS_EXPORTER").
+				WithValue(otel.LogsExporter))
+		}
+		if otel.TracesSampler != "" {
+			envs = append(envs, corev1ac.EnvVar().
+				WithName("OTEL_TRACES_SAMPLER").
+				WithValue(otel.TracesSampler))
+			if otel.TracesSamplerArg != "" {
+				envs = append(envs, corev1ac.EnvVar().
+					WithName("OTEL_TRACES_SAMPLER_ARG").
+					WithValue(otel.TracesSamplerArg))
+			}
+		}
+	}
+	if len(passthroughEnv) > 0 {
+		seen := make(map[string]bool, len(envs))
+		for _, e := range envs {
+			if e.Name != nil {
+				seen[*e.Name] = true
+			}
+		}
+		for _, pe := range passthroughEnv {
+			if pe.Name == "" || seen[pe.Name] {
+				continue
+			}
+			seen[pe.Name] = true
+			envs = append(envs, corev1ac.EnvVar().WithName(pe.Name).WithValue(pe.Value))
 		}
 	}
 	return envs

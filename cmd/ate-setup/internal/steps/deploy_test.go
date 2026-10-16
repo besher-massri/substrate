@@ -16,8 +16,10 @@ package steps
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -227,4 +229,215 @@ func TestComponentManifestsMatchSystemBundle(t *testing.T) {
 			}
 		}
 	}
+}
+
+func containerEnvMap(t *testing.T, obj *unstructured.Unstructured, cname string) map[string]string {
+	t.Helper()
+	for _, field := range []string{"containers", "initContainers"} {
+		containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		for _, raw := range containers {
+			c, ok := raw.(map[string]any)
+			if !ok || c["name"] != cname {
+				continue
+			}
+			env, _, _ := unstructured.NestedSlice(c, "env")
+			out := make(map[string]string, len(env))
+			for _, item := range env {
+				ev, ok := item.(map[string]any)
+				if ok {
+					name, _ := ev["name"].(string)
+					val, _ := ev["value"].(string)
+					out[name] = val
+				}
+			}
+			return out
+		}
+	}
+	t.Fatalf("%s has no container %q", kube.Describe(obj), cname)
+	return nil
+}
+
+func TestApplyWorkloadRuntimeAndScaleOverrides(t *testing.T) {
+	e := &Env{Cfg: &config.Config{Root: repoRoot(t), Router: config.RouterEnvoy}}
+	manifest, err := e.render(e.Cfg.Path(SystemOverlay(e.Cfg)))
+	if err != nil {
+		t.Fatalf("render system overlay: %v", err)
+	}
+	objs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		t.Fatalf("decode system overlay: %v", err)
+	}
+
+	environ := []string{
+		"ATE_STORAGE_BACKEND=gcs",
+		"ATE_GCS_GRPC_CONN_POOL_SIZE=16",
+		"ATE_API_PLACEMENT_BATCH_SIZE=64",
+		"ATE_HEARTBEAT_TIMEOUT=45s",
+		"ATELET_CHECKPOINT_CONCURRENCY=8",
+		"ATE_SNAPSHOT_ASYNC_UPLOAD=true",
+		"ATEWORKER_GVISOR_OVERLAY=self:tmpfs",
+		"ATEOM_MAX_CONCURRENT_REQUESTS=64",
+		"ATE_ENABLE_ACTOR_CPU_BURST_FLOOR=true",
+	}
+	applyWorkloadRuntimeAndScaleOverrides(objs, true, false, environ)
+
+	apiDep := findObject(objs, "Deployment", "ate-api-server")
+	if replicas, _, _ := unstructured.NestedInt64(apiDep.Object, "spec", "replicas"); replicas != 6 {
+		t.Errorf("size10 ate-api-server replicas = %d, want 6", replicas)
+	}
+	apiEnv := containerEnvMap(t, apiDep, "ate-api-server")
+	if apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] != "192" {
+		t.Errorf("ATE_API_POSTGRES_POOL_MAX_CONNS = %q, want 192", apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"])
+	}
+	if apiEnv["ATE_API_PLACEMENT_BATCH_SIZE"] != "64" || apiEnv["ATE_HEARTBEAT_TIMEOUT"] != "45s" {
+		t.Errorf("ate-api-server env missing forwarded vars: %v", apiEnv)
+	}
+	if _, bad := apiEnv["ATE_STORAGE_BACKEND"]; bad {
+		t.Errorf("ate-api-server must never receive ATE_STORAGE_BACKEND")
+	}
+	apiPluginEnv := containerEnvMap(t, apiDep, "objectstore-plugin")
+	if apiPluginEnv["ATE_STORAGE_BACKEND"] != "gcs" || apiPluginEnv["ATE_GCS_GRPC_CONN_POOL_SIZE"] != "16" {
+		t.Errorf("ate-api-server objectstore-plugin env = %v, want ATE_STORAGE_BACKEND=gcs and ATE_GCS_GRPC_CONN_POOL_SIZE=16", apiPluginEnv)
+	}
+
+	ctrlDep := findObject(objs, "Deployment", "ate-controller")
+	ctrlEnv := containerEnvMap(t, ctrlDep, "ate-controller")
+	for k, want := range map[string]string{
+		"ATEWORKER_GVISOR_OVERLAY":         "self:tmpfs",
+		"ATEOM_MAX_CONCURRENT_REQUESTS":    "64",
+		"ATE_ENABLE_ACTOR_CPU_BURST_FLOOR": "true",
+	} {
+		if ctrlEnv[k] != want {
+			t.Errorf("ate-controller env[%s] = %q, want %q", k, ctrlEnv[k], want)
+		}
+	}
+
+	routerDep := findObject(objs, "Deployment", "atenet-router")
+	if replicas, _, _ := unstructured.NestedInt64(routerDep.Object, "spec", "replicas"); replicas != 8 {
+		t.Errorf("size10 atenet-router replicas = %d, want 8", replicas)
+	}
+
+	ateletDS := findObject(objs, "DaemonSet", "atelet")
+	if grace, _, _ := unstructured.NestedInt64(ateletDS.Object, "spec", "template", "spec", "terminationGracePeriodSeconds"); grace != 30 {
+		t.Errorf("size10 atelet terminationGracePeriodSeconds = %d, want 30", grace)
+	}
+	ateletEnv := containerEnvMap(t, ateletDS, "atelet")
+	if ateletEnv["ATELET_CHECKPOINT_CONCURRENCY"] != "8" || ateletEnv["ATE_SNAPSHOT_ASYNC_UPLOAD"] != "true" {
+		t.Errorf("atelet env missing forwarded vars: %v", ateletEnv)
+	}
+	if _, bad := ateletEnv["ATE_STORAGE_BACKEND"]; bad {
+		t.Errorf("atelet container must never receive ATE_STORAGE_BACKEND")
+	}
+	ateletPluginEnv := containerEnvMap(t, ateletDS, "objectstore-plugin")
+	if ateletPluginEnv["ATE_STORAGE_BACKEND"] != "gcs" {
+		t.Errorf("atelet objectstore-plugin ATE_STORAGE_BACKEND = %q, want gcs", ateletPluginEnv["ATE_STORAGE_BACKEND"])
+	}
+}
+
+func BenchmarkApplyWorkloadRuntimeAndScaleOverrides(b *testing.B) {
+	e := &Env{Cfg: &config.Config{Root: repoRoot(&testing.T{}), Router: config.RouterEnvoy}}
+	manifest, err := e.render(e.Cfg.Path(SystemOverlay(e.Cfg)))
+	if err != nil {
+		b.Fatalf("render system overlay: %v", err)
+	}
+	baseObjs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		b.Fatalf("decode system overlay: %v", err)
+	}
+	environ := []string{
+		"ATE_STORAGE_BACKEND=gcs",
+		"ATE_GCS_GRPC_CONN_POOL_SIZE=16",
+		"ATE_API_PLACEMENT_BATCH_SIZE=64",
+		"ATE_HEARTBEAT_TIMEOUT=45s",
+		"ATELET_CHECKPOINT_CONCURRENCY=8",
+		"ATE_SNAPSHOT_ASYNC_UPLOAD=true",
+		"ATEWORKER_GVISOR_OVERLAY=self:tmpfs",
+		"ATEOM_MAX_CONCURRENT_REQUESTS=64",
+		"ATE_ENABLE_ACTOR_CPU_BURST_FLOOR=true",
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		objs := make([]*unstructured.Unstructured, len(baseObjs))
+		for i, o := range baseObjs {
+			objs[i] = o.DeepCopy()
+		}
+		applyWorkloadRuntimeAndScaleOverrides(objs, true, false, environ)
+	}
+}
+
+func BenchmarkCAdvisorSubCgroupRelabelDrop_1000Actors(b *testing.B) {
+	dropRe := regexp.MustCompile(`^.*/(sb-[^/]+|cri-containerd-[^/]+\.scope/.+|ate-actors/.+)$`)
+	metrics := []string{
+		"container_memory_working_set_bytes",
+		"container_memory_rss",
+		"container_cpu_usage_seconds_total",
+		"container_cpu_cfs_periods_total",
+		"container_cpu_cfs_throttled_periods_total",
+		"container_cpu_cfs_throttled_seconds_total",
+		"container_fs_reads_bytes_total",
+		"container_fs_writes_bytes_total",
+		"container_oom_events_total",
+	}
+	type sample struct {
+		name    string
+		id      string
+		payload string
+	}
+	// 1 pod rollup + 1,000 actor sandbox sub-cgroups across 9 metrics = 9,009 series per scrape
+	series := make([]sample, 0, 9009)
+	for _, m := range metrics {
+		series = append(series, sample{
+			name:    m,
+			id:      "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-worker.scope",
+			payload: m + `{namespace="benchmark-workloads",pod="benchmark-worker-0",container="worker"} 1048576`,
+		})
+		for a := range 1000 {
+			id := fmt.Sprintf("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-worker.scope/ate-actors/actor-%d", a)
+			series = append(series, sample{
+				name:    m,
+				id:      id,
+				payload: fmt.Sprintf(`%s{id=%q} 4096`, m, id),
+			})
+		}
+	}
+
+	b.Run("Unfiltered_IngestAllSubCgroups", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			tsdb := make(map[string]map[string]string, 64)
+			for _, s := range series {
+				tsdb[s.payload] = map[string]string{
+					"__name__": s.name,
+					"id":       s.id,
+					"series":   string([]byte(s.payload)),
+				}
+			}
+			if len(tsdb) != 9009 {
+				b.Fatalf("got %d series", len(tsdb))
+			}
+		}
+	})
+
+	b.Run("DropActorSubCgroups_KeepPodRollup", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			tsdb := make(map[string]map[string]string, 64)
+			for _, s := range series {
+				if dropRe.MatchString(s.id) {
+					continue
+				}
+				tsdb[s.payload] = map[string]string{
+					"__name__": s.name,
+					"id":       s.id,
+					"series":   string([]byte(s.payload)),
+				}
+			}
+			// 9 pod rollups kept out of 9,009 series (99.9% dropped)
+			if len(tsdb) != 9 {
+				b.Fatalf("got %d series, want 9", len(tsdb))
+			}
+		}
+	})
 }
