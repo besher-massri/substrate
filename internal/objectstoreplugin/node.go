@@ -23,16 +23,22 @@ package objectstoreplugin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/objectstorage"
 	objectstorev1 "go.ate.dev/substrate/pkg/proto/objectstorepb/v1"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -50,6 +56,9 @@ type NodePlugin struct {
 	uploader  *objectstorage.Uploader
 	// root confines every local path a caller names.
 	root string
+
+	cacheFlight singleflight.Group
+	actorLocks  sync.Map
 }
 
 // NewNodePlugin returns a NodePlugin that reads and writes local files only
@@ -78,10 +87,23 @@ func (p *NodePlugin) FetchSnapshot(ctx context.Context, req *objectstorev1.Fetch
 	}
 	defer root.Close()
 
+	absDstDir := filepath.Join(p.root, dstDir)
+	cacheTag := isCacheableTagSnapshot(req.GetSnapshotUri())
+	actorPrefix, snapKey, cacheActor := parseActorSnapshotCachePath(req.GetSnapshotUri())
+
 	g, gCtx := errgroup.WithContext(ctx)
 	for _, fileName := range req.GetFiles() {
 		fileName := fileName
 		g.Go(func() error {
+			if cacheTag {
+				if err := p.fetchCachedTagFile(gCtx, req.GetSnapshotUri(), uri, absDstDir, fileName); err == nil {
+					return nil
+				}
+			} else if cacheActor {
+				if err := p.fetchCachedActorFile(gCtx, actorPrefix, snapKey, uri, absDstDir, fileName); err == nil {
+					return nil
+				}
+			}
 			if fileName == manifestFile {
 				return p.fetchManifest(gCtx, uri, root)
 			}
@@ -109,7 +131,416 @@ func (p *NodePlugin) FetchSnapshot(ctx context.Context, req *objectstorev1.Fetch
 	if err := g.Wait(); err != nil {
 		return nil, toStatus(err)
 	}
+	if cacheTag {
+		p.linkGoldenBaseFromFetchedTag(req.GetSnapshotUri(), uri, absDstDir)
+	}
+	if slices.Contains(req.GetFiles(), "golden-delta") || slices.Contains(req.GetFiles(), "memory-ranges.delta") {
+		p.ensureGoldenBaseFromDelta(ctx, req.GetSnapshotUri(), uri, absDstDir)
+	}
 	return &objectstorev1.FetchSnapshotResponse{}, nil
+}
+
+// isCacheableTagSnapshot returns true if the snapshot URI refers to an
+// immutable golden/tag snapshot (which is shared across many actors).
+func isCacheableTagSnapshot(rawURI string) bool {
+	return strings.Contains(rawURI, "/tags/") || strings.Contains(rawURI, "/atespaces/ate-golden-actors/")
+}
+
+// parseActorSnapshotCachePath extracts the actor prefix and snapshot key for
+// per-actor snapshot URIs when ATE_CACHE_ACTOR_SNAPSHOTS is enabled.
+func parseActorSnapshotCachePath(rawURI string) (actorPrefix, snapKey string, ok bool) {
+	if v := os.Getenv("ATE_CACHE_ACTOR_SNAPSHOTS"); v != "true" && v != "1" {
+		return "", "", false
+	}
+	if isCacheableTagSnapshot(rawURI) {
+		return "", "", false
+	}
+	idx := strings.Index(rawURI, "/snapshots/")
+	if idx <= 0 {
+		return "", "", false
+	}
+	actorPrefix = rawURI[:idx]
+	rest := strings.Trim(rawURI[idx+len("/snapshots/"):], "/")
+	if rest == "" || strings.Contains(rest, "/") {
+		return "", "", false
+	}
+	return actorPrefix, rest, true
+}
+
+func (p *NodePlugin) actorLock(actorHash string) *sync.Mutex {
+	v, _ := p.actorLocks.LoadOrStore(actorHash, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func (p *NodePlugin) actorSnapshotDir(actorPrefix, snapKey string) (actorDir, snapDir string) {
+	sum := sha256.Sum256([]byte(actorPrefix))
+	actorHash := hex.EncodeToString(sum[:16])
+	actorDir = filepath.Join(p.root, "actor-snapshot-cache", actorHash)
+	snapDir = filepath.Join(actorDir, snapKey)
+	return actorDir, snapDir
+}
+
+// pruneOtherActorSnapshots removes all cached snapshot subdirectories under
+// actorDir except keepSnapKey so at most 1 snapshot per actor is retained.
+func pruneOtherActorSnapshots(actorDir, keepSnapKey string) {
+	entries, err := os.ReadDir(actorDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.Name() == keepSnapKey {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(actorDir, e.Name()))
+	}
+}
+
+// cacheActorSnapshotOnUpload populates the node-local actor snapshot cache via
+// hardlinks (or copies if across filesystems) during UploadSnapshot and evicts
+// any previous snapshot generation for the same actor.
+func (p *NodePlugin) cacheActorSnapshotOnUpload(actorPrefix, snapKey, absSrcDir string, files []string) {
+	actorDir, snapDir := p.actorSnapshotDir(actorPrefix, snapKey)
+	mu := p.actorLock(filepath.Base(actorDir))
+	mu.Lock()
+	defer mu.Unlock()
+
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		return
+	}
+	for _, fileName := range files {
+		srcPath := filepath.Join(absSrcDir, fileName)
+		dstPath := filepath.Join(snapDir, fileName)
+		if dir := filepath.Dir(dstPath); dir != snapDir {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				continue
+			}
+		}
+		_ = os.Remove(dstPath)
+		if err := os.Link(srcPath, dstPath); err != nil {
+			_ = copyFileContents(srcPath, dstPath)
+		}
+	}
+	pruneOtherActorSnapshots(actorDir, snapKey)
+}
+
+// fetchCachedActorFile serves an actor snapshot file from the node-local
+// actor-snapshot-cache if present, or downloads it from GCS into the cache
+// (evicting any older snapshot for the same actor) and links/copies it into
+// absDstDir.
+func (p *NodePlugin) fetchCachedActorFile(ctx context.Context, actorPrefix, snapKey string, uri resources.SnapshotURI, absDstDir, fileName string) error {
+	actorDir, snapDir := p.actorSnapshotDir(actorPrefix, snapKey)
+	cachePath := filepath.Join(snapDir, fileName)
+	flightKey := cachePath
+
+	_, err, _ := p.cacheFlight.Do(flightKey, func() (any, error) {
+		mu := p.actorLock(filepath.Base(actorDir))
+		mu.Lock()
+		defer mu.Unlock()
+
+		if info, statErr := os.Stat(cachePath); statErr == nil && info.Mode().IsRegular() {
+			pruneOtherActorSnapshots(actorDir, snapKey)
+			return nil, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
+			return nil, err
+		}
+		tmpFile, err := os.CreateTemp(filepath.Dir(cachePath), ".tmp-*")
+		if err != nil {
+			return nil, err
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		if fileName == manifestFile {
+			if err := tmpFile.Close(); err != nil {
+				return nil, err
+			}
+			manifestURI, err := uri.ObjectURI(manifestFile)
+			if err != nil {
+				return nil, err
+			}
+			manifest, err := objectstorage.FetchFromGCS(ctx, p.gcsClient, manifestURI)
+			if err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(tmpPath, manifest, 0o600); err != nil {
+				return nil, err
+			}
+		} else {
+			objectURI, err := uri.ObjectURI(fileName + ".zstd")
+			if err != nil {
+				_ = tmpFile.Close()
+				return nil, err
+			}
+			fetchErr := objectstorage.FetchFileFromGCSWithZstd(ctx, p.gcsClient, objectURI, tmpFile)
+			closeErr := tmpFile.Close()
+			if err := errors.Join(fetchErr, closeErr); err != nil {
+				return nil, err
+			}
+		}
+		if err := os.Chmod(tmpPath, 0o600); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(tmpPath, cachePath); err != nil {
+			return nil, err
+		}
+		pruneOtherActorSnapshots(actorDir, snapKey)
+		return nil, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	dstPath := filepath.Join(absDstDir, fileName)
+	if dir := filepath.Dir(dstPath); dir != absDstDir {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	if fileName != manifestFile && fileName != "config.json" {
+		_ = os.Remove(dstPath)
+		if err := os.Link(cachePath, dstPath); err == nil {
+			return nil
+		}
+	}
+	return copyFileContents(cachePath, dstPath)
+}
+
+func (p *NodePlugin) linkGoldenBaseCache(baseID, srcMemPath, sourceObjectURI string) {
+	if baseID == "" || strings.Contains(baseID, "/") || strings.Contains(baseID, "..") {
+		return
+	}
+	baseDir := filepath.Join(p.root, "golden-base-cache", baseID)
+	baseMem := filepath.Join(baseDir, "memory-ranges")
+	if info, err := os.Stat(baseMem); err == nil && info.Size() > 0 {
+		return
+	}
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return
+	}
+	tmpFile, err := os.CreateTemp(baseDir, ".tmp-link-*")
+	if err != nil {
+		return
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	_ = os.Remove(tmpPath)
+	if err := os.Link(srcMemPath, tmpPath); err != nil {
+		return
+	}
+	if err := os.Rename(tmpPath, baseMem); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if sourceObjectURI != "" {
+		_ = os.WriteFile(filepath.Join(baseDir, "source-uri"), []byte(sourceObjectURI), 0o644)
+	}
+}
+
+func (p *NodePlugin) linkGoldenBaseFromFetchedTag(rawURI string, uri resources.SnapshotURI, absDstDir string) {
+	sum := sha256.Sum256([]byte(rawURI))
+	cacheDir := filepath.Join(p.root, "golden-snapshot-cache", hex.EncodeToString(sum[:16]))
+	idBytes, err := os.ReadFile(filepath.Join(cacheDir, "base-id"))
+	if err != nil {
+		idBytes, err = os.ReadFile(filepath.Join(absDstDir, "base-id"))
+	}
+	if err != nil {
+		return
+	}
+	baseID := strings.TrimSpace(string(idBytes))
+	memPath := filepath.Join(cacheDir, "memory-ranges")
+	if _, err := os.Stat(memPath); err != nil {
+		memPath = filepath.Join(absDstDir, "memory-ranges")
+	}
+	if _, err := os.Stat(memPath); err == nil {
+		objURI, _ := uri.ObjectURI("memory-ranges.zstd")
+		p.linkGoldenBaseCache(baseID, memPath, objURI)
+	}
+}
+
+// ensureGoldenBaseFromDelta populates /var/lib/ate/golden-base-cache/<baseID>/memory-ranges
+// when a resume downloads a differential checkpoint (golden-delta + base-id, or
+// memory-ranges.delta + base-snapshot.id) on a node that did not yet have the
+// golden base memory-ranges cached locally.
+func (p *NodePlugin) ensureGoldenBaseFromDelta(ctx context.Context, rawURI string, uri resources.SnapshotURI, absDstDir string) {
+	idBytes, err := os.ReadFile(filepath.Join(absDstDir, "base-id"))
+	if err != nil {
+		idBytes, err = os.ReadFile(filepath.Join(absDstDir, "base-snapshot.id"))
+	}
+	if err != nil {
+		return
+	}
+	baseID := strings.TrimSpace(string(idBytes))
+	if baseID == "" || strings.Contains(baseID, "/") || strings.Contains(baseID, "..") {
+		return
+	}
+	goldenBaseDir := filepath.Join(p.root, "golden-base-cache", baseID)
+	goldenMemPath := filepath.Join(goldenBaseDir, "memory-ranges")
+	if info, err := os.Stat(goldenMemPath); err == nil && info.Size() > 0 {
+		return
+	}
+	var explicitObjURI string
+	if deltaBytes, derr := os.ReadFile(filepath.Join(absDstDir, "golden-delta")); derr == nil {
+		s := strings.TrimSpace(string(deltaBytes))
+		if strings.HasPrefix(s, "gs://") || strings.HasPrefix(s, "s3://") {
+			explicitObjURI = s
+		}
+	}
+
+	_, _, _ = p.cacheFlight.Do("golden-base:"+baseID, func() (any, error) {
+		if info, err := os.Stat(goldenMemPath); err == nil && info.Size() > 0 {
+			return nil, nil
+		}
+		memObjURI := explicitObjURI
+		if memObjURI == "" {
+			atespaceIdx := strings.Index(rawURI, "/atespaces/")
+			if atespaceIdx < 0 {
+				return nil, fmt.Errorf("snapshot URI %s missing /atespaces/", rawURI)
+			}
+			rest := rawURI[atespaceIdx+len("/atespaces/"):]
+			slashIdx := strings.Index(rest, "/")
+			if slashIdx <= 0 {
+				return nil, fmt.Errorf("snapshot URI %s missing atespace name", rawURI)
+			}
+			atespace := rest[:slashIdx]
+			bucketAndRoot := rawURI[:atespaceIdx]
+			tagsPrefix := strings.TrimPrefix(bucketAndRoot, "gs://")
+			slashBucket := strings.Index(tagsPrefix, "/")
+			if slashBucket <= 0 {
+				return nil, fmt.Errorf("snapshot URI %s missing bucket", rawURI)
+			}
+			bucket := tagsPrefix[:slashBucket]
+			rootPrefix := tagsPrefix[slashBucket+1:]
+			tagSearchPrefix := fmt.Sprintf("%s/atespaces/%s/tags/", rootPrefix, atespace)
+
+			lister, ok := p.gcsClient.(interface {
+				List(ctx context.Context, bucket, prefix string) ([]string, error)
+			})
+			if !ok {
+				return nil, fmt.Errorf("object storage client does not support List")
+			}
+			objs, err := lister.List(ctx, bucket, tagSearchPrefix)
+			if err != nil {
+				return nil, err
+			}
+			for _, obj := range objs {
+				if strings.HasSuffix(obj, "/memory-ranges.zstd") {
+					memObjURI = fmt.Sprintf("gs://%s/%s", bucket, obj)
+					break
+				}
+			}
+		}
+		if memObjURI == "" {
+			return nil, fmt.Errorf("no golden tag memory-ranges.zstd found for base %s", baseID)
+		}
+		if err := os.MkdirAll(goldenBaseDir, 0o755); err != nil {
+			return nil, err
+		}
+		tmpFile, err := os.CreateTemp(goldenBaseDir, ".tmp-golden-*")
+		if err != nil {
+			return nil, err
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		fetchErr := objectstorage.FetchFileFromGCSWithZstd(ctx, p.gcsClient, memObjURI, tmpFile)
+		closeErr := tmpFile.Close()
+		if err := errors.Join(fetchErr, closeErr); err != nil {
+			return nil, err
+		}
+		_ = os.Chmod(tmpPath, 0o644)
+		_ = os.WriteFile(filepath.Join(goldenBaseDir, "source-uri"), []byte(memObjURI), 0o644)
+		return nil, os.Rename(tmpPath, goldenMemPath)
+	})
+}
+
+func (p *NodePlugin) fetchCachedTagFile(ctx context.Context, rawURI string, uri resources.SnapshotURI, absDstDir, fileName string) error {
+	sum := sha256.Sum256([]byte(rawURI))
+	cacheDir := filepath.Join(p.root, "golden-snapshot-cache", hex.EncodeToString(sum[:16]))
+	cachePath := filepath.Join(cacheDir, fileName)
+
+	_, err, _ := p.cacheFlight.Do(cachePath, func() (any, error) {
+		if info, statErr := os.Stat(cachePath); statErr == nil && info.Mode().IsRegular() {
+			return nil, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
+			return nil, err
+		}
+		tmpFile, err := os.CreateTemp(filepath.Dir(cachePath), ".tmp-*")
+		if err != nil {
+			return nil, err
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		if fileName == manifestFile {
+			if err := tmpFile.Close(); err != nil {
+				return nil, err
+			}
+			manifestURI, err := uri.ObjectURI(manifestFile)
+			if err != nil {
+				return nil, err
+			}
+			manifest, err := objectstorage.FetchFromGCS(ctx, p.gcsClient, manifestURI)
+			if err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(tmpPath, manifest, 0o600); err != nil {
+				return nil, err
+			}
+		} else {
+			objectURI, err := uri.ObjectURI(fileName + ".zstd")
+			if err != nil {
+				_ = tmpFile.Close()
+				return nil, err
+			}
+			fetchErr := objectstorage.FetchFileFromGCSWithZstd(ctx, p.gcsClient, objectURI, tmpFile)
+			closeErr := tmpFile.Close()
+			if err := errors.Join(fetchErr, closeErr); err != nil {
+				return nil, err
+			}
+		}
+		if err := os.Chmod(tmpPath, 0o600); err != nil {
+			return nil, err
+		}
+		return nil, os.Rename(tmpPath, cachePath)
+	})
+	if err != nil {
+		return err
+	}
+
+	dstPath := filepath.Join(absDstDir, fileName)
+	if dir := filepath.Dir(dstPath); dir != absDstDir {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	// Hardlink memory-ranges from the golden-snapshot-cache so sparse holes and
+	// page cache are preserved across cold restores without copying 384 MiB.
+	if fileName == "memory-ranges" {
+		_ = os.Remove(dstPath)
+		if err := os.Link(cachePath, dstPath); err == nil {
+			return nil
+		}
+	}
+	// Copy small metadata files (e.g. config.json) into the per-actor restore
+	// directory so in-place socket path rewrites do not mutate the shared cache.
+	return copyFileContents(cachePath, dstPath)
+}
+
+func copyFileContents(srcPath, dstPath string) error {
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	return errors.Join(copyErr, closeErr)
 }
 
 // UploadSnapshot uploads the requested files from local_path into the
@@ -165,6 +596,19 @@ func (p *NodePlugin) UploadSnapshot(ctx context.Context, req *objectstorev1.Uplo
 		if err := upload(ctx, manifestFile); err != nil {
 			return nil, toStatus(err)
 		}
+	}
+	if idBytes, berr := root.ReadFile("base-id"); berr == nil {
+		baseID := strings.TrimSpace(string(idBytes))
+		if _, derr := root.Stat("golden-delta"); errors.Is(derr, os.ErrNotExist) {
+			memPath := filepath.Join(p.root, srcDir, "memory-ranges")
+			if _, merr := os.Stat(memPath); merr == nil {
+				objURI, _ := uri.ObjectURI("memory-ranges.zstd")
+				p.linkGoldenBaseCache(baseID, memPath, objURI)
+			}
+		}
+	}
+	if actorPrefix, snapKey, ok := parseActorSnapshotCachePath(req.GetSnapshotUri()); ok {
+		p.cacheActorSnapshotOnUpload(actorPrefix, snapKey, filepath.Join(p.root, srcDir), req.GetFiles())
 	}
 	return &objectstorev1.UploadSnapshotResponse{}, nil
 }

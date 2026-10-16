@@ -27,6 +27,13 @@ const BasePath = "/var/lib/ate"
 // ActorsDir is the parent of the per-actor directories atelet prepares.
 var ActorsDir = filepath.Join(BasePath, "actors")
 
+// SnapshotsDir is the parent of the per-actor snapshot directories
+// (checkpoint-state, restore-state, local-checkpoint) atelet and workers use.
+// Keeping it separate from ActorsDir lets operators mount control-plane
+// snapshot storage on a dedicated block device so heavy guest disk writes
+// under ActorsDir cannot starve checkpoint or restore I/O.
+var SnapshotsDir = filepath.Join(BasePath, "snapshots")
+
 // ActorSandboxAssetsDir is where atelet stages an actor's sandbox runtime
 // assets, hard-linked from its asset cache, and the only location a worker
 // runs a sandbox binary from. Both sides derive it from the actor UID, so a

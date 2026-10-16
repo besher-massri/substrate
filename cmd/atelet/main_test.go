@@ -37,6 +37,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
+	"go.ate.dev/substrate/cmd/atelet/internal/snapshottracker"
 	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/ateattr"
 	"go.ate.dev/substrate/internal/atelet"
@@ -965,6 +966,42 @@ func TestRemoveActorDirsReclaimsTheRoot(t *testing.T) {
 	} else if !os.IsNotExist(err) {
 		t.Errorf("reading actor dir %s: %v", actorDir, err)
 	}
+
+	snapshotDir := ateletpath.ActorSnapshotPath(actorUID)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		left := make([]string, 0, len(entries))
+		for _, e := range entries {
+			left = append(left, e.Name())
+		}
+		t.Errorf("actor snapshot dir %s survived removeActorDirs with %d entries: %v", snapshotDir, len(left), left)
+	} else if !os.IsNotExist(err) {
+		t.Errorf("reading actor snapshot dir %s: %v", snapshotDir, err)
+	}
+}
+
+// TestActorSnapshotDirsIsolatedFromActorDir verifies that resetActorDirs
+// materializes control-plane snapshot directories (checkpoint-state,
+// restore-state) under nodepath.SnapshotsDir and guest-plane actor directories
+// (bundles, durable-dir, system-info, volumes) under nodepath.ActorsDir.
+func TestActorSnapshotDirsIsolatedFromActorDir(t *testing.T) {
+	useTempNodeDirs(t)
+	const actorUID = "actor-uid-isolation"
+
+	if err := resetActorDirs(actorUID); err != nil {
+		t.Fatalf("resetActorDirs(%q) failed: %v", actorUID, err)
+	}
+	for name, dir := range map[string]string{
+		"CheckpointStateDir":        ateletpath.CheckpointStateDir(actorUID),
+		"RestoreStateDir":           ateletpath.RestoreStateDir(actorUID),
+		"OCIBundleDir":              ateletpath.OCIBundleDir(actorUID),
+		"DurableDirVolumeMountsDir": ateletpath.DurableDirVolumeMountsDir(actorUID),
+		"SystemInfoVolumeRootsDir":  ateletpath.SystemInfoVolumeRootsDir(actorUID),
+		"ExternalVolumeMountsDir":   ateletpath.ExternalVolumeMountsDir(actorUID),
+	} {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Errorf("resetActorDirs did not materialize directory %s (%q): err=%v", name, dir, err)
+		}
+	}
 }
 
 // TestRemoveActorDirsKeepsPopulatedVolume checks that removing the root does
@@ -1594,5 +1631,64 @@ func TestServingCheck(t *testing.T) {
 	close(served)
 	if err := check(context.Background()); err != nil {
 		t.Errorf("servingCheck after the port opened = %v, want nil", err)
+	}
+}
+
+func TestResolveSnapshotDetachDelay(t *testing.T) {
+	tests := []struct {
+		name        string
+		flagVal     time.Duration
+		flagChanged bool
+		envVal      string
+		want        time.Duration
+		wantErr     bool
+	}{
+		{
+			name:    "default 30m when neither flag nor env is set",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			want:    30 * time.Minute,
+		},
+		{
+			name:    "env var overrides default when flag is unset",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			envVal:  "45m",
+			want:    45 * time.Minute,
+		},
+		{
+			name:        "explicit flag overrides env var",
+			flagVal:     15 * time.Minute,
+			flagChanged: true,
+			envVal:      "45m",
+			want:        15 * time.Minute,
+		},
+		{
+			name:    "invalid env var duration fails",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			envVal:  "not-a-duration",
+			wantErr: true,
+		},
+		{
+			name:    "non-positive env var duration fails",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			envVal:  "0s",
+			wantErr: true,
+		},
+		{
+			name:        "non-positive flag duration fails",
+			flagVal:     -time.Minute,
+			flagChanged: true,
+			wantErr:     true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveSnapshotDetachDelay(tc.flagVal, tc.flagChanged, tc.envVal)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("resolveSnapshotDetachDelay() err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Errorf("resolveSnapshotDetachDelay() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

@@ -30,11 +30,6 @@ var (
 	// and in every worker pod (which mounts them as overlay lowerdirs).
 	ImageCacheDir = filepath.Join(nodepath.BasePath, "image-cache")
 
-	// SnapshotScratchDir holds short-lived directories for snapshot manifests
-	// moved through the object-store plugin. It lives under BasePath, which the
-	// node plugin shares with atelet.
-	SnapshotScratchDir = filepath.Join(nodepath.BasePath, "snapshot-scratch")
-
 	// SandboxAssetCacheDir is the node-local sandbox asset cache (see
 	// cmd/atelet/internal/filecache): runsc releases, micro-VM kernels, VMMs
 	// and guest images, content-addressed. It lives under BasePath, on the
@@ -57,9 +52,28 @@ var (
 	SandboxRuntimeIndexFile = filepath.Join(nodepath.BasePath, "sandbox-runtime-index.json")
 )
 
+// SnapshotScratchDir holds short-lived directories for snapshot manifests
+// moved through the object-store plugin. It lives under nodepath.SnapshotsDir
+// so manifest staging I/O stays on the snapshot filesystem when
+// /var/lib/ate/snapshots is mounted on a dedicated block device.
+func SnapshotScratchDir() string {
+	return filepath.Join(nodepath.SnapshotsDir, "scratch")
+}
+
 func ActorPath(actorUID string) string {
 	return filepath.Join(
 		nodepath.ActorsDir,
+		actorUID,
+	)
+}
+
+// ActorSnapshotPath is the per-actor directory under nodepath.SnapshotsDir
+// holding control-plane checkpoint/restore and local pause snapshot state,
+// separated from ActorPath so snapshot I/O can be isolated onto its own
+// filesystem/device away from guest writable directories.
+func ActorSnapshotPath(actorUID string) string {
+	return filepath.Join(
+		nodepath.SnapshotsDir,
 		actorUID,
 	)
 }
@@ -123,14 +137,14 @@ func OCIBundlePath(actorUID, containerName string) string {
 
 func CheckpointStateDir(actorUID string) string {
 	return filepath.Join(
-		ActorPath(actorUID),
+		ActorSnapshotPath(actorUID),
 		"checkpoint-state",
 	)
 }
 
 func LocalCheckpointsDir(actorUID string) string {
 	return filepath.Join(
-		ActorPath(actorUID),
+		ActorSnapshotPath(actorUID),
 		"local-checkpoint",
 	)
 }
@@ -202,7 +216,7 @@ func SystemInfoVolumeRoot(actorUID, volumeName string) string {
 // yet been loaded.
 func RestoreStateDir(actorUID string) string {
 	return filepath.Join(
-		ActorPath(actorUID),
+		ActorSnapshotPath(actorUID),
 		"restore-state",
 	)
 }

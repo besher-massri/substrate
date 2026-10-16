@@ -80,9 +80,13 @@ var _ volume.VolumePluginWorkerPlane = (*fakeWorkerPlugin)(nil)
 // independently of the volume mount code.
 func withTempActorsDir(t *testing.T) {
 	t.Helper()
-	orig := nodepath.ActorsDir
-	nodepath.ActorsDir = filepath.Join(t.TempDir(), "actors")
-	t.Cleanup(func() { nodepath.ActorsDir = orig })
+	root := t.TempDir()
+	origActors, origSnapshots := nodepath.ActorsDir, nodepath.SnapshotsDir
+	nodepath.ActorsDir = filepath.Join(root, "actors")
+	nodepath.SnapshotsDir = filepath.Join(root, "snapshots")
+	t.Cleanup(func() {
+		nodepath.ActorsDir, nodepath.SnapshotsDir = origActors, origSnapshots
+	})
 }
 
 func TestUnmountExternalVolumes(t *testing.T) {

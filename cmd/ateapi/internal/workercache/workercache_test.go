@@ -102,6 +102,49 @@ func TestCache_CreatedEvent(t *testing.T) {
 	}
 }
 
+// Entries carry what scheduling reads of a Worker, derived when the cache
+// ingests it, so an update that changes the allocation changes the Entry.
+func TestCache_EntriesFollowUpdates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := makeWorker("ns", "w", 1)
+	w.Status.Capacity = &ateapipb.WorkerResources{Actors: 4, Resources: limits("cpu", "4")}
+	fs := newFakeStore(w)
+	c := workercache.New(fs, time.Hour)
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	entries, err := c.Entries()
+	if err != nil {
+		t.Fatalf("Entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Worker != w {
+		t.Fatalf("Entries() = %v, want the one ingested worker", entries)
+	}
+	if free := entries[0].Room.Free.Get("cpu"); free.String() != "4" {
+		t.Errorf("free cpu = %v before any allocation, want 4", free.String())
+	}
+
+	updated := makeWorker("ns", "w", 2)
+	updated.Status.Capacity = w.Status.Capacity
+	updated.Status.Allocated = &ateapipb.WorkerResources{Actors: 1, Resources: limits("cpu", "1500m")}
+	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: updated})
+	eventually(t, func() bool {
+		entries, err := c.Entries()
+		return err == nil && len(entries) == 1 && entries[0].Worker == updated
+	}, 2*time.Second)
+
+	entries, _ = c.Entries()
+	if free := entries[0].Room.Free.Get("cpu"); free.String() != "2500m" {
+		t.Errorf("free cpu = %v after allocating 1500m of 4, want 2500m", free.String())
+	}
+	if util := entries[0].Room.Utilization; util != 0.375 {
+		t.Errorf("Utilization = %v, want 0.375", util)
+	}
+}
+
 func TestCache_UpdatedEvent_NewerVersionApplied(t *testing.T) {
 	w := makeWorker("ns", "pod1", 1)
 	fs := newFakeStore(w)

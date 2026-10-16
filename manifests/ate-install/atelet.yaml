@@ -206,8 +206,13 @@ spec:
         - configMapRef:
             name: ate-otel-config
         volumeMounts:
+        # HostToContainer lets host submounts under /var/lib/ate (such as a
+        # dedicated block device mounted at /var/lib/ate/snapshots or
+        # /var/lib/ate/actors by a node-init DaemonSet) propagate into the
+        # running container without restarting the pod.
         - name: ate-base
           mountPath: /var/lib/ate
+          mountPropagation: HostToContainer
         - name: objectstore-plugin
           mountPath: /run/objectstore-plugin
         # Sandbox assets are downloaded here and verified against their sha256
@@ -305,8 +310,13 @@ spec:
           initialDelaySeconds: 10
           periodSeconds: 10
         volumeMounts:
+        # HostToContainer lets host submounts under /var/lib/ate (such as a
+        # dedicated block device mounted at /var/lib/ate/snapshots or
+        # /var/lib/ate/actors by a node-init DaemonSet) propagate into the
+        # running container without restarting the pod.
         - name: ate-base
           mountPath: /var/lib/ate
+          mountPropagation: HostToContainer
         - name: objectstore-plugin
           mountPath: /run/objectstore-plugin
         - name: podidentity
