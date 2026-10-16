@@ -122,3 +122,33 @@ func BenchmarkConcurrentSnapshotUploads(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkReadCompositeHeadSmallFile(b *testing.B) {
+	payload := make([]byte, 512)
+	b.Run("growable_readCompositeHead", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			head, err := readCompositeHead(io.LimitReader(zeroReader{}, int64(len(payload))), uploadCompositeMin)
+			if err != io.EOF || len(head) != len(payload) {
+				b.Fatalf("len=%d err=%v", len(head), err)
+			}
+		}
+	})
+	b.Run("fixed_64MiB_head", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			head := make([]byte, uploadCompositeMin)
+			n, err := io.ReadFull(io.LimitReader(zeroReader{}, int64(len(payload))), head)
+			if err != io.ErrUnexpectedEOF || n != len(payload) {
+				b.Fatalf("n=%d err=%v", n, err)
+			}
+		}
+	})
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}

@@ -116,6 +116,28 @@ func (t *Tracker) LocalSnapshotsToKeep(actorUID string) []string {
 	return keep
 }
 
+// ForgetLocal drops the actor's latest local snapshot when a remote restore
+// supersedes any earlier local copy on this node. An older snapshot's
+// background upload in progress runs on, and LocalSnapshotsToKeep keeps its
+// local copy until that upload ends.
+func (t *Tracker) ForgetLocal(actorUID string) {
+	t.lock(actorUID)
+	defer t.unlock(actorUID)
+	a := t.findLocked(actorUID)
+	if a == nil || a.LatestLocal == nil {
+		return
+	}
+	a.clearLatestLocal()
+	a.clearSupersededUploading()
+	if !a.keepUploading() {
+		a.UndurableSince = time.Time{}
+		t.resetBackoffLocked(a)
+	}
+	t.addLocked(a)
+	t.saveLocked(a)
+	t.requeueLocked(a)
+}
+
 // CommitPromoted records snap, a local snapshot PromoteSnapshot made durable or
 // found durable already, as the actor's latest durable snapshot, keeping its
 // local copy, the time its checkpoint committed, and any UploadTime on snap.

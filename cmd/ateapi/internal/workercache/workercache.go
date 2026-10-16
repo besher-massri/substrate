@@ -13,9 +13,11 @@
 // limitations under the License.
 
 // Package workercache maintains an in-memory view of all workers, kept current
-// via store.Interface.WatchWorkers. It exposes Workers() for fast O(1) reads
-// during actor scheduling and is the natural home for future indices (by node,
-// by label, etc.) as scheduling requirements grow.
+// via store.Interface.WatchWorkers. It exposes Entries() for fast reads during
+// actor scheduling, each Worker paired with what scheduling needs of its
+// record, derived once when the cache ingests it rather than on every read.
+// It is the natural home for future indices (by node, by label, etc.) as
+// scheduling requirements grow.
 package workercache
 
 import (
@@ -43,7 +45,8 @@ type Cache struct {
 	relistInterval time.Duration
 
 	mu       sync.RWMutex
-	workers  map[string]*ateapipb.Worker
+	entries  map[string]*Entry
+	byNode   map[string][]*Entry
 	handlers []func(*ateapipb.Worker)
 
 	ready atomic.Bool
@@ -57,9 +60,9 @@ type Cache struct {
 func (c *Cache) AddHandler(handler func(*ateapipb.Worker)) {
 	c.mu.Lock()
 	c.handlers = append(c.handlers, handler)
-	current := make([]*ateapipb.Worker, 0, len(c.workers))
-	for _, w := range c.workers {
-		current = append(current, w)
+	current := make([]*ateapipb.Worker, 0, len(c.entries))
+	for _, e := range c.entries {
+		current = append(current, e.Worker)
 	}
 	c.mu.Unlock()
 	for _, w := range current {
@@ -83,7 +86,8 @@ func New(store workerListWatcher, relistInterval time.Duration) *Cache {
 	return &Cache{
 		store:          store,
 		relistInterval: relistInterval,
-		workers:        make(map[string]*ateapipb.Worker),
+		entries:        make(map[string]*Entry),
+		byNode:         make(map[string][]*Entry),
 	}
 }
 
@@ -107,21 +111,64 @@ func (c *Cache) Start(ctx context.Context) error {
 	return nil
 }
 
-// Workers returns a snapshot of all currently known workers. The returned
-// slice and its elements must not be modified by the caller. Returns an error
-// if the cache is not ready (brief window during reconnect); callers are
-// expected to retry.
+// Entries returns a snapshot of all currently known workers, each with what
+// the cache derived from it on ingestion. The returned slice and its elements
+// must not be modified by the caller. Returns an error if the cache is not
+// ready (brief window during reconnect); callers are expected to retry.
+func (c *Cache) Entries() ([]*Entry, error) {
+	if !c.ready.Load() {
+		return nil, fmt.Errorf("worker cache not ready")
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Entry, 0, len(c.entries))
+	for _, e := range c.entries {
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// Workers is Entries for a caller that reads only the Worker records.
 func (c *Cache) Workers() ([]*ateapipb.Worker, error) {
 	if !c.ready.Load() {
 		return nil, fmt.Errorf("worker cache not ready")
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*ateapipb.Worker, 0, len(c.workers))
-	for _, w := range c.workers {
-		out = append(out, w)
+	out := make([]*ateapipb.Worker, 0, len(c.entries))
+	for _, e := range c.entries {
+		out = append(out, e.Worker)
 	}
 	return out, nil
+}
+
+// Entry returns the cached Entry for the worker with the given name, if
+// present and the cache is ready.
+func (c *Cache) Entry(name string) (*Entry, bool) {
+	if !c.ready.Load() {
+		return nil, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.entries[name]
+	return entry, ok
+}
+
+// EntriesByNode returns the cached Entries for workers running on node, if
+// the cache is ready.
+func (c *Cache) EntriesByNode(node string) []*Entry {
+	if node == "" || !c.ready.Load() {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	src := c.byNode[node]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]*Entry, len(src))
+	copy(out, src)
+	return out
 }
 
 // Worker returns the worker with the given name.
@@ -131,11 +178,11 @@ func (c *Cache) Worker(name string) (*ateapipb.Worker, error) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	worker, ok := c.workers[name]
+	entry, ok := c.entries[name]
 	if !ok {
 		return nil, store.ErrNotFound
 	}
-	return worker, nil
+	return entry.Worker, nil
 }
 
 // Forget removes a worker that a store write proved no longer exists. The
@@ -145,7 +192,48 @@ func (c *Cache) Worker(name string) (*ateapipb.Worker, error) {
 func (c *Cache) Forget(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.workers, name)
+	if old, ok := c.entries[name]; ok {
+		c.removeFromNodeLocked(name, old.Worker.GetNodeName())
+		delete(c.entries, name)
+	}
+}
+
+func (c *Cache) removeFromNodeLocked(key, node string) {
+	if node == "" {
+		return
+	}
+	list := c.byNode[node]
+	for i, e := range list {
+		if workerKey(e.Worker) == key {
+			list[i] = list[len(list)-1]
+			list[len(list)-1] = nil
+			list = list[:len(list)-1]
+			if len(list) == 0 {
+				delete(c.byNode, node)
+			} else {
+				c.byNode[node] = list
+			}
+			return
+		}
+	}
+}
+
+func (c *Cache) putByNodeLocked(key string, entry *Entry) {
+	if entry == nil {
+		return
+	}
+	node := entry.Worker.GetNodeName()
+	if node == "" {
+		return
+	}
+	list := c.byNode[node]
+	for i, e := range list {
+		if workerKey(e.Worker) == key {
+			list[i] = entry
+			return
+		}
+	}
+	c.byNode[node] = append(list, entry)
 }
 
 func (c *Cache) sync(ctx context.Context) (*store.WorkerWatch, error) {
@@ -174,19 +262,26 @@ func (c *Cache) relist(ctx context.Context) error {
 		}
 		pageToken = page.NextPageToken
 	}
-	newMap := make(map[string]*ateapipb.Worker, len(workers))
+	// Derived outside the lock: the listing is this call's own.
+	newMap := make(map[string]*Entry, len(workers))
+	newByNode := make(map[string][]*Entry, len(workers))
 	for _, w := range workers {
-		newMap[workerKey(w)] = w
+		e := NewEntry(w)
+		newMap[workerKey(w)] = e
+		if node := w.GetNodeName(); node != "" {
+			newByNode[node] = append(newByNode[node], e)
+		}
 	}
 	c.mu.Lock()
 	var changed []*ateapipb.Worker
-	for key, w := range newMap {
-		old, ok := c.workers[key]
-		if !ok || old.GetMetadata().GetVersion() != w.GetMetadata().GetVersion() {
-			changed = append(changed, w)
+	for key, e := range newMap {
+		old, ok := c.entries[key]
+		if !ok || old.Worker.GetMetadata().GetVersion() != e.Worker.GetMetadata().GetVersion() {
+			changed = append(changed, e.Worker)
 		}
 	}
-	c.workers = newMap
+	c.entries = newMap
+	c.byNode = newByNode
 	handlers := c.handlers
 	c.mu.Unlock()
 	slog.InfoContext(ctx, "worker cache synced", slog.Int("count", len(newMap)), slog.Int("changed", len(changed)))
@@ -249,15 +344,26 @@ func (c *Cache) resync(ctx context.Context) *store.WorkerWatch {
 
 func (c *Cache) applyEvent(event store.WorkerEvent) {
 	key := workerKey(event.Worker)
+	var entry *Entry
+	if event.Type != store.WorkerEventDeleted {
+		entry = NewEntry(event.Worker) // derived outside the lock
+	}
 	c.mu.Lock()
 	var handlers []func(*ateapipb.Worker)
 	switch event.Type {
 	case store.WorkerEventDeleted:
-		delete(c.workers, key)
+		if existing, ok := c.entries[key]; ok {
+			c.removeFromNodeLocked(key, existing.Worker.GetNodeName())
+			delete(c.entries, key)
+		}
 	case store.WorkerEventCreated, store.WorkerEventUpdated:
-		existing, ok := c.workers[key]
-		if !ok || event.Worker.GetMetadata().GetVersion() >= existing.GetMetadata().GetVersion() {
-			c.workers[key] = event.Worker
+		existing, ok := c.entries[key]
+		if !ok || event.Worker.GetMetadata().GetVersion() >= existing.Worker.GetMetadata().GetVersion() {
+			if ok && existing.Worker.GetNodeName() != entry.Worker.GetNodeName() {
+				c.removeFromNodeLocked(key, existing.Worker.GetNodeName())
+			}
+			c.entries[key] = entry
+			c.putByNodeLocked(key, entry)
 			handlers = c.handlers
 		}
 	}

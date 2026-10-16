@@ -117,18 +117,48 @@ const uploadChunkSize = 64 << 20
 
 // PutObject writes reader to the object, in a single request below
 // uploadCompositeMin and as parallel parts above it. The size is not known up front,
-// so this reads that many bytes to find out which case it is, then hands them on.
+// so this reads up to that many bytes to find out which case it is, growing the
+// buffer incrementally so small objects do not allocate a 64 MiB slice.
 func (g *gcsClient) PutObject(ctx context.Context, bucket, object string, reader io.Reader) error {
-	head := make([]byte, uploadCompositeMin)
-	n, err := io.ReadFull(reader, head)
+	head, err := readCompositeHead(reader, uploadCompositeMin)
 	switch {
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		// The whole object is in hand and fits in one request.
-		return g.putSingle(ctx, bucket, object, bytes.NewReader(head[:n]))
+		return g.putSingle(ctx, bucket, object, bytes.NewReader(head))
 	case err != nil:
 		return fmt.Errorf("while reading object body: %w", err)
 	}
-	return g.putComposite(ctx, bucket, object, bytes.NewReader(head[:n]), reader)
+	return g.putComposite(ctx, bucket, object, bytes.NewReader(head), reader)
+}
+
+// readCompositeHead reads up to limit bytes from reader, growing the buffer from
+// 64 KiB (or the known size when available) so tiny snapshot metadata files do
+// not allocate a full uploadCompositeMin (64 MiB) buffer.
+func readCompositeHead(reader io.Reader, limit int) ([]byte, error) {
+	initCap := min(limit, 64<<10)
+	if sr, ok := reader.(interface{ Size() int64 }); ok {
+		if sz := sr.Size(); sz >= 0 && sz < int64(limit) {
+			initCap = max(int(sz)+1, 64)
+		}
+	}
+	buf := make([]byte, 0, initCap)
+	for len(buf) < limit {
+		if len(buf) == cap(buf) {
+			nextCap := min(limit, max(cap(buf)*2, 64<<10))
+			next := make([]byte, len(buf), nextCap)
+			copy(next, buf)
+			buf = next
+		}
+		n, err := reader.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err != nil {
+			if errors.Is(err, io.EOF) && len(buf) < limit {
+				return buf, io.EOF
+			}
+			return buf, err
+		}
+	}
+	return buf, nil
 }
 
 // putSingle writes the whole body in one resumable request.

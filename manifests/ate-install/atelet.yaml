@@ -165,6 +165,7 @@ spec:
         - node
         - --socket=/run/objectstore-plugin/node.sock
         - --root=/var/lib/ate
+        - --upload-memory-budget=2Gi
         - --asset-staging-dir=/var/lib/objectstore-plugin/asset-staging
         # atelet's 8 GiB per-asset cap, so any asset fits. Each download
         # reserves its object's size; ones past the capacity wait their turn,
@@ -206,8 +207,13 @@ spec:
         - configMapRef:
             name: ate-otel-config
         volumeMounts:
+        # HostToContainer lets host submounts under /var/lib/ate (such as a
+        # dedicated block device mounted at /var/lib/ate/snapshots or
+        # /var/lib/ate/actors by a node-init DaemonSet) propagate into the
+        # running container without restarting the pod.
         - name: ate-base
           mountPath: /var/lib/ate
+          mountPropagation: HostToContainer
         - name: objectstore-plugin
           mountPath: /run/objectstore-plugin
         # Sandbox assets are downloaded here and verified against their sha256
@@ -305,8 +311,13 @@ spec:
           initialDelaySeconds: 10
           periodSeconds: 10
         volumeMounts:
+        # HostToContainer lets host submounts under /var/lib/ate (such as a
+        # dedicated block device mounted at /var/lib/ate/snapshots or
+        # /var/lib/ate/actors by a node-init DaemonSet) propagate into the
+        # running container without restarting the pod.
         - name: ate-base
           mountPath: /var/lib/ate
+          mountPropagation: HostToContainer
         - name: objectstore-plugin
           mountPath: /run/objectstore-plugin
         - name: podidentity

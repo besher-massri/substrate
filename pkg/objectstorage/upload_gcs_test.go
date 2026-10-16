@@ -176,3 +176,57 @@ func TestGCSSparseUploadHonorsReservedParts(t *testing.T) {
 		}
 	})
 }
+
+func TestGCSUploaderSmallFilesAdmittedConcurrently(t *testing.T) {
+	const files = 6
+	dir := t.TempDir()
+	opened := make([]*os.File, files)
+	for i := range files {
+		p := filepath.Join(dir, fmt.Sprintf("file-%d", i))
+		if err := os.WriteFile(p, bytes.Repeat([]byte{byte(i + 1)}, 1024), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		opened[i] = f
+	}
+	synctest.Test(t, func(t *testing.T) {
+		gate := make(chan struct{})
+		transport := &slowGCSTransport{parts: make(chan string, files*2), release: gate}
+		client, err := NewGCSClient(t.Context(), option.WithoutAuthentication(), option.WithHTTPClient(&http.Client{Transport: transport}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		g := client.(*gcsClient)
+		defer func() {
+			g.client.Close()
+			for _, c := range g.pool {
+				c.Close()
+			}
+		}()
+		u, err := NewUploader(client, DefaultUploadMemory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, files)
+		for i, f := range opened {
+			go func() {
+				done <- u.SendFile(t.Context(), fmt.Sprintf("gs://bucket/snap/file-%d.zstd", i), f)
+			}()
+		}
+		synctest.Wait()
+		if got := len(transport.parts); got != files {
+			t.Errorf("started %d concurrent small-file GCS uploads under DefaultUploadMemory, want all %d", got, files)
+		}
+		close(gate)
+		synctest.Wait()
+		for range files {
+			if err := <-done; err != nil {
+				t.Error(err)
+			}
+		}
+	})
+}

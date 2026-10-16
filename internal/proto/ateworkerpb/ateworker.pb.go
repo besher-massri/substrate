@@ -159,7 +159,8 @@ func (StatsSource) EnumDescriptor() ([]byte, []int) {
 // ActorDirs is the set of per-actor directories atelet prepares on the volume
 // it shares with the worker. The worker takes them from the RPC instead of deriving
 // them from the actor UID.
-// Every directory is under root_dir.
+// Guest-plane directories live under root_dir (/var/lib/ate/actors/<uid>), while
+// checkpoint_dir and restore_dir live under /var/lib/ate/snapshots/<uid>.
 //
 // +k8s:customValidation # each directory is an absolute, clean path
 type ActorDirs struct {

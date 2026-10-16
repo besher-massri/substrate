@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"sync"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -33,6 +35,20 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+// lastActorWorker and lastActorNode record the last worker and node an actor
+// was checkpointed on (keyed by actorRef.String()) so ResumeActor can apply
+// soft worker and node affinity while the node retains a local copy of the
+// snapshot.
+var (
+	lastActorWorker sync.Map
+	lastActorNode   sync.Map
+)
+
+func softNodeAffinityEnabled() bool {
+	v := os.Getenv("ATE_SOFT_NODE_AFFINITY")
+	return v == "true" || v == "1"
+}
 
 // suspendMode selects which of the two suspends the suspend workflow runs.
 // Both take the same steps; the mode only decides the shape of the snapshot
@@ -375,6 +391,14 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 
 	// 1. Free the worker (if it hasn't been freed yet)
 	if latestActor.GetStatus().GetWorkerAssignment() != nil {
+		if wName := latestActor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); wName != "" {
+			lastActorWorker.Store(actorRef.String(), wName)
+		}
+		if nName := latestActor.GetStatus().GetWorkerAssignment().GetNodeName(); nName != "" {
+			lastActorNode.Store(actorRef.String(), nName)
+		} else if nName := latestActor.GetStatus().GetAssignedNode(); nName != "" {
+			lastActorNode.Store(actorRef.String(), nName)
+		}
 		t = time.Now()
 		_, _, err := releaseWorker(ctx, w.store, latestActor)
 		dReleaseWorker = time.Since(t)
@@ -401,7 +425,13 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 			// TODO: This will change when an async suspend uploads its snapshot
 			// and both local and durable snapshots are kept.
 			pruneSnapshots(toUpdate.Status, nil)
-			toUpdate.Status.AssignedNode = ""
+			if softNodeAffinityEnabled() {
+				if toUpdate.Status.AssignedNode == "" {
+					toUpdate.Status.AssignedNode = latestActor.GetStatus().GetWorkerAssignment().GetNodeName()
+				}
+			} else {
+				toUpdate.Status.AssignedNode = ""
+			}
 		case suspendAsync:
 			// Record the node locality of the local checkpoint and clear older local checkpoints.
 			// AssignedNode is kept: a paused actor resumes on that node.

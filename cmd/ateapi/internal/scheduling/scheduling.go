@@ -22,8 +22,8 @@ import (
 	"math/rand"
 	"slices"
 
+	"go.ate.dev/substrate/cmd/ateapi/internal/workercache"
 	"go.ate.dev/substrate/internal/hardware"
-	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"k8s.io/apimachinery/pkg/labels"
 )
@@ -53,6 +53,17 @@ type Constraints struct {
 	// to specific node VMs.
 	RequiredNodes []string
 
+	// PreferredWorker, when non-empty, gives soft affinity to the named worker
+	// (by metadata name or pod UID) or, if that worker is full or unavailable,
+	// to another eligible worker on the same node.
+	PreferredWorker string
+
+	// PreferredNodes, when non-empty, gives soft affinity to eligible workers
+	// running on one of these nodes (e.g., where the actor's latest snapshot is
+	// retained locally), falling back to the rest of the pool when all
+	// preferred nodes are full.
+	PreferredNodes []string
+
 	// Limits are the actor's declared resource limits, named as a Worker names
 	// the capacity it reports, so the two subtract.
 	Limits *ateapipb.Resources
@@ -78,9 +89,22 @@ type Scheduler interface {
 	HasRoom(worker *ateapipb.Worker, constraints Constraints) bool
 }
 
-// WorkerSource provides the whole fleet of workers.
+// WorkerSource provides the whole fleet of workers, each with what the cache
+// derived from its record when it ingested it.
 type WorkerSource interface {
-	Workers() ([]*ateapipb.Worker, error)
+	Entries() ([]*workercache.Entry, error)
+}
+
+// workerEntryLookup is an optional fast path implemented by caches that index
+// entries by worker metadata name.
+type workerEntryLookup interface {
+	Entry(name string) (*workercache.Entry, bool)
+}
+
+// workerNodeLookup is an optional fast path implemented by caches that index
+// entries by node name.
+type workerNodeLookup interface {
+	EntriesByNode(node string) []*workercache.Entry
 }
 
 type scheduler struct {
@@ -113,72 +137,133 @@ func New(source WorkerSource, opts ...Option) Scheduler {
 // the higher of actor-slot and compute-resource utilization. Spreading across
 // the warm pool avoids hotspots until autoscaling reclaims idle workers.
 func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ateapipb.Worker, error) {
-	workers, err := s.source.Workers()
-	if err != nil {
-		return nil, fmt.Errorf("while listing workers: %w", err)
-	}
-
-	want, err := resources.ParseQuantities(constraints.Limits)
+	// The actor's size is parsed once per pass. The workers' were parsed when
+	// the cache ingested them, so the pass over the fleet parses nothing.
+	need, err := workercache.ParseAmounts(constraints.Limits)
 	if err != nil {
 		return nil, fmt.Errorf("while parsing actor resource limits: %w", err)
 	}
 
-	var candidates []candidate
-	for _, worker := range workers {
-		if !s.Applies(worker, constraints) {
+	var preferredNode string
+	if constraints.PreferredWorker != "" {
+		if lookup, ok := s.source.(workerEntryLookup); ok {
+			if e, found := lookup.Entry(constraints.PreferredWorker); found && e != nil {
+				if s.Applies(e.Worker, constraints) && hasRoom(e, need) {
+					return e.Worker, nil
+				}
+				preferredNode = e.Worker.GetNodeName()
+			}
+		}
+	}
+
+	if preferredNode != "" || len(constraints.PreferredNodes) > 0 {
+		if nodeLookup, ok := s.source.(workerNodeLookup); ok {
+			var sameNode []*workercache.Entry
+			if preferredNode != "" {
+				for _, e := range nodeLookup.EntriesByNode(preferredNode) {
+					if s.Applies(e.Worker, constraints) && hasRoom(e, need) {
+						sameNode = append(sameNode, e)
+					}
+				}
+			}
+			for _, node := range constraints.PreferredNodes {
+				if node == "" || node == preferredNode {
+					continue
+				}
+				for _, e := range nodeLookup.EntriesByNode(node) {
+					if s.Applies(e.Worker, constraints) && hasRoom(e, need) {
+						sameNode = append(sameNode, e)
+					}
+				}
+			}
+			if len(sameNode) > 0 {
+				return s.pickCandidate(sameNode), nil
+			}
+		}
+	}
+
+	entries, err := s.source.Entries()
+	if err != nil {
+		return nil, fmt.Errorf("while listing workers: %w", err)
+	}
+
+	var candidates []*workercache.Entry
+	for _, e := range entries {
+		if constraints.PreferredWorker != "" && workerMatchesPreferred(e.Worker, constraints.PreferredWorker) {
+			preferredNode = e.Worker.GetNodeName()
+			if s.Applies(e.Worker, constraints) && hasRoom(e, need) {
+				return e.Worker, nil
+			}
+		}
+		if !s.Applies(e.Worker, constraints) {
 			continue
 		}
-		if cand, ok := checkRoom(worker, want); ok {
-			candidates = append(candidates, cand)
+		if hasRoom(e, need) {
+			candidates = append(candidates, e)
 		}
 	}
 
 	if len(candidates) == 0 {
 		return nil, ErrNoCapacity
 	}
-	if len(candidates) == 1 {
-		return candidates[0].worker, nil
+
+	if preferredNode != "" || len(constraints.PreferredNodes) > 0 {
+		var sameNode []*workercache.Entry
+		for _, c := range candidates {
+			node := c.Worker.GetNodeName()
+			if node == "" {
+				continue
+			}
+			if node == preferredNode || slices.Contains(constraints.PreferredNodes, node) {
+				sameNode = append(sameNode, c)
+			}
+		}
+		if len(sameNode) > 0 {
+			return s.pickCandidate(sameNode), nil
+		}
 	}
 
+	return s.pickCandidate(candidates), nil
+}
+
+func (s *scheduler) pickCandidate(candidates []*workercache.Entry) *ateapipb.Worker {
+	if len(candidates) == 1 {
+		return candidates[0].Worker
+	}
 	i := s.intn(len(candidates))
 	j := s.intn(len(candidates) - 1)
 	if j >= i {
 		j++
 	}
-	if lessLoaded(&candidates[j], &candidates[i]) {
-		return candidates[j].worker, nil
+	if lessLoaded(candidates[j], candidates[i]) {
+		return candidates[j].Worker
 	}
-	return candidates[i].worker, nil
+	return candidates[i].Worker
 }
 
-// candidate pairs an eligible worker with its cached compute utilization.
-type candidate struct {
-	worker *ateapipb.Worker
-	// resUtil is the worker's dominant compute-resource utilization in [0,1],
-	// or -1 if not yet computed.
-	resUtil float64
-}
-
-func (c *candidate) resourceUtilization() float64 {
-	if c.resUtil < 0 {
-		c.resUtil = workerResourceUtilization(c.worker)
+func workerMatchesPreferred(w *ateapipb.Worker, preferred string) bool {
+	if preferred == "" || w == nil {
+		return false
 	}
-	return c.resUtil
+	if w.GetWorkerPod() == preferred || w.GetWorkerPodUid() == preferred {
+		return true
+	}
+	return w.GetMetadata().GetName() == preferred
 }
 
 // lessLoaded compares dominant utilization — the higher of actor-slot
 // utilization (allocated/capacity) and compute-resource utilization — so either
 // dimension can mark a worker as hot. Ties fall back to actor-slot utilization,
 // then to remaining actor slots.
-func lessLoaded(a, b *candidate) bool {
-	aAlloc := int64(a.worker.GetStatus().GetAllocated().GetActors())
-	bAlloc := int64(b.worker.GetStatus().GetAllocated().GetActors())
-	// checkRoom admits only workers with allocated < capacity, so capacity >= 1.
-	aCap := int64(a.worker.GetStatus().GetCapacity().GetActors())
-	bCap := int64(b.worker.GetStatus().GetCapacity().GetActors())
+func lessLoaded(a, b *workercache.Entry) bool {
+	aAlloc := int64(a.Worker.GetStatus().GetAllocated().GetActors())
+	bAlloc := int64(b.Worker.GetStatus().GetAllocated().GetActors())
+	// hasRoom admits only workers with allocated < capacity, so capacity >= 1.
+	aCap := int64(a.Worker.GetStatus().GetCapacity().GetActors())
+	bCap := int64(b.Worker.GetStatus().GetCapacity().GetActors())
 
-	aLoad := max(float64(aAlloc)/float64(aCap), a.resourceUtilization())
-	bLoad := max(float64(bAlloc)/float64(bCap), b.resourceUtilization())
+	aLoad := max(float64(aAlloc)/float64(aCap), a.Room.Utilization)
+	bLoad := max(float64(bAlloc)/float64(bCap), b.Room.Utilization)
 	if aLoad != bLoad {
 		return aLoad < bLoad
 	}
@@ -189,39 +274,6 @@ func lessLoaded(a, b *candidate) bool {
 	}
 
 	return aCap-aAlloc > bCap-bAlloc
-}
-
-// workerResourceUtilization returns the highest allocated/capacity ratio across
-// compute dimensions, or 1 when capacity is unreported or quantities fail to parse.
-func workerResourceUtilization(w *ateapipb.Worker) float64 {
-	capQ, err := resources.ParseQuantities(w.GetStatus().GetCapacity().GetResources())
-	if err != nil || len(capQ) == 0 {
-		return 1
-	}
-	usedQ, err := resources.ParseQuantities(w.GetStatus().GetAllocated().GetResources())
-	if err != nil {
-		return 1
-	}
-	return quantitiesUtilization(capQ, usedQ)
-}
-
-func quantitiesUtilization(capQ, usedQ resources.Quantities) float64 {
-	var (
-		maxRatio    float64
-		hasPositive bool
-	)
-	for name, capVal := range capQ {
-		if capFloat := capVal.AsApproximateFloat64(); capFloat > 0 {
-			hasPositive = true
-			if usedVal, ok := usedQ[name]; ok {
-				maxRatio = max(maxRatio, usedVal.AsApproximateFloat64()/capFloat)
-			}
-		}
-	}
-	if !hasPositive {
-		return 1
-	}
-	return maxRatio
 }
 
 func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bool {
@@ -252,49 +304,47 @@ func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bo
 }
 
 // HasRoom reports whether what the worker has left admits one more actor of
-// this size. A dimension the worker does not report is unconstrained, so
-// placement is never blocked by missing data.
+// this size. A worker reports every dimension it has, so one it does not
+// report is none of it, and an actor asking for that dimension does not fit.
 //
 // A worker whose recorded capacity or allocation will not parse is treated as
 // having no room: it is the only answer that cannot overcommit a worker whose
 // true occupancy is unreadable.
+//
+// This reads the worker's record directly, for a caller holding a row the
+// cache has not seen. Schedule asks the same question of cache entries.
 func (s *scheduler) HasRoom(worker *ateapipb.Worker, constraints Constraints) bool {
-	want, err := resources.ParseQuantities(constraints.Limits)
+	need, err := workercache.ParseAmounts(constraints.Limits)
 	if err != nil {
 		return false
 	}
-	_, ok := checkRoom(worker, want)
-	return ok
+	return hasRoom(workercache.NewEntry(worker), need)
 }
 
-func checkRoom(worker *ateapipb.Worker, want resources.Quantities) (candidate, bool) {
-	capacity := worker.GetStatus().GetCapacity()
-	used := worker.GetStatus().GetAllocated()
+// hasRoom is HasRoom for a worker the cache has read and an actor size already
+// parsed, so Schedule can ask it of every worker without parsing anything.
+func hasRoom(e *workercache.Entry, need workercache.Amounts) bool {
+	capacity := e.Worker.GetStatus().GetCapacity()
+	used := e.Worker.GetStatus().GetAllocated()
 
 	// No per-actor size to compare: every assignment costs one, so a worker at
 	// its limit has no room however small the next actor is.
 	if used.GetActors() >= capacity.GetActors() {
-		return candidate{}, false
+		return false
 	}
-
-	if len(want) == 0 {
-		return candidate{worker: worker, resUtil: -1}, true
+	if len(need) == 0 {
+		return true
 	}
-	free, err := resources.ParseQuantities(capacity.GetResources())
-	if err != nil {
-		return candidate{}, false
+	if e.Room.Unreadable {
+		return false
 	}
-	if free == nil {
-		free = resources.Quantities{}
+	for _, n := range need {
+		// Both operands are copies, so a comparison that converts one to
+		// inf.Dec converts the copy and leaves the shared Entry as it was.
+		have := e.Room.Free.Get(n.Name) // absent is none of it
+		if have.Cmp(n.Quantity) < 0 {
+			return false
+		}
 	}
-	allocated, err := resources.ParseQuantities(used.GetResources())
-	if err != nil {
-		return candidate{}, false
-	}
-	resUtil := quantitiesUtilization(free, allocated)
-	free.Sub(allocated)
-	if !free.Covers(want) {
-		return candidate{}, false
-	}
-	return candidate{worker: worker, resUtil: resUtil}, true
+	return true
 }

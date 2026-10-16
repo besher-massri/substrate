@@ -52,7 +52,7 @@ func TestUploaderBudgetFitsBothPaths(t *testing.T) {
 			if plan.workers < 1 || plan.workers > runtime.GOMAXPROCS(0) || plan.memory > capacity {
 				t.Fatalf("%T: invalid plan %+v for capacity %d", client, plan, capacity)
 			}
-			if plan.memory < uploadBufferMemory(client)+int64(plan.workers)*parallelWorkerMemory {
+			if plan.memory < uploadBufferMemoryForFile(client, 0)+int64(plan.workers)*parallelWorkerMemory {
 				t.Fatalf("%T: streaming pipeline under-reserved: %+v", client, plan)
 			}
 			if _, ok := client.(sparseFilePutter); ok && (plan.parts < 1 || int64(plan.parts)*sparseUploadMemory > plan.memory) {
@@ -70,9 +70,9 @@ func TestUploaderPlansFromPopulatedBytes(t *testing.T) {
 		populatedMiB int
 		gcs, s3      uploadPlan
 	}{
-		{"all_holes", 0, uploadPlan{1, 1, 384 << 20}, uploadPlan{1, 1, 224 << 20}},
-		{"small", 1, uploadPlan{1, 1, 384 << 20}, uploadPlan{1, 1, 224 << 20}},
-		{"two_chunks", 9, uploadPlan{2, 1, 448 << 20}, uploadPlan{2, 1, 288 << 20}},
+		{"all_holes", 0, uploadPlan{1, 1, 68 << 20}, uploadPlan{1, 1, 224 << 20}},
+		{"small", 1, uploadPlan{1, 1, 68 << 20}, uploadPlan{1, 1, 224 << 20}},
+		{"two_chunks", 9, uploadPlan{2, 1, 146 << 20}, uploadPlan{2, 1, 288 << 20}},
 		{"multiple_ranges", 192, uploadPlan{3, 3, 512 << 20}, uploadPlan{5, 3, 480 << 20}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
