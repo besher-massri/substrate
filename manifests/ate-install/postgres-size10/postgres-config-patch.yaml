@@ -35,27 +35,27 @@ data:
     ssl_ca_file = '/run/postgres.podcert.ate.dev/trust-bundle.pem'
     hba_file = '/etc/postgresql/pg_hba.conf'
 
-    # Memory: container holds 140 GiB. shared_buffers at 25 % is the standard
+    # Memory: container holds 140 GiB. shared_buffers at ~25 % is the standard
     # starting point; going higher rarely helps on PG 18 because the OS page
     # cache double-buffers. effective_cache_size is a planner hint, not an
     # allocation.
-    shared_buffers = 35GB
+    shared_buffers = 32GB
     effective_cache_size = 100GB
     work_mem = 32MB
     maintenance_work_mem = 2GB
     wal_buffers = 64MB
     huge_pages = try
 
-    # 2 ate-api-server replicas at pool_max_conns=64 + 3-conn watch pool +
-    # 1-conn readiness pool each = 136 steady-state; 300 leaves room to double
-    # replicas and for psql / monitoring / migrations.
-    max_connections = 300
+    # Up to 6-8 ate-api-server replicas at pool_max_conns=192 + watch/readiness
+    # pools each; 2000 leaves ample headroom for bursty scale-up and psql /
+    # monitoring / migrations.
+    max_connections = 2000
 
     # 1 GB max_wal_size (the compiled default) forces a checkpoint every few
     # seconds under sustained writes and caps throughput well below what the
-    # disk can do. 16 GB stretches the interval out; completion_target 0.9
+    # disk can do. 32 GB stretches the interval out; completion_target 0.9
     # spreads the flush across it.
-    max_wal_size = 16GB
+    max_wal_size = 32GB
     min_wal_size = 4GB
     checkpoint_completion_target = 0.9
     wal_compression = on

@@ -34,7 +34,10 @@ patches:
     patch: |-
       - op: add
         path: /spec/template/spec/containers/0/args/-
-        value: --kube-api-qps=100
+        value: --kube-api-qps=500
       - op: add
         path: /spec/template/spec/containers/0/args/-
-        value: --kube-api-burst=200
+        value: --kube-api-burst=1000
+      - op: replace
+        path: /spec/template/spec/containers/0/env/3/value
+        value: "50"
