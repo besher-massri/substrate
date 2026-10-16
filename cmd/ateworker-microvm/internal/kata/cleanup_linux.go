@@ -18,6 +18,7 @@ package kata
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -27,8 +28,57 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/nodepath"
 )
+
+// EnvFastSandboxCleanup controls whether CleanupSandboxState skips mountinfo
+// and /proc scans when sandbox directories do not exist on disk or when the
+// actor's cgroup leaf has already been killed. Enabled by default; set to
+// "false" / "0" / "off" to force legacy unconditional mountinfo + /proc scans.
+const (
+	EnvFastSandboxCleanup       = "ATEWORKER_MICROVM_FAST_SANDBOX_CLEANUP"
+	EnvLegacyFastSandboxCleanup = "ATEOM_MICROVM_FAST_SANDBOX_CLEANUP"
+)
+
+// FastSandboxCleanupEnabled reports whether fast sandbox state cleanup is
+// enabled (default true unless explicitly disabled via env).
+func FastSandboxCleanupEnabled() bool {
+	for _, key := range []string{EnvFastSandboxCleanup, EnvLegacyFastSandboxCleanup} {
+		if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
+			switch strings.ToLower(raw) {
+			case "0", "false", "no", "off":
+				return false
+			default:
+				return true
+			}
+		}
+	}
+	return true
+}
+
+// CleanupOptions configures optional fast-paths in CleanupSandboxStateOpts.
+type CleanupOptions struct {
+	// SkipIfDirsAbsent checks whether any sandbox directory exists on disk
+	// before scanning mounts or calling RemoveAll.
+	SkipIfDirsAbsent bool
+	// SkipOrphanScan skips scanning /proc for orphaned per-sandbox processes
+	// (e.g. when cgroup.KillActorLeaf has already killed the actor cgroup leaf,
+	// or on a pre-run sweep when no prior sandbox directory existed on disk).
+	SkipOrphanScan bool
+	// BaseDirs overrides the default sandbox state directories when non-empty
+	// (used by unit tests and benchmarks).
+	BaseDirs []string
+}
+
+// DefaultCleanupOptions returns the default CleanupOptions honoring
+// ATEWORKER_MICROVM_FAST_SANDBOX_CLEANUP / ATEOM_MICROVM_FAST_SANDBOX_CLEANUP.
+func DefaultCleanupOptions() CleanupOptions {
+	fast := FastSandboxCleanupEnabled()
+	return CleanupOptions{
+		SkipIfDirsAbsent: fast,
+	}
+}
 
 // CleanupSandboxState removes leftover host-side state for a sandbox id (the
 // virtio-fs shared sandbox dir and the per-VM runtime dir), lazily unmounting
@@ -48,10 +98,62 @@ import (
 // next sweep (the stagers tolerate a leftover dir — they unmount stale binds
 // and reuse mountpoints).
 func CleanupSandboxState(ctx context.Context, id string) {
-	dirs := []string{
-		filepath.Join("/run/kata-containers/shared/sandboxes", id),
-		filepath.Join(vcVMDir, id),
+	CleanupSandboxStateOpts(ctx, id, DefaultCleanupOptions())
+}
+
+// CleanupSandboxStateOpts removes leftover host-side state for a sandbox id
+// using the provided CleanupOptions.
+func CleanupSandboxStateOpts(ctx context.Context, id string, opts CleanupOptions) {
+	dirs := opts.BaseDirs
+	if len(dirs) == 0 {
+		dirs = []string{
+			filepath.Join("/run/kata-containers/shared/sandboxes", id),
+			filepath.Join(vcVMDir, id),
+		}
 	}
+
+	activeDirs := dirs
+	if opts.SkipIfDirsAbsent {
+		activeDirs = make([]string, 0, len(dirs))
+		for _, d := range dirs {
+			if _, err := os.Stat(d); err == nil || !errors.Is(err, os.ErrNotExist) {
+				activeDirs = append(activeDirs, d)
+			}
+		}
+	}
+
+	if len(activeDirs) > 0 {
+		if opts.SkipIfDirsAbsent {
+			// Fast path: use imagecache.UnmountAllUnder (which uses statx MNT_ID
+			// before falling back to mountinfo) on each existing sandbox dir.
+			for _, d := range activeDirs {
+				if err := imagecache.UnmountAllUnder(d); err != nil {
+					slog.WarnContext(ctx, "Leaving sandbox dir in place: mounts under it were not all detached",
+						slog.String("dir", d), slog.Any("err", err))
+					continue
+				}
+				if err := os.RemoveAll(d); err != nil {
+					slog.WarnContext(ctx, "Failed to remove leftover sandbox dir",
+						slog.String("dir", d), slog.Any("err", err))
+				}
+			}
+		} else {
+			unmountAndRemoveLegacy(ctx, activeDirs)
+		}
+	}
+
+	if opts.SkipOrphanScan {
+		return
+	}
+	if opts.SkipIfDirsAbsent && len(activeDirs) == 0 {
+		// Neither sandbox state dir existed on disk, so no prior sandbox
+		// execution left behind orphaned sockets/processes for this id.
+		return
+	}
+	killOrphanedSandboxProcesses(ctx, id)
+}
+
+func unmountAndRemoveLegacy(ctx context.Context, dirs []string) {
 	removable := make(map[string]bool, len(dirs))
 	if b, err := os.ReadFile("/proc/self/mountinfo"); err != nil {
 		// Without the mount table there is no telling what is still mounted
@@ -98,6 +200,9 @@ func CleanupSandboxState(ctx context.Context, id string) {
 				slog.String("dir", d), slog.Any("err", err))
 		}
 	}
+}
+
+func killOrphanedSandboxProcesses(ctx context.Context, id string) {
 	// Kill orphaned per-sandbox processes (cloud-hypervisor / virtiofsd) left by
 	// a prior killed attempt: a canceled Create leaves the CH it spawned running
 	// (reparented to the init) holding guest RAM and stale sockets. Matched strictly by
