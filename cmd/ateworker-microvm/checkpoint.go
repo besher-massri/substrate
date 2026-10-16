@@ -157,6 +157,7 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 
 	tPause := time.Now()
 	dPrep = tPause.Sub(tStart)
+	s.raiseActorWeightForTeardown(ctx, actorUID)
 	pauseErr := client.Pause(ctx)
 	dPause = time.Since(tPause)
 	if pauseErr != nil {
@@ -342,6 +343,7 @@ func (s *AteWorkerService) teardownActor(ctx context.Context, id string, actorDi
 	// FAILED_PRECONDITION path ("no numbers right now") instead of surfacing a
 	// closed connection as a failed read.
 	s.setGuestStats(id, nil)
+	s.raiseActorWeightForTeardown(ctx, id)
 
 	var errs []error
 	if client != nil {

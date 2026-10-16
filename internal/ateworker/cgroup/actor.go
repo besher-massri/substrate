@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,12 @@ const (
 	cpuPeriodUS = 100000
 	// cpuMinQuotaUS is the smallest quota the kernel accepts.
 	cpuMinQuotaUS = 1000
+
+	// MinCPUWeight, DefaultCPUWeight, and MaxCPUWeight are the cgroup v2
+	// cpu.weight bounds and kernel default.
+	MinCPUWeight     = 1
+	DefaultCPUWeight = 100
+	MaxCPUWeight     = 10000
 )
 
 // ActorLeaf is a cgroup of its own for one actor's host processes, so actors on
@@ -103,6 +110,89 @@ func (l *ActorLeaf) Close() error {
 		return nil
 	}
 	return l.dir.Close()
+}
+
+// SetCPULimit updates the leaf's cpu.max to milliCPU (0 removes the cap). A
+// nil leaf or a node without the cpu controller is a no-op.
+func (l *ActorLeaf) SetCPULimit(milliCPU int64) error {
+	if l == nil {
+		return nil
+	}
+	path := filepath.Join(l.dir.Name(), "cpu.max")
+	if err := writeExisting(path, cpuMax(milliCPU)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("while setting cpu.max on %q: %w", l.dir.Name(), err)
+	}
+	return nil
+}
+
+// SetCPUWeight sets the leaf's cgroup v2 cpu.weight (1–10000; default 100),
+// which sets its proportional share when contending for CPU without capping it
+// when cores are idle. A nil leaf, a zero weight, or a node without the cpu
+// controller is a no-op.
+func (l *ActorLeaf) SetCPUWeight(weight int) error {
+	if l == nil || weight == 0 {
+		return nil
+	}
+	return setCPUWeight(l.dir.Name(), weight)
+}
+
+// SetWorkerCPUWeight sets cpu.weight on the worker's own leaf (/sys/fs/cgroup/worker).
+func SetWorkerCPUWeight(weight int) error {
+	if weight == 0 {
+		return nil
+	}
+	return setCPUWeight(filepath.Join(Root, workerLeaf), weight)
+}
+
+// SetActorLeafCPUWeight sets cpu.weight on the named actor leaf under Root,
+// without opening it. Missing leaf or missing cpu.weight is a no-op.
+func SetActorLeafCPUWeight(actorUID string, weight int) error {
+	return SetActorLeafCPUWeightUnder(Root, actorUID, weight)
+}
+
+// SetActorLeafCPUWeightUnder is SetActorLeafCPUWeight for a leaf under root.
+func SetActorLeafCPUWeightUnder(root, actorUID string, weight int) error {
+	if weight == 0 {
+		return nil
+	}
+	path, err := actorLeafPath(root, actorUID)
+	if err != nil {
+		return err
+	}
+	return setCPUWeight(path, weight)
+}
+
+// SetActorLeafCPULimit sets cpu.max on the named actor leaf under Root.
+func SetActorLeafCPULimit(actorUID string, milliCPU int64) error {
+	return SetActorLeafCPULimitUnder(Root, actorUID, milliCPU)
+}
+
+// SetActorLeafCPULimitUnder sets cpu.max on the named actor leaf under root.
+func SetActorLeafCPULimitUnder(root, actorUID string, milliCPU int64) error {
+	path, err := actorLeafPath(root, actorUID)
+	if err != nil {
+		return err
+	}
+	if err := writeExisting(filepath.Join(path, "cpu.max"), cpuMax(milliCPU)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("while setting cpu.max on %q: %w", path, err)
+	}
+	return nil
+}
+
+// SetCPUWeight is an alias for SetActorLeafCPUWeight(actorID, weight).
+func SetCPUWeight(actorUID string, weight int) error {
+	return SetActorLeafCPUWeight(actorUID, weight)
+}
+
+func setCPUWeight(cgroupDir string, weight int) error {
+	if weight < MinCPUWeight || weight > MaxCPUWeight {
+		return fmt.Errorf("cpu.weight %d out of range [%d, %d]", weight, MinCPUWeight, MaxCPUWeight)
+	}
+	path := filepath.Join(cgroupDir, "cpu.weight")
+	if err := writeExisting(path, strconv.Itoa(weight)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("while setting cpu.weight on %q: %w", cgroupDir, err)
+	}
+	return nil
 }
 
 // KillActorLeaf kills every process in the named leaf, including any they

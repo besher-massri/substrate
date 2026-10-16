@@ -238,3 +238,26 @@ func processUserCPUTime(t *testing.T) time.Duration {
 	}
 	return time.Duration(ru.Utime.Sec)*time.Second + time.Duration(ru.Utime.Usec)*time.Microsecond
 }
+
+func TestDefaultCPULoadCycleAndEnvOverride(t *testing.T) {
+	if got := DefaultCPULoadCycle(); got != 200*time.Millisecond {
+		t.Fatalf("DefaultCPULoadCycle() default = %v, want 200ms", got)
+	}
+	t.Setenv(EnvGluttonCPUBurnSliceMS, "50")
+	if got := DefaultCPULoadCycle(); got != 50*time.Millisecond {
+		t.Fatalf("DefaultCPULoadCycle() with GLUTTON_CPU_BURN_SLICE_MS=50 = %v, want 50ms", got)
+	}
+	t.Setenv(EnvGluttonCPUBurnSliceMS, "invalid")
+	if got := DefaultCPULoadCycle(); got != 200*time.Millisecond {
+		t.Fatalf("DefaultCPULoadCycle() with invalid env = %v, want 200ms fallback", got)
+	}
+}
+
+func BenchmarkDefaultCPULoadCycle(b *testing.B) {
+	b.Setenv(EnvGluttonCPUBurnSliceMS, "200")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = DefaultCPULoadCycle()
+	}
+}
