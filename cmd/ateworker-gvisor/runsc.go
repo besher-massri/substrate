@@ -24,13 +24,122 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"go.ate.dev/substrate/internal/ocispec"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/sizing"
 )
+
+const (
+	// defaultOverlay2Config is the default runsc --overlay2 configuration for
+	// sandbox creation, start, and restore. Using a memory-backed root overlay
+	// keeps container rootfs upper layers inside sentry memory across
+	// checkpoint/restore cycles instead of referencing per-sandbox host-backed
+	// filestore files (which breaks multi-container warm restores).
+	defaultOverlay2Config = "root:memory"
+
+	// envGVisorOverlay2 overrides the runsc --overlay2 configuration (e.g.
+	// "root:memory", "all:memory", or "none" to disable).
+	envGVisorOverlay2       = "ATEWORKER_GVISOR_OVERLAY2"
+	envLegacyGVisorOverlay2 = "ATEOM_GVISOR_OVERLAY2"
+
+	// wakeupLivenessCheckDelay is the post-restore liveness verification delay
+	// before spawning background `runsc wait` checks on restored containers.
+	// Fast restores (<250ms) spawn zero extra subprocesses while a container
+	// that exits immediately after restore fails fast in ~250ms instead of 30s.
+	wakeupLivenessCheckDelay = 250 * time.Millisecond
+
+	// minUncompressedAppPagesBytes is the minimum size of an uncompressed
+	// `pages.img` file when at least one application subcontainer is running
+	// alongside `/pause` (an empty `/pause`-only sandbox writes 21 pages =
+	// 86,016 bytes).
+	minUncompressedAppPagesBytes int64 = 128 * 1024
+	// minCompressedAppPagesBytes is the minimum size of a zstd-compressed
+	// `pages.img.zstd` file when at least one application subcontainer is
+	// running alongside `/pause`.
+	minCompressedAppPagesBytes int64 = 32 * 1024
+)
+
+// overlay2EnvOverride inspects ATEWORKER_GVISOR_OVERLAY2 (falling back to
+// ATEOM_GVISOR_OVERLAY2). It returns whether an override was set, whether
+// overlay2 was explicitly disabled ("none"/"off"/"false"), and the normalized
+// "--overlay2=<val>" flag when enabled.
+func overlay2EnvOverride() (flag string, disabled bool, set bool) {
+	raw := strings.TrimSpace(os.Getenv(envGVisorOverlay2))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv(envLegacyGVisorOverlay2))
+	}
+	if raw == "" {
+		return "", false, false
+	}
+	switch strings.ToLower(raw) {
+	case "none", "off", "false", "disabled", "0":
+		return "", true, true
+	}
+	if strings.HasPrefix(raw, "--overlay2=") || strings.HasPrefix(raw, "-overlay2=") {
+		return raw, false, true
+	}
+	return "--overlay2=" + raw, false, true
+}
+
+// overlay2Flag returns the effective runsc --overlay2 global flag, defaulting
+// to "--overlay2=root:memory" unless overridden or disabled via environment.
+func overlay2Flag() string {
+	if flag, disabled, set := overlay2EnvOverride(); set {
+		if disabled {
+			return ""
+		}
+		return flag
+	}
+	return "--overlay2=" + defaultOverlay2Config
+}
+
+func isOverlay2Command(command string) bool {
+	switch command {
+	case "create", "start", "restore":
+		return true
+	default:
+		return false
+	}
+}
+
+func isOverlay2Arg(arg string) bool {
+	return strings.HasPrefix(arg, "--overlay2=") || strings.HasPrefix(arg, "-overlay2=") ||
+		arg == "--overlay2" || arg == "-overlay2"
+}
+
+// applyOverlay2Flag applies any ATEWORKER_GVISOR_OVERLAY2 / ATEOM_GVISOR_OVERLAY2
+// environment override to globalFlags for create, start, and restore commands.
+func applyOverlay2Flag(command string, globalFlags []string) []string {
+	if !isOverlay2Command(command) {
+		return globalFlags
+	}
+	flag, disabled, set := overlay2EnvOverride()
+	if !set {
+		return globalFlags
+	}
+	filtered := make([]string, 0, len(globalFlags)+1)
+	for i := 0; i < len(globalFlags); i++ {
+		arg := globalFlags[i]
+		if (arg == "--overlay2" || arg == "-overlay2") && i+1 < len(globalFlags) {
+			i++
+			continue
+		}
+		if isOverlay2Arg(arg) {
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	if !disabled && flag != "" {
+		filtered = append(filtered, flag)
+	}
+	return filtered
+}
 
 type runsc struct {
 	path     string
@@ -53,7 +162,7 @@ type runsc struct {
 //	<combined globalFlags> -root <stateDir> <command> <subcommandFlags> <extraArgs> [<containerName>]
 func (r *runsc) buildArgs(command, containerName string, extraArgs ...string) []string {
 	cfg := r.flags.get()
-	globalFlags := cfg.globalFlags(command)
+	globalFlags := applyOverlay2Flag(command, cfg.globalFlags(command))
 	subcommandFlags := cfg.subcommandFlags(command)
 
 	args := make([]string, 0,
@@ -322,4 +431,112 @@ func (r *runsc) cmdWaitRestore(ctx context.Context, containerName string) error 
 // `--fs-restore-image-path` completes for the given container.
 func (r *runsc) cmdWaitFSRestore(ctx context.Context, containerName string) error {
 	return r.runWait(ctx, containerName, "-fsrestore")
+}
+
+// containerWaiter is the slice of *runsc used to verify container liveness
+// after restore.
+type containerWaiter interface {
+	cmdWait(ctx context.Context, containerName string) error
+}
+
+// verifyMemoryCheckpointPages fails fast when a MEMORY checkpoint directory for
+// an actor with application containers contains only `/pause` pages because an
+// application container exited before `runsc checkpoint`.
+func verifyMemoryCheckpointPages(checkpointDir string, appContainers int) error {
+	if appContainers <= 0 || checkpointDir == "" {
+		return nil
+	}
+	if info, err := os.Stat(filepath.Join(checkpointDir, "pages.img")); err == nil {
+		if info.Size() <= minUncompressedAppPagesBytes {
+			return fmt.Errorf("application container exited before memory checkpoint: %s/pages.img is only %d bytes (<= %d bytes pause-only threshold)",
+				checkpointDir, info.Size(), minUncompressedAppPagesBytes)
+		}
+		return nil
+	}
+	if info, err := os.Stat(filepath.Join(checkpointDir, "pages.img.zstd")); err == nil {
+		if info.Size() <= minCompressedAppPagesBytes {
+			return fmt.Errorf("application container exited before memory checkpoint: %s/pages.img.zstd is only %d bytes (<= %d bytes pause-only threshold)",
+				checkpointDir, info.Size(), minCompressedAppPagesBytes)
+		}
+		return nil
+	}
+	return nil
+}
+
+// verifyContainersRunning checks that none of the restored containers exit
+// within window (e.g. 250ms). A container whose `cmdWait` remains blocked until
+// window elapses is still running; a container whose `cmdWait` returns before
+// window elapses has exited or failed to restore.
+func verifyContainersRunning(ctx context.Context, waiter containerWaiter, containers []*ateworkerpb.Container, window time.Duration) error {
+	if waiter == nil || len(containers) == 0 || window <= 0 {
+		return nil
+	}
+	return waitForWakeupProbesWithLiveness(ctx, waiter, containers, 0, func(probeCtx context.Context) error {
+		timer := time.NewTimer(window)
+		defer timer.Stop()
+		select {
+		case <-probeCtx.Done():
+			return probeCtx.Err()
+		case <-timer.C:
+			return nil
+		}
+	})
+}
+
+// waitForWakeupProbesWithLiveness runs probeWait while guarding against
+// application containers that exit or fail to start after restore. After delay
+// (default 250ms), it launches background `cmdWait` checks on each container
+// and cancels probeWait immediately if any container exits before probeWait
+// succeeds.
+func waitForWakeupProbesWithLiveness(
+	ctx context.Context,
+	waiter containerWaiter,
+	containers []*ateworkerpb.Container,
+	delay time.Duration,
+	probeWait func(context.Context) error,
+) error {
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var exitedErr error
+	var exitedOnce sync.Once
+	if waiter != nil && len(containers) > 0 {
+		go func() {
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-probeCtx.Done():
+					return
+				case <-timer.C:
+				}
+			}
+			for _, ac := range containers {
+				name := ac.GetName()
+				if name == "" {
+					continue
+				}
+				go func(containerName string) {
+					err := waiter.cmdWait(probeCtx, containerName)
+					if probeCtx.Err() != nil {
+						return
+					}
+					exitedOnce.Do(func() {
+						if err != nil {
+							exitedErr = fmt.Errorf("application container %q not running during wakeup probe: %w", containerName, err)
+						} else {
+							exitedErr = fmt.Errorf("application container %q exited before wakeup probe succeeded", containerName)
+						}
+						cancel()
+					})
+				}(name)
+			}
+		}()
+	}
+
+	err := probeWait(probeCtx)
+	if exitedErr != nil {
+		return exitedErr
+	}
+	return err
 }
