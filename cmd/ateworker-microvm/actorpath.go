@@ -95,6 +95,23 @@ func goldenBaseMemoryRangesPath(baseID string) string {
 	return filepath.Join(ateRoot, "golden-base-cache", baseID, "memory-ranges")
 }
 
+// goldenBaseMemoryRangesPathForDir resolves the golden base memory-ranges path
+// relative to snapshotDir when snapshotDir sits under <ateRoot>/actors/<uid>/...,
+// falling back to goldenBaseMemoryRangesPath(baseID).
+func goldenBaseMemoryRangesPathForDir(snapshotDir, baseID string) string {
+	clean := filepath.Clean(snapshotDir)
+	actorDir := filepath.Dir(clean)
+	actorsDir := filepath.Dir(actorDir)
+	if filepath.Base(actorsDir) == "actors" {
+		ateRoot := filepath.Dir(actorsDir)
+		candidate := filepath.Join(ateRoot, "golden-base-cache", baseID, "memory-ranges")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return goldenBaseMemoryRangesPath(baseID)
+}
+
 // ensureGoldenBaseCached atomically populates goldenBaseMemoryRangesPath(baseID)
 // from srcMemPath if it is not already present on this node.
 func ensureGoldenBaseCached(ctx context.Context, baseID, srcMemPath string) error {
@@ -103,6 +120,9 @@ func ensureGoldenBaseCached(ctx context.Context, baseID, srcMemPath string) erro
 	}
 	dstPath := goldenBaseMemoryRangesPath(baseID)
 	if fi, err := os.Stat(dstPath); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+		if tmpfsSlotsEnabled() {
+			maybePrewarmGoldenSlots(dstPath)
+		}
 		return nil
 	}
 	srcFi, err := os.Stat(srcMemPath)
@@ -124,6 +144,9 @@ func ensureGoldenBaseCached(ctx context.Context, baseID, srcMemPath string) erro
 	if err := os.Rename(tmpPath, dstPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
+	}
+	if tmpfsSlotsEnabled() {
+		maybePrewarmGoldenSlots(dstPath)
 	}
 	return nil
 }
