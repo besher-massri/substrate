@@ -83,15 +83,13 @@ type randomDevReseeder interface {
 
 const (
 	// reseedMaxAttempts is the total number of ReseedRandomDev RPC attempts
-	// (1 initial + 2 retries) before failing the restore. Under bursty
+	// (1 initial + 4 retries) before failing the restore. Under bursty
 	// nested-virtualization restore load, a freshly unpaused guest vCPU can
 	// briefly stall in host KVM scheduling before kata-agent services the
 	// vsock stream, even after dialAgentRetry has connected.
-	reseedMaxAttempts = 3
-	// reseedAttemptTimeout bounds a single ReseedRandomDev RPC attempt. A
-	// per-attempt deadline cancels the ttrpc request stream without closing
-	// the underlying vsock connection, so the next attempt can reuse ac.
-	reseedAttemptTimeout = 5 * time.Second
+	reseedMaxAttempts = 5
+	// reseedAttemptTimeout bounds a single ReseedRandomDev RPC attempt.
+	reseedAttemptTimeout = 1500 * time.Millisecond
 	// reseedBackoff is the pause between failed ReseedRandomDev attempts.
 	reseedBackoff = 100 * time.Millisecond
 )
@@ -150,8 +148,68 @@ func reseedGuestCRNG(ctx context.Context, ac randomDevReseeder) error {
 	return fmt.Errorf("after %d attempt(s): %w", reseedMaxAttempts, lastErr)
 }
 
+// dialAndReseedGuestCRNG dials kata-agent over hybrid-vsock and reseeds the
+// guest CRNG, re-dialing a fresh vsock connection if a ReseedRandomDev stream
+// stalls on the initial connection after VM resume.
+func dialAndReseedGuestCRNG(ctx context.Context, vsockPath string) (*kata.AgentClient, error) {
+	nonce, err := newReseedNonce()
+	if err != nil {
+		return nil, err
+	}
+	ac, err := dialAgentRetry(ctx, vsockPath, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("while dialing kata-agent after resume: %w", err)
+	}
+	attemptTimeout := reseedAttemptTimeoutForRestore()
+	var lastErr error
+	for attempt := 1; attempt <= reseedMaxAttempts; attempt++ {
+		rctx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		lastErr = ac.ReseedRandomDev(rctx, nonce)
+		cancel()
+		if lastErr == nil {
+			if attempt > 1 {
+				slog.InfoContext(ctx, "ReseedRandomDev succeeded after retry",
+					slog.Int("attempt", attempt))
+			}
+			return ac, nil
+		}
+		_ = ac.Close()
+		ac = nil
+		if ctx.Err() != nil {
+			break
+		}
+		slog.WarnContext(ctx, "ReseedRandomDev attempt failed; re-dialing kata-agent",
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", reseedMaxAttempts),
+			slog.Any("err", lastErr))
+		if attempt < reseedMaxAttempts {
+			timer := time.NewTimer(reseedBackoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, fmt.Errorf("while reseeding guest CRNG: after %d attempt(s): %w (last error: %w)", attempt, ctx.Err(), lastErr)
+			case <-timer.C:
+			}
+			newAC, dialErr := dialAgentRetry(ctx, vsockPath, 10*time.Second)
+			if dialErr != nil {
+				lastErr = dialErr
+				break
+			}
+			ac = newAC
+		}
+	}
+	if ac != nil {
+		_ = ac.Close()
+	}
+	return nil, fmt.Errorf("while reseeding guest CRNG: after %d attempt(s): %w", reseedMaxAttempts, lastErr)
+}
+
 func parallelPrepEnabled() bool {
 	return microvmEnvBool("PARALLEL_PREP")
+}
+
+func parallelWakeupEnabled() bool {
+	return microvmEnvBool("PARALLEL_WAKEUP") || microvmEnv("WAKEUP_POLL_MS") != "" || parallelPrepEnabled()
 }
 
 func earlyVMMLaunchEnabled() bool {
@@ -277,6 +335,47 @@ func (s *AteWorkerService) reconstructDeltaIfNeeded(ctx context.Context, actorUI
 		slog.String("base_id", baseID),
 		slog.Duration("merge", time.Since(tMerge)))
 	return targetDir, false, nil
+}
+
+// reconstructDeltaWithSlot reconstructs a differential snapshot using the
+// golden slot pool when enabled, returning the active slot lease (if any).
+func (s *AteWorkerService) reconstructDeltaWithSlot(ctx context.Context, actorUID, baseID, restoreDir string, preserveRestoreDir bool) (vmmRestoreDir string, vmmPreserveRestoreDir bool, lease *goldenSlotLease, err error) {
+	if !isDeltaSnapshot(restoreDir) || slotPoolDisabled() || (!tmpfsSlotsEnabled() && goldenTmpfsRoot == "") {
+		dir, pres, rerr := s.reconstructDeltaIfNeeded(ctx, actorUID, baseID, restoreDir, preserveRestoreDir)
+		return dir, pres, nil, rerr
+	}
+
+	goldenBaseMemPath := goldenBaseMemoryRangesPathForDir(restoreDir, baseID)
+	if _, serr := os.Stat(goldenBaseMemPath); serr != nil {
+		return "", false, nil, fmt.Errorf("golden base %s missing for differential restore of %s: %w", goldenBaseMemPath, actorUID, serr)
+	}
+
+	tMerge := time.Now()
+	outMemPath := filepath.Join(restoreDir, "memory-ranges")
+	metaPath := filepath.Join(restoreDir, memoryRangesDiffMetaFile)
+	dataPath := filepath.Join(restoreDir, memoryRangesDiffDataFile)
+	if _, merr := os.Stat(metaPath); merr == nil {
+		lease, err = acquireGoldenSlotCompact(ctx, goldenBaseMemPath, metaPath, dataPath, outMemPath)
+		if err != nil {
+			return "", false, nil, fmt.Errorf("while reconstructing compact delta into golden slot: %w", err)
+		}
+		if !preserveRestoreDir {
+			_ = os.Remove(metaPath)
+			_ = os.Remove(dataPath)
+			_ = os.Remove(filepath.Join(restoreDir, goldenDeltaMarkerFile))
+		}
+	} else {
+		deltaMemPath := filepath.Join(restoreDir, "memory-ranges")
+		lease, err = acquireGoldenSlot(ctx, goldenBaseMemPath, deltaMemPath, outMemPath)
+		if err != nil {
+			return "", false, nil, fmt.Errorf("while reconstructing sparse delta into golden slot: %w", err)
+		}
+	}
+	slog.InfoContext(ctx, "Reconstructed warm snapshot from golden base slot",
+		slog.String("id", actorUID),
+		slog.String("base_id", baseID),
+		slog.Duration("reconstruct", time.Since(tMerge)))
+	return restoreDir, preserveRestoreDir, lease, nil
 }
 
 // readaheadSparseMemoryRanges issues 128 KiB POSIX_FADV_WILLNEED calls across
@@ -465,6 +564,13 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 // caller from their tar.
 func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBootParams, scope ateworkerpb.SnapshotFidelity, restoreDir string, preserveRestoreDir bool, tStart time.Time) (retErr error) {
 	actorUID := p.actorUID
+	var zc *zeroCopyRestore
+	defer func() {
+		if retErr != nil && zc != nil {
+			zc.abandon(context.WithoutCancel(ctx), actorUID)
+		}
+	}()
+
 	// Checked before anything is prepared or cleaned up: the snapshot's
 	// kernel and guest image paths are repointed at these below.
 	kernel, image := p.assetPaths[assetKernel], p.assetPaths[assetImage]
@@ -483,6 +589,28 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	var egress *tunnel.ActorEgress
 	vmmRestoreDir := restoreDir
 	vmmPreserveRestoreDir := preserveRestoreDir
+	var slotLease *goldenSlotLease
+	defer func() {
+		if slotLease != nil {
+			slotLease.abort()
+		}
+	}()
+
+	type reconstructResult struct {
+		dir      string
+		preserve bool
+		lease    *goldenSlotLease
+		err      error
+	}
+	var reconstructDone chan reconstructResult
+	reconstructJoined := false
+	defer func() {
+		if reconstructDone != nil && !reconstructJoined {
+			if res := <-reconstructDone; res.lease != nil {
+				res.lease.abort()
+			}
+		}
+	}()
 
 	if parallelPrepEnabled() {
 		var prepGroup errgroup.Group
@@ -498,20 +626,28 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 			}
 			return nil
 		})
-		prepGroup.Go(func() error {
-			var err error
-			vmmRestoreDir, vmmPreserveRestoreDir, err = s.reconstructDeltaIfNeeded(ctx, actorUID, srcID, restoreDir, preserveRestoreDir)
-			if err != nil {
-				return err
-			}
-			if err := rewriteSnapshotPaths(vmmRestoreDir, actorUID, kernel, image); err != nil {
-				return fmt.Errorf("while rewriting snapshot paths: %w", err)
-			}
-			return nil
-		})
 		if err := prepGroup.Wait(); err != nil {
 			return err
 		}
+		reconstructDone = make(chan reconstructResult, 1)
+		go func() {
+			dir, pres, lease, rerr := s.reconstructDeltaWithSlot(ctx, actorUID, srcID, restoreDir, preserveRestoreDir)
+			if rerr != nil {
+				reconstructDone <- reconstructResult{err: rerr}
+				return
+			}
+			if err := rewriteSnapshotPaths(dir, actorUID, kernel, image); err != nil {
+				if lease != nil {
+					lease.abort()
+				}
+				reconstructDone <- reconstructResult{err: fmt.Errorf("while rewriting snapshot paths: %w", err)}
+				return
+			}
+			if restoreReadaheadEnabled() && lease == nil {
+				go readaheadSparseMemoryRanges(filepath.Join(dir, "memory-ranges"))
+			}
+			reconstructDone <- reconstructResult{dir: dir, preserve: pres, lease: lease}
+		}()
 	} else {
 		var err error
 		egress, err = s.tunnel.PrepareEgress(ctx, p.attribution(), p.egressGateway)
@@ -519,7 +655,7 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 			return err
 		}
 		s.cleanupSandboxState(ctx, actorUID)
-		vmmRestoreDir, vmmPreserveRestoreDir, err = s.reconstructDeltaIfNeeded(ctx, actorUID, srcID, restoreDir, preserveRestoreDir)
+		vmmRestoreDir, vmmPreserveRestoreDir, slotLease, err = s.reconstructDeltaWithSlot(ctx, actorUID, srcID, restoreDir, preserveRestoreDir)
 		if err != nil {
 			return err
 		}
@@ -532,54 +668,11 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 		if err := os.MkdirAll(kata.VMDir(actorUID), 0o700); err != nil {
 			return fmt.Errorf("while creating VM dir: %w", err)
 		}
+		if restoreReadaheadEnabled() && slotLease == nil {
+			go readaheadSparseMemoryRanges(filepath.Join(vmmRestoreDir, "memory-ranges"))
+		}
 	}
 	tPrep := time.Now()
-
-	if restoreReadaheadEnabled() {
-		go readaheadSparseMemoryRanges(filepath.Join(vmmRestoreDir, "memory-ranges"))
-	}
-
-	// MEMORY snapshots carry each container's upper as a tar (rootfsUpperTarFile).
-	// Start re-materializing the upper contents NOW, in the background: the
-	// untar scales with the actor's data and is joined right before the host
-	// overlay mounts need it, so it hides behind the bundle preparation below.
-	//
-	// An error return between here and the join MUST drain the goroutine (the
-	// deferred receive below): returning with the untar still writing would let
-	// a retried restore's own untar race it inside the same directory.
-	untarDone := make(chan error, 1)
-	untarJoined := false
-	go func() {
-		untarDone <- untarRootfsUpper(rootfsUpperDir(p.actorDirs), restoreDir, containerNames(p.containers))
-	}()
-	defer func() {
-		if !untarJoined {
-			<-untarDone
-		}
-	}()
-
-	// Reconstruct each container's rootfs at the frozen find-paths location
-	// SharedDir(id)/<cid>/rootfs from the LOCAL OCI bundle (atelet re-unpacked
-	// the golden image) and start the one virtiofsd serving the tree. The fs
-	// sockets in the snapshot config are repointed to this VMDir by
-	// rewriteSnapshotPaths above. Cross-node consistency relies on a
-	// deterministic unpack of the same image at the same <cid>/rootfs path
-	// (plus, for merged rootfs, the upper re-materialized from the tar).
-	containers := p.containers
-	ctrs, err := s.buildActorContainers(p.actorUID, p.actorDirs, containers)
-	if err != nil {
-		return err
-	}
-	tBundles := time.Now()
-	// The overlay mounts need the upper on disk: join the background untar (still
-	// overlapped with the bundle preparation above), then assemble the merged trees
-	// and serve them.
-	untarErr := <-untarDone
-	untarJoined = true
-	if untarErr != nil {
-		return untarErr
-	}
-	tUpper := time.Now()
 
 	leafSize := p.size
 	boostEnabled, boostMilli := activationCPUBoostConfig()
@@ -637,6 +730,48 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 		}
 	}()
 
+	// MEMORY snapshots carry each container's upper as a tar (rootfsUpperTarFile).
+	// Start re-materializing the upper contents NOW, in the background: the
+	// untar scales with the actor's data and is joined right before the host
+	// overlay mounts need it, so it hides behind the bundle preparation below.
+	//
+	// An error return between here and the join MUST drain the goroutine (the
+	// deferred receive below): returning with the untar still writing would let
+	// a retried restore's own untar race it inside the same directory.
+	untarDone := make(chan error, 1)
+	untarJoined := false
+	go func() {
+		untarDone <- untarRootfsUpper(rootfsUpperDir(p.actorDirs), restoreDir, containerNames(p.containers))
+	}()
+	defer func() {
+		if !untarJoined {
+			<-untarDone
+		}
+	}()
+
+	// Reconstruct each container's rootfs at the frozen find-paths location
+	// SharedDir(id)/<cid>/rootfs from the LOCAL OCI bundle (atelet re-unpacked
+	// the golden image) and start the one virtiofsd serving the tree. The fs
+	// sockets in the snapshot config are repointed to this VMDir by
+	// rewriteSnapshotPaths above. Cross-node consistency relies on a
+	// deterministic unpack of the same image at the same <cid>/rootfs path
+	// (plus, for merged rootfs, the upper re-materialized from the tar).
+	containers := p.containers
+	ctrs, err := s.buildActorContainers(p.actorUID, p.actorDirs, containers)
+	if err != nil {
+		return err
+	}
+	tBundles := time.Now()
+	// The overlay mounts need the upper on disk: join the background untar (still
+	// overlapped with the bundle preparation above), then assemble the merged trees
+	// and serve them.
+	untarErr := <-untarDone
+	untarJoined = true
+	if untarErr != nil {
+		return untarErr
+	}
+	tUpper := time.Now()
+
 	// Networking: rebuild the actor's namespace; the snapshot's virtio-net is
 	// fd-backed, so CH needs fresh tap FDs (net_fds) on restore. The caller
 	// unhosts on failure, once the defers here have stopped the actor's
@@ -664,7 +799,7 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 		}
 	}()
 	buildTaps := func() error {
-		netDevs, nerr := ch.SnapshotNetDevices(vmmRestoreDir)
+		netDevs, nerr := ch.SnapshotNetDevices(restoreDir)
 		if nerr != nil {
 			return fmt.Errorf("while reading snapshot net devices: %w", nerr)
 		}
@@ -735,6 +870,15 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	if err != nil {
 		return fmt.Errorf("while launching VMM for restore: %w", err)
 	}
+	if reconstructDone != nil {
+		recRes := <-reconstructDone
+		reconstructJoined = true
+		slotLease = recRes.lease
+		if recRes.err != nil {
+			return recRes.err
+		}
+		vmmRestoreDir, vmmPreserveRestoreDir = recRes.dir, recRes.preserve
+	}
 	// How guest RAM comes back depends on the VMM (see restoreMemMode), and the rest
 	// of the actor's lifecycle follows from that choice:
 	//
@@ -746,11 +890,33 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	//     source afterwards and nothing merges against it, so it is dropped below and
 	//     the next snapshot stands on its own.
 	tLaunch := time.Now()
+	if zeroCopyRestoreEnabled() {
+		var zerr error
+		zc, _, zerr = startZeroCopyRestore(ctx, actorUID, vmmRestoreDir, slotLease)
+		if zerr != nil {
+			return zerr
+		}
+	}
 	memMode := restoreMemMode(ctx, client.Info())
+	if zc != nil {
+		// Guest RAM is mapped from the slot: Copy mode finds nothing to copy.
+		memMode = ch.MemRestoreEager
+	}
 	slog.InfoContext(ctx, "restoring guest memory",
 		slog.String("mode", memMode), slog.String("vmm_version", client.Info().Version))
 	if err := client.RestoreWithNetFDs(ctx, vmmRestoreDir, restoredNets, memMode); err != nil {
 		return fmt.Errorf("while restoring VM with net FDs: %w", err)
+	}
+	if slotLease != nil {
+		if keepDelta := slotLease.commit(memMode == ch.MemRestoreEager, vmmPreserveRestoreDir); !keepDelta {
+			_ = os.Remove(filepath.Join(vmmRestoreDir, goldenDeltaMarkerFile))
+		}
+	}
+	if zc != nil && vmmPreserveRestoreDir {
+		if err := zc.revert(); err != nil {
+			slog.ErrorContext(ctx, "Could not revert preserved snapshot after zero-copy restore",
+				slog.String("id", actorUID), slog.String("dir", vmmRestoreDir), slog.Any("err", err))
+		}
 	}
 	tVMRestore := time.Now()
 	// An eager restore has read the whole snapshot into guest memory, and nothing
@@ -760,8 +926,10 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	//
 	// When the restore dir is not preserved, dropping ahead of Resume means a
 	// failure after this point costs a re-download of the snapshot on retry.
-	maybeDropStagedMemoryImage(ctx, vmmRestoreDir, memMode, vmmPreserveRestoreDir)
-	dropActorSnapshotCacheAsync(vmmRestoreDir, memMode == ch.MemRestoreEager)
+	if slotLease == nil {
+		maybeDropStagedMemoryImage(ctx, vmmRestoreDir, memMode, vmmPreserveRestoreDir)
+		dropActorSnapshotCacheAsync(vmmRestoreDir, memMode == ch.MemRestoreEager)
+	}
 	if err := client.Resume(ctx); err != nil {
 		return fmt.Errorf("while resuming restored guest: %w", err)
 	}
@@ -770,40 +938,44 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	// One kata-agent connection serves this whole activation: the CRNG reseed below,
 	// then log forwarding and guest stats. As on cold boot, not reaching the agent
 	// fails the restore. A failing restore closes the connection on its way out.
-	guestAC, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
-	if err != nil {
-		return fmt.Errorf("while dialing kata-agent after resume: %w", err)
-	}
+	var guestAC *kata.AgentClient
 	defer func() {
-		if retErr != nil {
+		if retErr != nil && guestAC != nil {
 			_ = guestAC.Close()
 		}
 	}()
-
-	// Reseed the guest CRNG before the workload gets far. A restored guest resumes with
-	// the entropy pool frozen in the snapshot, so every actor restored from one snapshot
-	// (golden cold-start, tag clones) would share an identical CRNG state and emit the
-	// same "random" values. Cloud Hypervisor has no VmGenID device to signal the guest,
-	// so we feed fresh per-restore entropy through the kata-agent's ReseedRandomDev, which
-	// mixes it into /dev/random and reseeds. A failed reseed fails the restore, since the
-	// actor would otherwise run with randomness it shares with its clones.
-	//
-	// The reseed runs just after Resume, so a workload that reads randomness in its first
-	// instants after resume can still see the frozen state. Fully closing that needs the
-	// workload frozen across the reseed, or a VMM VmGenID that acts before the vCPUs resume.
-	//
-	// TODO: switch to a Cloud Hypervisor VmGenID device once it exists. clh has no such
-	// device today; Firecracker and QEMU do. With one, the VMM changes the generation id
-	// and notifies the guest before unpausing the vCPUs, so a >=5.18 kernel reseeds its
-	// CRNG on its own with no host round-trip, no per-restore RPC, and no post-Resume
-	// race. At that point this agent-driven reseed can be dropped.
-	if err := reseedGuestCRNG(ctx, guestAC); err != nil {
-		return fmt.Errorf("while reseeding guest CRNG: %w", err)
+	dialAndReseed := func(ctx context.Context) error {
+		ac, err := dialAndReseedGuestCRNG(ctx, kata.VsockSocketPath(actorUID))
+		if err != nil {
+			return err
+		}
+		guestAC = ac
+		return nil
 	}
-
-	// Block until every wakeup-probe-enabled container reports 200.
-	if err := wakeupprobe.WaitAll(ctx, containers, actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
-		return fmt.Errorf("while waiting for container wakeup probe: %w", err)
+	waitProbes := func(ctx context.Context) error {
+		waitFn := wakeupprobe.WaitAll
+		if parallelWakeupEnabled() {
+			waitFn = wakeupprobe.WaitAllFast
+		}
+		if err := waitFn(ctx, containers, actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
+			return fmt.Errorf("while waiting for container wakeup probe: %w", err)
+		}
+		return nil
+	}
+	if parallelWakeupEnabled() {
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error { return dialAndReseed(gctx) })
+		g.Go(func() error { return waitProbes(gctx) })
+		if err := g.Wait(); err != nil {
+			return err
+		}
+	} else {
+		if err := dialAndReseed(ctx); err != nil {
+			return err
+		}
+		if err := waitProbes(ctx); err != nil {
+			return err
+		}
 	}
 	applySteadyCgroup()
 
@@ -851,6 +1023,10 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 		// shutdown with InvalidContainerId, so these must be what the guest runs.
 		workloadIDs: workloadIDs(ctrs),
 		guestAgent:  guestAC,
+	}
+	if zc != nil {
+		ra.memSlot, ra.memSlotDev, ra.memSlotIno = zc.slot, zc.slotDev, zc.slotIno
+		ra.memSlotBase, ra.origMemory = zc.slotBase, zc.origMemory
 	}
 
 	// Re-attach stdout/stderr forwarding for each container over the agent

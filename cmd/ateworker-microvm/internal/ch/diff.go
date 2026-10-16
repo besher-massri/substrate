@@ -156,6 +156,156 @@ func DeflateAgainstBase(ctx context.Context, baseFile, targetFile string) (punch
 	return punchedBytes, keptBytes, nil
 }
 
+// CreateSparseDeltaAgainstBase compares targetFile against baseFile at 4 KiB
+// page granularity without modifying targetFile, writing a sparse file at
+// outDeltaFile of the same logical size whose populated extents hold only the
+// pages where targetFile differs from baseFile (including pages that were
+// non-zero in baseFile and zeroed in targetFile).
+func CreateSparseDeltaAgainstBase(ctx context.Context, baseFile, targetFile, outDeltaFile string) (keptBytes int64, err error) {
+	baseF, err := os.Open(baseFile)
+	if err != nil {
+		return 0, fmt.Errorf("open base %s: %w", baseFile, err)
+	}
+	defer baseF.Close()
+
+	targetF, err := os.Open(targetFile)
+	if err != nil {
+		return 0, fmt.Errorf("open target %s: %w", targetFile, err)
+	}
+	defer targetF.Close()
+
+	baseFi, err := baseF.Stat()
+	if err != nil {
+		return 0, err
+	}
+	targetFi, err := targetF.Stat()
+	if err != nil {
+		return 0, err
+	}
+	size := targetFi.Size()
+	if baseFi.Size() != size {
+		return 0, fmt.Errorf("base/target size mismatch (%d vs %d)", baseFi.Size(), size)
+	}
+
+	tmpOut := outDeltaFile + ".delta.tmp"
+	_ = os.Remove(tmpOut)
+	outF, err := os.OpenFile(tmpOut, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return 0, fmt.Errorf("create sparse delta %s: %w", tmpOut, err)
+	}
+	defer func() {
+		if err != nil {
+			outF.Close()
+			_ = os.Remove(tmpOut)
+		}
+	}()
+	if err := outF.Truncate(size); err != nil {
+		return 0, fmt.Errorf("truncate sparse delta: %w", err)
+	}
+
+	baseFd := int(baseF.Fd())
+	targetFd := int(targetF.Fd())
+	outFd := int(outF.Fd())
+	baseBuf := make([]byte, diffChunkSize)
+	targetBuf := make([]byte, diffChunkSize)
+
+	nextExtent := func(fd int, from int64) (int64, int64, error) {
+		ds, serr := unix.Seek(fd, from, unix.SEEK_DATA)
+		if serr != nil {
+			if errors.Is(serr, unix.ENXIO) {
+				return size, size, nil
+			}
+			return 0, 0, serr
+		}
+		de, serr := unix.Seek(fd, ds, unix.SEEK_HOLE)
+		if serr != nil {
+			return 0, 0, serr
+		}
+		return ds, min(de, size), nil
+	}
+
+	for off := int64(0); off < size; {
+		if err := ctx.Err(); err != nil {
+			return keptBytes, err
+		}
+		tStart, tEnd, err := nextExtent(targetFd, off)
+		if err != nil {
+			return keptBytes, fmt.Errorf("seek target: %w", err)
+		}
+		bStart, bEnd, err := nextExtent(baseFd, off)
+		if err != nil {
+			return keptBytes, fmt.Errorf("seek base: %w", err)
+		}
+		dataStart := min(tStart, bStart)
+		if dataStart >= size {
+			break
+		}
+		var dataEnd int64
+		if tStart <= bStart {
+			dataEnd = tEnd
+			if bStart <= dataEnd && bEnd > dataEnd {
+				dataEnd = bEnd
+			}
+		} else {
+			dataEnd = bEnd
+			if tStart <= dataEnd && tEnd > dataEnd {
+				dataEnd = tEnd
+			}
+		}
+
+		for pos := dataStart; pos < dataEnd; {
+			if err := ctx.Err(); err != nil {
+				return keptBytes, err
+			}
+			n := diffChunkSize
+			if rem := dataEnd - pos; rem < n {
+				n = rem
+			}
+			if err := preadFull(targetFd, targetBuf[:n], pos); err != nil {
+				return keptBytes, fmt.Errorf("read target at %d: %w", pos, err)
+			}
+			if err := preadFull(baseFd, baseBuf[:n], pos); err != nil {
+				return keptBytes, fmt.Errorf("read base at %d: %w", pos, err)
+			}
+
+			runStart := int64(-1)
+			for p := int64(0); p < n; p += diffPageSize {
+				pLen := diffPageSize
+				if rem := n - p; rem < pLen {
+					pLen = rem
+				}
+				if !bytes.Equal(targetBuf[p:p+pLen], baseBuf[p:p+pLen]) {
+					if runStart < 0 {
+						runStart = p
+					}
+					keptBytes += pLen
+				} else if runStart >= 0 {
+					if err := pwriteFull(outFd, targetBuf[runStart:p], pos+runStart); err != nil {
+						return keptBytes, fmt.Errorf("write sparse delta at %d: %w", pos+runStart, err)
+					}
+					runStart = -1
+				}
+			}
+			if runStart >= 0 {
+				if err := pwriteFull(outFd, targetBuf[runStart:n], pos+runStart); err != nil {
+					return keptBytes, fmt.Errorf("write sparse delta at %d: %w", pos+runStart, err)
+				}
+			}
+			pos += n
+		}
+		off = dataEnd
+	}
+
+	if err := outF.Close(); err != nil {
+		return keptBytes, err
+	}
+	_ = os.Remove(outDeltaFile)
+	if err := os.Rename(tmpOut, outDeltaFile); err != nil {
+		return keptBytes, err
+	}
+	return keptBytes, nil
+}
+
 // CreateDeltaAgainstBase compares populated extents of targetFile against
 // baseFile at 4 KiB page granularity and writes only modified extents into
 // metaFile (ADIF v1 header + extent table) and dataFile (contiguous dirty-page
