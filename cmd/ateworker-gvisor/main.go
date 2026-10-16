@@ -704,8 +704,11 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		}
 	}
 
-	// Block until every wakeup-probe-enabled container reports 200.
-	if err := wakeupprobe.WaitAll(ctx, req.GetSpec().GetContainers(), actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid()))); err != nil {
+	// Block until every wakeup-probe-enabled container reports 200, while
+	// verifying after 250ms that no application container exited early.
+	if err := waitForWakeupProbesWithLiveness(ctx, rcmd, req.GetSpec().GetContainers(), wakeupLivenessCheckDelay, func(probeCtx context.Context) error {
+		return wakeupprobe.WaitAll(probeCtx, req.GetSpec().GetContainers(), actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid())))
+	}); err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
 	if err := s.tunnel.Activate(workerstats.ActorAttributionFromRequest(req), s.sandboxDialer(req.GetActorUid()), egress); err != nil {
@@ -836,6 +839,10 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 			if err != nil {
 				timing.checkpoint = lap(&tLast)
 				return fmt.Errorf("while checkpointing pause: %w", err)
+			}
+			if err := verifyMemoryCheckpointPages(checkpointPath, len(containers)); err != nil {
+				timing.checkpoint = lap(&tLast)
+				return fmt.Errorf("while verifying memory checkpoint: %w", err)
 			}
 			// the checkpoint stops the sandbox, runsc delete fails until it is reaped
 			if sandbox != nil {
@@ -1047,6 +1054,11 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		}
 	}()
 	checkpointDir := req.GetActorDirs().GetRestoreDir()
+	if fidelity == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+		if err := verifyMemoryCheckpointPages(checkpointDir, len(containers)); err != nil {
+			return nil, fmt.Errorf("while verifying memory checkpoint before restore: %w", err)
+		}
+	}
 	restoreArgs, err := fsRestoreArgs(checkpointDir)
 	if err != nil {
 		return nil, err
@@ -1133,8 +1145,11 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		}
 	}
 
-	// Block until every wakeup-probe-enabled container reports 200.
-	err = wakeupprobe.WaitAll(ctx, containers, actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid())))
+	// Block until every wakeup-probe-enabled container reports 200, while
+	// verifying after 250ms that no restored container exited early.
+	err = waitForWakeupProbesWithLiveness(ctx, rcmd, containers, wakeupLivenessCheckDelay, func(probeCtx context.Context) error {
+		return wakeupprobe.WaitAll(probeCtx, containers, actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid())))
+	})
 	timing.wakeupProbe = lap(&tLast)
 	if err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)

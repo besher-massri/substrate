@@ -9,17 +9,20 @@
   "commands": {
     "create": {
       "globalFlags": [
-        "--cpu-num-from-quota"
+        "--cpu-num-from-quota",
+        "--overlay2=root:memory"
       ]
     },
     "start": {
       "globalFlags": [
-        "-allow-connected-on-save"
+        "-allow-connected-on-save",
+        "--overlay2=root:memory"
       ]
     },
     "restore": {
       "globalFlags": [
-        "--cpu-num-from-quota"
+        "--cpu-num-from-quota",
+        "--overlay2=root:memory"
       ],
       "subcommandFlags": [
         "-background",
