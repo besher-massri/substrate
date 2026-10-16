@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -302,9 +303,90 @@ func (s *AteWorkerService) snapshotVMState(ctx context.Context, client *ch.Clien
 			slog.String("id", actorUID), slog.Duration("merge", time.Since(tMerge)))
 	}
 
+	if diffSnapshotEnabled() {
+		if ra == nil || ra.restoreSourceDir == "" {
+			// Cold-booted golden snapshot: cache a reference copy of the base
+			// memory-ranges on this node and leave the checkpoint itself complete.
+			if err := ensureGoldenBaseCached(ctx, baseID, filepath.Join(checkpointDir, "memory-ranges")); err != nil {
+				slog.WarnContext(ctx, "Failed to cache golden base memory-ranges on checkpoint",
+					slog.String("id", actorUID), slog.String("base_id", baseID), slog.Any("err", err))
+			}
+		} else {
+			if err := s.maybeDeflateCheckpointAgainstGoldenBase(ctx, baseID, actorUID, checkpointDir); err != nil {
+				return 0, err
+			}
+		}
+	}
+
 	// The RO lower never ships (reconstructed from the OCI image at restore).
 	// The disk-backed upper ships as its own tar from CheckpointWorkload; a
 	return dSnapshot, nil
+}
+
+func (s *AteWorkerService) maybeDeflateCheckpointAgainstGoldenBase(ctx context.Context, baseID, actorUID, checkpointDir string) error {
+	if baseID == "" {
+		return nil
+	}
+	goldenBaseMemPath := goldenBaseMemoryRangesPath(baseID)
+	if _, err := os.Stat(goldenBaseMemPath); err != nil {
+		return nil
+	}
+	checkpointMemPath := filepath.Join(checkpointDir, "memory-ranges")
+	if _, err := os.Stat(checkpointMemPath); err != nil {
+		return nil
+	}
+
+	tDeflate := time.Now()
+	if compactDeltaFormatEnabled() {
+		metaPath := filepath.Join(checkpointDir, memoryRangesDiffMetaFile)
+		dataPath := filepath.Join(checkpointDir, memoryRangesDiffDataFile)
+		kept, err := ch.CreateDeltaAgainstBase(ctx, goldenBaseMemPath, checkpointMemPath, metaPath, dataPath)
+		if err != nil {
+			slog.WarnContext(ctx, "CreateDeltaAgainstBase skipped, keeping full snapshot",
+				slog.String("id", actorUID), slog.Any("err", err))
+			return nil
+		}
+		if err := os.Remove(checkpointMemPath); err != nil {
+			return fmt.Errorf("while removing full memory-ranges after compact delta creation: %w", err)
+		}
+		if err := writeGoldenDeltaMarker(goldenBaseMemPath, checkpointDir); err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "Created compact differential memory-ranges delta",
+			slog.String("id", actorUID),
+			slog.String("base_id", baseID),
+			slog.Int64("kept_bytes", kept),
+			slog.Duration("deflate", time.Since(tDeflate)))
+		return nil
+	}
+
+	punched, kept, err := ch.DeflateAgainstBase(ctx, goldenBaseMemPath, checkpointMemPath)
+	if err != nil {
+		slog.WarnContext(ctx, "DeflateAgainstBase skipped, keeping full snapshot",
+			slog.String("id", actorUID), slog.Any("err", err))
+		return nil
+	}
+	if err := writeGoldenDeltaMarker(goldenBaseMemPath, checkpointDir); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "Deflated memory-ranges against golden base",
+		slog.String("id", actorUID),
+		slog.String("base_id", baseID),
+		slog.Int64("punched_bytes", punched),
+		slog.Int64("kept_bytes", kept),
+		slog.Duration("deflate", time.Since(tDeflate)))
+	return nil
+}
+
+func writeGoldenDeltaMarker(goldenBaseMemPath, checkpointDir string) error {
+	deltaMarker := []byte("1\n")
+	if uriBytes, err := os.ReadFile(filepath.Join(filepath.Dir(goldenBaseMemPath), "source-uri")); err == nil && len(bytes.TrimSpace(uriBytes)) > 0 {
+		deltaMarker = uriBytes
+	}
+	if err := os.WriteFile(filepath.Join(checkpointDir, goldenDeltaMarkerFile), deltaMarker, 0o600); err != nil {
+		return fmt.Errorf("while writing %s marker: %w", goldenDeltaMarkerFile, err)
+	}
+	return nil
 }
 
 // mergeOnDemandDelta merges the OnDemand delta in checkpointDir with the base in
