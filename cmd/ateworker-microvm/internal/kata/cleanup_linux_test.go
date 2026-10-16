@@ -17,6 +17,9 @@
 package kata
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -49,4 +52,85 @@ func TestIsSandboxProcess(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCleanupSandboxStateOpts_SkipWhenDirsAbsentAndCgroupKilled(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared", "actor-clean")
+	vmDir := filepath.Join(tmp, "vm", "actor-clean")
+
+	// 1. Neither directory exists: fast cleanup is a two-stat no-op.
+	CleanupSandboxStateOpts(ctx, "actor-clean", CleanupOptions{
+		SkipIfDirsAbsent: true,
+		SkipOrphanScan:   true,
+		BaseDirs:         []string{sharedDir, vmDir},
+	})
+
+	// 2. Create leftover directories and files; verify fast cleanup unmounts and removes them.
+	if err := os.MkdirAll(filepath.Join(sharedDir, "mounts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll sharedDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedDir, "mounts", "stale.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll vmDir: %v", err)
+	}
+
+	CleanupSandboxStateOpts(ctx, "actor-clean", CleanupOptions{
+		SkipIfDirsAbsent: true,
+		SkipOrphanScan:   true,
+		BaseDirs:         []string{sharedDir, vmDir},
+	})
+
+	for _, d := range []string{sharedDir, vmDir} {
+		if _, err := os.Stat(d); !os.IsNotExist(err) {
+			t.Errorf("expected %q to be removed, stat err = %v", d, err)
+		}
+	}
+
+	// 3. Verify env toggle controls DefaultCleanupOptions.
+	t.Setenv(EnvFastSandboxCleanup, "false")
+	if FastSandboxCleanupEnabled() {
+		t.Errorf("FastSandboxCleanupEnabled() = true when %s=false", EnvFastSandboxCleanup)
+	}
+	t.Setenv(EnvFastSandboxCleanup, "true")
+	if !FastSandboxCleanupEnabled() {
+		t.Errorf("FastSandboxCleanupEnabled() = false when %s=true", EnvFastSandboxCleanup)
+	}
+}
+
+func BenchmarkCleanupSandboxState_FastVsLegacy(b *testing.B) {
+	ctx := context.Background()
+	tmp := b.TempDir()
+	missingShared := filepath.Join(tmp, "shared", "bench-actor")
+	missingVM := filepath.Join(tmp, "vm", "bench-actor")
+	baseDirs := []string{missingShared, missingVM}
+
+	b.Run("fast_skip_absent_and_cgroup_killed", func(b *testing.B) {
+		opts := CleanupOptions{
+			SkipIfDirsAbsent: true,
+			SkipOrphanScan:   true,
+			BaseDirs:         baseDirs,
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			CleanupSandboxStateOpts(ctx, "bench-actor", opts)
+		}
+	})
+
+	b.Run("legacy_mountinfo_and_proc_scan", func(b *testing.B) {
+		opts := CleanupOptions{
+			SkipIfDirsAbsent: false,
+			SkipOrphanScan:   false,
+			BaseDirs:         baseDirs,
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			CleanupSandboxStateOpts(ctx, "bench-actor", opts)
+		}
+	})
 }
