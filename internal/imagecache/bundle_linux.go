@@ -322,13 +322,47 @@ func setOpaque(root *os.Root, rel string) error {
 	return nil
 }
 
+// EnvFastUnmount controls whether UnmountAllUnder discovers mount points under
+// dir via statx(STATX_MNT_ID) directory walk before falling back to reading
+// /proc/self/mountinfo. Enabled by default; set to "false" / "0" / "off" to
+// force the /proc/self/mountinfo scan.
+const (
+	EnvFastUnmount       = "ATEWORKER_FAST_UNMOUNT"
+	EnvLegacyFastUnmount = "ATEOM_FAST_UNMOUNT"
+)
+
+func fastUnmountEnabled() bool {
+	for _, key := range []string{EnvFastUnmount, EnvLegacyFastUnmount} {
+		if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
+			switch strings.ToLower(raw) {
+			case "0", "false", "no", "off":
+				return false
+			default:
+				return true
+			}
+		}
+	}
+	return true
+}
+
 // UnmountAllUnder lazily detaches every mount at or below dir in the calling
 // process's mount namespace. It is the teardown counterpart of
 // SetupBundleRootfs, keyed by directory rather than by container name so a
 // single call cleans up all of an actor's bundle mounts. Missing mounts are
 // not an error.
 func UnmountAllUnder(dir string) error {
-	points, err := mountPointsUnder(dir)
+	var (
+		points []string
+		err    error
+	)
+	if fastUnmountEnabled() {
+		points, err = mountPointsUnderStatx(dir)
+		if err != nil {
+			points, err = mountPointsUnder(dir)
+		}
+	} else {
+		points, err = mountPointsUnder(dir)
+	}
 	if err != nil {
 		return err
 	}
@@ -341,6 +375,92 @@ func UnmountAllUnder(dir string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func statxMountID(path string) (unix.Statx_t, error) {
+	var sx unix.Statx_t
+	err := unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW|unix.AT_STATX_DONT_SYNC, unix.STATX_MNT_ID, &sx)
+	if err != nil {
+		return sx, err
+	}
+	if sx.Mask&unix.STATX_MNT_ID == 0 {
+		return sx, unix.ENOSYS
+	}
+	return sx, nil
+}
+
+// mountPointsUnderStatx discovers mount points at or below dir by comparing
+// STATX_MNT_ID (and STATX_ATTR_MOUNT_ROOT) across directory boundaries instead
+// of reading and scanning multi-MB /proc/self/mountinfo on dense nodes.
+func mountPointsUnderStatx(dir string) ([]string, error) {
+	dir = filepath.Clean(dir)
+	dirSx, err := statxMountID(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var points []string
+	if parentDir := filepath.Dir(dir); parentDir != dir {
+		parentSx, perr := statxMountID(parentDir)
+		if (dirSx.Attributes&unix.STATX_ATTR_MOUNT_ROOT != 0) || (perr == nil && dirSx.Mnt_id != parentSx.Mnt_id) {
+			points = append(points, dir)
+		}
+	}
+
+	dirMntID := map[string]uint64{dir: dirSx.Mnt_id}
+	walkErr := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if path == dir || d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		dSx, serr := statxMountID(path)
+		if serr != nil {
+			if errors.Is(serr, os.ErrNotExist) || errors.Is(serr, unix.ENOENT) {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			return serr
+		}
+		parent := filepath.Dir(path)
+		parentMntID, ok := dirMntID[parent]
+		if !ok {
+			parentMntID = dirSx.Mnt_id
+		}
+		if d.IsDir() {
+			dirMntID[path] = dSx.Mnt_id
+		}
+
+		isMount := (dSx.Attributes&unix.STATX_ATTR_MOUNT_ROOT != 0) || (dSx.Mnt_id != parentMntID)
+		if isMount {
+			points = append(points, path)
+			// SetupBundleRootfs mounts <bundle>/rootfs and <bundle>/volumes/<name>;
+			// neither contains nested submounts created by imagecache, so skip
+			// walking the container rootfs or volume tree.
+			if d.IsDir() && (d.Name() == "rootfs" || filepath.Base(parent) == "volumes") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Never walk inside unmounted bundle upper/work/rootfs trees.
+		if d.IsDir() && parent == dir && (d.Name() == "upper" || d.Name() == "work" || d.Name() == "rootfs") {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	return points, nil
 }
 
 // mountPointsUnder lists mount points at or below dir per

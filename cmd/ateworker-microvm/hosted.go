@@ -164,14 +164,21 @@ func (s *AteWorkerService) raiseActorWeightForTeardown(ctx context.Context, acto
 // cleanupSandboxState kills what is left of the actor's host processes and
 // clears its sandbox directories.
 func (s *AteWorkerService) cleanupSandboxState(ctx context.Context, actorUID string) {
+	cgroupKilled := false
 	if s.actorCgroups {
 		killCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := cgroup.KillActorLeaf(killCtx, actorUID); err != nil {
 			slog.WarnContext(ctx, "Failed to kill the actor's leftover processes", slog.Any("err", err))
+		} else {
+			cgroupKilled = true
 		}
 		cancel()
 	}
-	kata.CleanupSandboxState(ctx, actorUID)
+	opts := kata.DefaultCleanupOptions()
+	if kata.FastSandboxCleanupEnabled() && cgroupKilled {
+		opts.SkipOrphanScan = true
+	}
+	kata.CleanupSandboxStateOpts(ctx, actorUID, opts)
 }
 
 // unhostActor removes an actor, its network, and its cgroup. Repeated calls are
