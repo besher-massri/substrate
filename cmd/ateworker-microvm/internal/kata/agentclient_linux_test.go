@@ -103,3 +103,43 @@ func TestReseedRandomDevReturnsAgentError(t *testing.T) {
 		t.Fatal("ReseedRandomDev returned nil for an agent error, want the error")
 	}
 }
+
+// A per-attempt context deadline cancels the ttrpc request stream, not the
+// underlying vsock connection, so the next reseed attempt can reuse the same
+// AgentClient without redialing.
+func TestReseedRandomDevSucceedsOnSameClientAfterStreamTimeout(t *testing.T) {
+	firstBlocked := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls int
+	ac := startFakeAgent(t, func(req *agentpb.ReseedRandomDevRequest) error {
+		calls++
+		if calls == 1 {
+			close(firstBlocked)
+			<-releaseFirst
+		}
+		return nil
+	})
+	t.Cleanup(func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+	})
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := ac.ReseedRandomDev(shortCtx, []byte("attempt-1"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first ReseedRandomDev = %v, want DeadlineExceeded", err)
+	}
+	<-firstBlocked
+	close(releaseFirst)
+
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer retryCancel()
+	if err := ac.ReseedRandomDev(retryCtx, []byte("attempt-2")); err != nil {
+		t.Fatalf("second ReseedRandomDev on same client: %v", err)
+	}
+}
+
