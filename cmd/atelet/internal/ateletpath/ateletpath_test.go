@@ -26,24 +26,41 @@ func TestActorDirs(t *testing.T) {
 	if actorDirs.GetRootDir() != ActorPath(actorUID) {
 		t.Fatalf("root_dir = %q, want %q", actorDirs.GetRootDir(), ActorPath(actorUID))
 	}
-	under := map[string]string{
+	snapshotRoot := ActorSnapshotPath(actorUID)
+	if snapshotRoot == actorDirs.GetRootDir() {
+		t.Fatalf("ActorSnapshotPath(%q) = %q, must be distinct from ActorPath", actorUID, snapshotRoot)
+	}
+
+	underActorRoot := map[string]string{
 		"oci_bundle_dir":                actorDirs.GetOciBundleDir(),
-		"checkpoint_dir":                actorDirs.GetCheckpointDir(),
-		"restore_dir":                   actorDirs.GetRestoreDir(),
 		"durable_dir_volume_mounts_dir": actorDirs.GetDurableDirVolumeMountsDir(),
 		"system_info_volume_roots_dir":  actorDirs.GetSystemInfoVolumeRootsDir(),
 		"external_volume_mounts_dir":    actorDirs.GetExternalVolumeMountsDir(),
 		"sandbox_assets_dir":            actorDirs.GetSandboxAssetsDir(),
 	}
-	seen := map[string]string{}
-	for field, dir := range under {
-		rel, err := filepath.Rel(actorDirs.GetRootDir(), dir)
-		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-			t.Errorf("%s = %q is not a proper subdirectory of root_dir %q", field, dir, actorDirs.GetRootDir())
-		}
-		if other, dup := seen[dir]; dup {
-			t.Errorf("%s and %s share %q", field, other, dir)
-		}
-		seen[dir] = field
+	underSnapshotRoot := map[string]string{
+		"checkpoint_dir":        actorDirs.GetCheckpointDir(),
+		"restore_dir":           actorDirs.GetRestoreDir(),
+		"local_checkpoints_dir": LocalCheckpointsDir(actorUID),
+		"local_snapshot_dir":    LocalSnapshotDir(actorUID, "snap-1"),
 	}
+	if rel, err := filepath.Rel(filepath.Dir(snapshotRoot), SnapshotScratchDir()); err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		t.Errorf("SnapshotScratchDir() = %q is not under SnapshotsDir %q", SnapshotScratchDir(), filepath.Dir(snapshotRoot))
+	}
+
+	seen := map[string]string{}
+	checkSubdirs := func(parentName, parent string, dirs map[string]string) {
+		for field, dir := range dirs {
+			rel, err := filepath.Rel(parent, dir)
+			if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+				t.Errorf("%s = %q is not a proper subdirectory of %s %q", field, dir, parentName, parent)
+			}
+			if other, dup := seen[dir]; dup {
+				t.Errorf("%s and %s share %q", field, other, dir)
+			}
+			seen[dir] = field
+		}
+	}
+	checkSubdirs("root_dir", actorDirs.GetRootDir(), underActorRoot)
+	checkSubdirs("snapshot_root", snapshotRoot, underSnapshotRoot)
 }

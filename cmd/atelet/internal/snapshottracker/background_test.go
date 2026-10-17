@@ -38,6 +38,9 @@ func useActorDir(t *testing.T) {
 	if err := os.MkdirAll(ateletpath.ActorPath(trackedActorUID), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(ateletpath.ActorSnapshotPath(trackedActorUID), 0o700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // returnsPromptly fails the test unless f returns within a minute.

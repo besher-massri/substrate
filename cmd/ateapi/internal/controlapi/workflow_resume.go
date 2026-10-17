@@ -666,15 +666,51 @@ func schedulingConstraints(actor *ateapipb.Actor, tmpl *ateapipb.ActorTemplate) 
 	if err != nil {
 		return scheduling.Constraints{}, fmt.Errorf("invalid template resource limits: %w", err)
 	}
-	var requiredNodes []string
-	if node := actor.GetStatus().GetAssignedNode(); node != "" {
-		requiredNodes = []string{node}
+	var (
+		requiredNodes   []string
+		preferredWorker string
+		preferredNodes  []string
+	)
+	softAffinity := softNodeAffinityEnabled()
+	hasDurable := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED) != nil
+	assignedNode := actor.GetStatus().GetAssignedNode()
+	if assignedNode != "" {
+		if softAffinity && !latestSnapshotIsLocalOnly(actor.GetStatus()) && hasDurable {
+			preferredNodes = appendUniqueNode(preferredNodes, assignedNode)
+		} else {
+			requiredNodes = []string{assignedNode}
+		}
+	}
+	if len(requiredNodes) == 0 {
+		for _, snap := range actor.GetStatus().GetSnapshots() {
+			if loc := snap.GetLocality(); loc != "" {
+				preferredNodes = appendUniqueNode(preferredNodes, loc)
+			}
+		}
+		actorKey := (resources.ActorRef{
+			Atespace: actor.GetMetadata().GetAtespace(),
+			Name:     actor.GetMetadata().GetName(),
+		}).String()
+		var cachedNode string
+		if v, ok := lastActorNode.Load(actorKey); ok {
+			cachedNode, _ = v.(string)
+		}
+		if assignedNode == "" && cachedNode != "" {
+			preferredNodes = appendUniqueNode(preferredNodes, cachedNode)
+		}
+		if softAffinity && (assignedNode == "" || cachedNode == assignedNode) {
+			if v, ok := lastActorWorker.Load(actorKey); ok {
+				preferredWorker, _ = v.(string)
+			}
+		}
 	}
 	c := scheduling.Constraints{
 		SandboxClass:    snapshotSandboxClass(actor),
 		RequiredRuntime: hardware.NewRequirement(requiredSnapshotRuntime(actor, tmpl)),
 		ActorSelector:   labels.SelectorFromSet(labels.Set(actor.GetWorkerSelector().GetMatchLabels())),
 		RequiredNodes:   requiredNodes,
+		PreferredWorker: preferredWorker,
+		PreferredNodes:  preferredNodes,
 		Limits:          limits.Proto(),
 	}
 	if sel := tmpl.GetWorkerSelector(); sel != nil {
@@ -697,6 +733,13 @@ func snapshotSandboxClass(actor *ateapipb.Actor) string {
 		return snap.GetSandboxRuntime().GetSandboxClass()
 	}
 	return ""
+}
+
+func appendUniqueNode(nodes []string, node string) []string {
+	if node == "" || slices.Contains(nodes, node) {
+		return nodes
+	}
+	return append(nodes, node)
 }
 
 // requiredSnapshotRuntime returns the SandboxRuntime stamped on the snapshot

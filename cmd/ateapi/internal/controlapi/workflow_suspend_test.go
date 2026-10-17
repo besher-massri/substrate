@@ -1841,3 +1841,58 @@ func TestSuspendActor_AppliesPromoteSnapshotState(t *testing.T) {
 		t.Errorf("snapshots mismatch (-want +got):\n%s", diff)
 	}
 }
+
+func TestSuspendActor_SoftNodeAffinityPreservesAssignedNodeAcrossReplicas(t *testing.T) {
+	t.Setenv("ATE_SOFT_NODE_AFFINITY", "true")
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	tmpl := seedSuspendTemplate(t, ctx, persistence, &ateapipb.SnapshotConfig{StorageLocation: testStorageLocation})
+	w, _ := newWireCaptureWorkflow(t, persistence)
+
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-soft-affinity"}
+	created := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+		ActorTemplate: suspendTestTemplateRef(),
+		Status: &ateapipb.ActorStatus{
+			State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDING,
+			AssignedNode:           "node-affinity-1",
+			WorkerAssignment:       wireTestAssignment(),
+			LastAssignedGeneration: 1,
+			Snapshots: []*ateapipb.Snapshot{
+				newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", "snapshot-1", someActorSnapshotURI(t, testStorageLocation, "team-a", "snapshot-1"), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING),
+			},
+		},
+	})
+	seedWireWorker(t, ctx, persistence, assignmentOf(created))
+
+	stored, err := w.SuspendActor(ctx, actorRef, suspendSync)
+	if err != nil {
+		t.Fatalf("SuspendActor: %v", err)
+	}
+	if got := stored.GetStatus().GetAssignedNode(); got != "node-affinity-1" {
+		t.Fatalf("AssignedNode = %q, want node-affinity-1 preserved under ATE_SOFT_NODE_AFFINITY=true", got)
+	}
+
+	// Simulate ResumeActor arriving on a different ate-api-server replica that
+	// has empty or stale in-memory lastActorNode/lastActorWorker maps.
+	lastActorNode.Store(actorRef.String(), "stale-node-from-older-cycle")
+	lastActorWorker.Store(actorRef.String(), "stale-worker-from-older-cycle")
+	t.Cleanup(func() {
+		lastActorNode.Delete(actorRef.String())
+		lastActorWorker.Delete(actorRef.String())
+	})
+
+	constraints, err := schedulingConstraints(stored, tmpl)
+	if err != nil {
+		t.Fatalf("schedulingConstraints: %v", err)
+	}
+	if len(constraints.RequiredNodes) != 0 {
+		t.Errorf("RequiredNodes = %v, want empty under soft affinity with durable snapshot", constraints.RequiredNodes)
+	}
+	if len(constraints.PreferredNodes) != 1 || constraints.PreferredNodes[0] != "node-affinity-1" {
+		t.Errorf("PreferredNodes = %v, want [node-affinity-1]", constraints.PreferredNodes)
+	}
+	if constraints.PreferredWorker != "" {
+		t.Errorf("PreferredWorker = %q, want empty when replica cache holds stale node", constraints.PreferredWorker)
+	}
+}

@@ -438,6 +438,168 @@ func TestCopySnapshot(t *testing.T) {
 	}
 }
 
+func TestTagSnapshotCache(t *testing.T) {
+	ctx := context.Background()
+	backend := newMemObjects()
+	root := t.TempDir()
+	client := objectstorev1.NewNodeProviderClient(serve(t, backend, root))
+
+	tagURI := "gs://" + testBucket + "/root/atespaces/team-a/tags/tag-v1"
+	src := filepath.Join(root, "src")
+	dst1 := filepath.Join(root, "dst1")
+	dst2 := filepath.Join(root, "dst2")
+	for _, d := range []string{src, dst1, dst2} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantPayload := []byte("golden tag memory image")
+	if err := os.WriteFile(filepath.Join(src, "memory-ranges"), wantPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "base-id"), []byte("golden-actor-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, manifestFile), []byte(`{"snapshotFiles":["memory-ranges","base-id"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UploadSnapshot(ctx, &objectstorev1.UploadSnapshotRequest{
+		SnapshotUri: tagURI, LocalPath: src, Files: []string{"memory-ranges", "base-id", manifestFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot(tag) = %v", err)
+	}
+
+	// First fetch downloads from backend and populates golden-snapshot-cache + golden-base-cache.
+	if _, err := client.FetchSnapshot(ctx, &objectstorev1.FetchSnapshotRequest{
+		SnapshotUri: tagURI, WritePath: dst1, Files: []string{manifestFile, "base-id", "memory-ranges"},
+	}); err != nil {
+		t.Fatalf("first FetchSnapshot(tag) = %v", err)
+	}
+
+	// Delete objects from backend: second fetch must succeed from the local tag cache.
+	for _, k := range backend.keys() {
+		parts := strings.SplitN(k, "/", 2)
+		_ = backend.Delete(ctx, parts[0], parts[1])
+	}
+	if _, err := client.FetchSnapshot(ctx, &objectstorev1.FetchSnapshotRequest{
+		SnapshotUri: tagURI, WritePath: dst2, Files: []string{manifestFile, "base-id", "memory-ranges"},
+	}); err != nil {
+		t.Fatalf("second FetchSnapshot(tag) from cache = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst2, "memory-ranges"))
+	if err != nil || !bytes.Equal(got, wantPayload) {
+		t.Errorf("cached tag memory-ranges = %q, %v; want %q", got, err, wantPayload)
+	}
+	dst1Info, err := os.Stat(filepath.Join(dst1, "memory-ranges"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst2Info, err := os.Stat(filepath.Join(dst2, "memory-ranges"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(dst1Info, dst2Info) {
+		t.Error("expected dst1/memory-ranges and dst2/memory-ranges to share hardlinked inode from golden-snapshot-cache")
+	}
+	baseCacheInfo, err := os.Stat(filepath.Join(root, "golden-base-cache", "golden-actor-1", "memory-ranges"))
+	if err != nil {
+		t.Fatalf("expected golden-base-cache/golden-actor-1/memory-ranges to be populated: %v", err)
+	}
+	if !os.SameFile(dst1Info, baseCacheInfo) && !os.SameFile(mustStat(t, filepath.Join(src, "memory-ranges")), baseCacheInfo) {
+		t.Error("expected golden-base-cache/golden-actor-1/memory-ranges to be hardlinked")
+	}
+}
+
+func mustStat(t *testing.T, p string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
+}
+
+func TestActorSnapshotHardlinkCacheAndEviction(t *testing.T) {
+	t.Setenv("ATE_CACHE_ACTOR_SNAPSHOTS", "true")
+	ctx := context.Background()
+	backend := newMemObjects()
+	root := t.TempDir()
+	client := objectstorev1.NewNodeProviderClient(serve(t, backend, root))
+
+	snap1URI := "gs://" + testBucket + "/root/atespaces/team-a/actors/uid1/snapshots/snap1"
+	snap2URI := "gs://" + testBucket + "/root/atespaces/team-a/actors/uid1/snapshots/snap2"
+	src1 := filepath.Join(root, "src1")
+	src2 := filepath.Join(root, "src2")
+	dst1 := filepath.Join(root, "dst1")
+	for _, d := range []string{src1, src2, dst1} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(src1, "memory.img"), []byte("gen1-mem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src1, manifestFile), []byte(`{"snapshotFiles":["memory.img"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UploadSnapshot(ctx, &objectstorev1.UploadSnapshotRequest{
+		SnapshotUri: snap1URI, LocalPath: src1, Files: []string{"memory.img", manifestFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot(snap1) = %v", err)
+	}
+
+	// Remove snap1 from backend: FetchSnapshot must still succeed from the
+	// local hardlink cache populated on upload.
+	for _, k := range backend.keys() {
+		parts := strings.SplitN(k, "/", 2)
+		_ = backend.Delete(ctx, parts[0], parts[1])
+	}
+	if _, err := client.FetchSnapshot(ctx, &objectstorev1.FetchSnapshotRequest{
+		SnapshotUri: snap1URI, WritePath: dst1, Files: []string{manifestFile, "memory.img"},
+	}); err != nil {
+		t.Fatalf("FetchSnapshot(snap1) from upload hardlink cache = %v", err)
+	}
+	srcInfo, err := os.Stat(filepath.Join(src1, "memory.img"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstInfo, err := os.Stat(filepath.Join(dst1, "memory.img"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(srcInfo, dstInfo) {
+		t.Error("expected dst1/memory.img to share the hardlinked inode with src1/memory.img")
+	}
+
+	// Uploading snap2 for the same actor must evict snap1 from the local cache
+	// (1-snapshot-per-actor eviction rule).
+	if err := os.WriteFile(filepath.Join(src2, "memory.img"), []byte("gen2-mem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src2, manifestFile), []byte(`{"snapshotFiles":["memory.img"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UploadSnapshot(ctx, &objectstorev1.UploadSnapshotRequest{
+		SnapshotUri: snap2URI, LocalPath: src2, Files: []string{"memory.img", manifestFile},
+	}); err != nil {
+		t.Fatalf("UploadSnapshot(snap2) = %v", err)
+	}
+
+	// Verify only snap2 remains in actor-snapshot-cache/<actorHash>/.
+	cacheRoot := filepath.Join(root, "actor-snapshot-cache")
+	actorDirs, err := os.ReadDir(cacheRoot)
+	if err != nil || len(actorDirs) != 1 {
+		t.Fatalf("actor-snapshot-cache dirs = %v, %v; want 1 actor dir", actorDirs, err)
+	}
+	snapDirs, err := os.ReadDir(filepath.Join(cacheRoot, actorDirs[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapDirs) != 1 || snapDirs[0].Name() != "snap2" {
+		t.Errorf("cached snapshots for actor = %v, want only [snap2]", snapDirs)
+	}
+}
+
 func equal(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -449,3 +611,95 @@ func equal(a, b []string) bool {
 	}
 	return true
 }
+
+func BenchmarkHardlinkSnapshotCacheVsCopy(b *testing.B) {
+	const snapshotBytes = 16 << 20 // 16 MiB
+	payload := bytes.Repeat([]byte{0x42}, snapshotBytes)
+
+	b.Run("HardlinkActorSnapshotCacheHit_16MB", func(b *testing.B) {
+		b.Setenv("ATE_CACHE_ACTOR_SNAPSHOTS", "true")
+		root := b.TempDir()
+		backend := newMemObjects()
+		srv, err := NewNodePlugin(backend, root, objectstorage.DefaultUploadMemory)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ctx := context.Background()
+
+		srcDir := filepath.Join(root, "src")
+		if err := os.MkdirAll(srcDir, 0o700); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "memory-ranges"), payload, 0o600); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, manifestFile), []byte(`{"snapshotFiles":["memory-ranges"]}`), 0o600); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := srv.UploadSnapshot(ctx, &objectstorev1.UploadSnapshotRequest{
+			SnapshotUri: testURI, LocalPath: srcDir, Files: []string{"memory-ranges", manifestFile},
+		}); err != nil {
+			b.Fatal(err)
+		}
+
+		dstBase := filepath.Join(root, "dst")
+		b.SetBytes(snapshotBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := range b.N {
+			dstDir := filepath.Join(dstBase, fmt.Sprintf("iter-%d", i))
+			if err := os.MkdirAll(dstDir, 0o700); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := srv.FetchSnapshot(ctx, &objectstorev1.FetchSnapshotRequest{
+				SnapshotUri: testURI, WritePath: dstDir, Files: []string{manifestFile, "memory-ranges"},
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("UncachedObjectStoreDownload_16MB", func(b *testing.B) {
+		b.Setenv("ATE_CACHE_ACTOR_SNAPSHOTS", "false")
+		root := b.TempDir()
+		backend := newMemObjects()
+		srv, err := NewNodePlugin(backend, root, objectstorage.DefaultUploadMemory)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ctx := context.Background()
+
+		srcDir := filepath.Join(root, "src")
+		if err := os.MkdirAll(srcDir, 0o700); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "memory-ranges"), payload, 0o600); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, manifestFile), []byte(`{"snapshotFiles":["memory-ranges"]}`), 0o600); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := srv.UploadSnapshot(ctx, &objectstorev1.UploadSnapshotRequest{
+			SnapshotUri: testURI, LocalPath: srcDir, Files: []string{"memory-ranges", manifestFile},
+		}); err != nil {
+			b.Fatal(err)
+		}
+
+		dstBase := filepath.Join(root, "dst")
+		b.SetBytes(snapshotBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := range b.N {
+			dstDir := filepath.Join(dstBase, fmt.Sprintf("iter-%d", i))
+			if err := os.MkdirAll(dstDir, 0o700); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := srv.FetchSnapshot(ctx, &objectstorev1.FetchSnapshotRequest{
+				SnapshotUri: testURI, WritePath: dstDir, Files: []string{manifestFile, "memory-ranges"},
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
