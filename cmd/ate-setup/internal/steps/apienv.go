@@ -321,6 +321,7 @@ func (e *Env) applyWithAPIServerEnvHash(ctx context.Context, manifest []byte) er
 	if msg := sharedBootstrapOwnerWarning(e.Cfg.APIExperimentalEnableAuthz, e.Cfg.APIAuthzBootstrapOwners, e.Namespace()); msg != "" {
 		log.Warnf("%s", msg)
 	}
+	applyWorkloadRuntimeAndScaleOverrides(objs, e.Cfg.Size10(), e.Cfg.FakeDataPlane, os.Environ())
 	return e.Kube.Apply(ctx, objs)
 }
 

@@ -17,6 +17,7 @@ package steps
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -177,7 +178,7 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 		waits = append(waits, rollout{kube.KindDeployment, k8sCredentialProviderDeployment})
 	}
 	for _, w := range waits {
-		if err := e.Kube.RolloutStatus(ctx, w.kind, e.Namespace(), w.name, e.Cfg.RolloutTimeout); err != nil {
+		if err := e.Kube.RolloutStatus(ctx, w.kind, e.Namespace(), w.name, e.rolloutTimeout()); err != nil {
 			return err
 		}
 	}
@@ -223,6 +224,22 @@ func (e *Env) DeployPodCertificateController(ctx context.Context) error {
 		log.Infof("Setting WORKERS_PER_SIGNER to %d", e.Cfg.PodcertWorkersPerSigner)
 		if err := setPodcertWorkersPerSigner(objs, e.Cfg.PodcertWorkersPerSigner); err != nil {
 			return err
+		}
+	}
+	podcertReplicas := int64(0)
+	if e.Cfg.Size10() {
+		podcertReplicas = 10
+	}
+	if raw := os.Getenv("PODCERT_CONTROLLER_REPLICAS"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			podcertReplicas = n
+		}
+	}
+	if podcertReplicas > 0 {
+		for _, obj := range objs {
+			if obj.GetKind() == "Deployment" && obj.GetNamespace() == NamespacePodCert && obj.GetName() == "podcertificate-controller" {
+				_ = unstructured.SetNestedField(obj.Object, podcertReplicas, "spec", "replicas")
+			}
 		}
 	}
 	if err := e.Kube.Apply(ctx, objs); err != nil {
@@ -318,7 +335,16 @@ func (e *Env) DeployAteAPIServer(ctx context.Context) error {
 	if err := e.reconcileCloudSQLProxySidecar(ctx); err != nil {
 		return err
 	}
-	return e.Kube.RolloutStatus(ctx, kube.KindDeployment, e.Namespace(), "ate-api-server", e.Cfg.RolloutTimeout)
+	return e.Kube.RolloutStatus(ctx, kube.KindDeployment, e.Namespace(), "ate-api-server", e.rolloutTimeout())
+}
+
+// rolloutTimeout returns the rollout timeout for ate-system workloads, raising
+// the default to 180s on size10 clusters unless --rollout-timeout was set.
+func (e *Env) rolloutTimeout() time.Duration {
+	if e.Cfg.Size10() {
+		return e.Cfg.WaitTimeout(180 * time.Second)
+	}
+	return e.Cfg.RolloutTimeout
 }
 
 // apiServerManifestPath is the ate-api-server manifest for the environment.
@@ -349,10 +375,19 @@ func (e *Env) DeployAteController(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := e.ResolveAndApplyBytes(ctx, manifest); err != nil {
+	manifest, err = e.ResolveManifestBytes(ctx, manifest)
+	if err != nil {
 		return err
 	}
-	if err := e.Kube.RolloutStatus(ctx, kube.KindDeployment, e.Namespace(), "ate-controller", e.Cfg.RolloutTimeout); err != nil {
+	objs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		return err
+	}
+	applyWorkloadRuntimeAndScaleOverrides(objs, e.Cfg.Size10(), e.Cfg.FakeDataPlane, os.Environ())
+	if err := e.Kube.Apply(ctx, objs); err != nil {
+		return err
+	}
+	if err := e.Kube.RolloutStatus(ctx, kube.KindDeployment, e.Namespace(), "ate-controller", e.rolloutTimeout()); err != nil {
 		return err
 	}
 	return e.waitFakeWorkersync(ctx)
@@ -482,10 +517,15 @@ func (e *Env) DeployAtelet(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := e.Kube.ApplyBytes(ctx, manifest); err != nil {
+	objs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
 		return err
 	}
-	if err := e.Kube.RolloutStatus(ctx, kube.KindDaemonSet, e.Namespace(), "atelet", e.Cfg.RolloutTimeout); err != nil {
+	applyWorkloadRuntimeAndScaleOverrides(objs, e.Cfg.Size10(), e.Cfg.FakeDataPlane, os.Environ())
+	if err := e.Kube.Apply(ctx, objs); err != nil {
+		return err
+	}
+	if err := e.Kube.RolloutStatus(ctx, kube.KindDaemonSet, e.Namespace(), "atelet", e.rolloutTimeout()); err != nil {
 		return err
 	}
 	return e.waitFakeWorkersync(ctx)
@@ -524,7 +564,12 @@ func (e *Env) DeployAtenet(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := e.Kube.ApplyBytes(ctx, routerManifest); err != nil {
+	routerObjs, err := kube.DecodeManifestBytes(routerManifest)
+	if err != nil {
+		return err
+	}
+	applyWorkloadRuntimeAndScaleOverrides(routerObjs, e.Cfg.Size10(), e.Cfg.FakeDataPlane, os.Environ())
+	if err := e.Kube.Apply(ctx, routerObjs); err != nil {
 		return err
 	}
 	if err := e.EnsureEgressMITMCAPoolSecret(ctx); err != nil {
@@ -644,7 +689,7 @@ func (e *Env) DeployCRDs(ctx context.Context) error {
 // waitCRDsEstablished waits until the CRDs are served.
 func (e *Env) waitCRDsEstablished(ctx context.Context, crds []*unstructured.Unstructured) error {
 	for _, crd := range crds {
-		if err := e.Kube.WaitCondition(ctx, crdGVK, "", crd.GetName(), "Established", 30*time.Second); err != nil {
+		if err := e.Kube.WaitCondition(ctx, crdGVK, "", crd.GetName(), "Established", 2*time.Minute); err != nil {
 			return err
 		}
 	}
@@ -652,4 +697,240 @@ func (e *Env) waitCRDsEstablished(ctx context.Context, crds []*unstructured.Unst
 	// has to see the kinds that were just installed.
 	e.Kube.InvalidateDiscovery()
 	return nil
+}
+
+// objectstorePluginEnvKeys are the optional storage environment variables
+// forwarded exclusively to objectstore-plugin sidecars (never to ate-api-server
+// or atelet main containers, which reject ATE_STORAGE_BACKEND).
+var objectstorePluginEnvKeys = []string{
+	"ATE_STORAGE_BACKEND",
+	"ATE_CACHE_ACTOR_SNAPSHOTS",
+	"ATE_GOLDEN_SNAPSHOT_CACHE_DIR",
+	"ATE_ACTOR_SNAPSHOT_CACHE_DIR",
+	"ATE_GCS_ENDPOINT",
+	"ATE_GCS_GRPC_CONN_POOL_SIZE",
+	"ATE_S3_ENDPOINT",
+	"ATE_S3_FORCE_PATH_STYLE",
+	"AWS_ACCESS_KEY_ID",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_REGION",
+	"GOOGLE_APPLICATION_CREDENTIALS",
+}
+
+// applyWorkloadRuntimeAndScaleOverrides mutates decoded control-plane and
+// data-plane workload objects in place before server-side apply:
+//   - under size10, scales ate-api-server (6 replicas, 8/16 CPU, 16Gi/32Gi,
+//     ATE_API_POSTGRES_POOL_MAX_CONNS=192), ate-controller
+//     (--worker-sync-concurrency=32, 4/8 CPU, 8Gi/16Gi), atenet-router
+//     (2 replicas, 4/8 CPU, 4Gi/8Gi), and fake-data-plane components when
+//     enabled;
+//   - forwards opt-in environment variables from environ to their target
+//     containers (ATE_API_* to ate-api-server, ATELET_*/ATE_SNAPSHOT_* to
+//     atelet, ATEWORKER_*/ATEOM_*/ATE_ENABLE_ACTOR_CPU_BURST_FLOOR to
+//     ate-controller, and storage vars to objectstore-plugin sidecars).
+func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, size10, fakeDataPlane bool, environ []string) {
+	envMap := make(map[string]string, len(environ))
+	for _, entry := range environ {
+		if k, v, ok := strings.Cut(entry, "="); ok && v != "" {
+			envMap[k] = v
+		}
+	}
+
+	pluginEnv := make(map[string]string)
+	for _, k := range objectstorePluginEnvKeys {
+		if v := envMap[k]; v != "" {
+			pluginEnv[k] = v
+		}
+	}
+
+	apiEnv := make(map[string]string)
+	controllerEnv := make(map[string]string)
+	ateletEnv := make(map[string]string)
+	for k, v := range envMap {
+		switch {
+		case k == "ATE_STORAGE_BACKEND":
+			// Handled exclusively via pluginEnv above.
+		case k == "ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING" ||
+			k == "ATE_API_POSTGRES_OWNER_CONNECTION_STRING" ||
+			k == "ATE_API_POSTGRES_SCHEMA" ||
+			k == "ATE_API_SERVER_REPLICAS":
+			// Handled via Secret or replica count below.
+		case strings.HasPrefix(k, "ATE_API_") ||
+			k == "ATE_SOFT_NODE_AFFINITY" ||
+			k == "ATE_HEARTBEAT_TIMEOUT" ||
+			k == "ATE_LEASE_RENEWAL_INTERVAL" ||
+			k == "ATE_PLACEMENT_CACHE_TTL":
+			apiEnv[k] = v
+		case strings.HasPrefix(k, "ATEWORKER_") ||
+			strings.HasPrefix(k, "ATEOM_") ||
+			k == "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR" ||
+			k == "ATE_ACTOR_CPU_LIMIT_FLOOR":
+			controllerEnv[k] = v
+		case strings.HasPrefix(k, "ATELET_") ||
+			strings.HasPrefix(k, "ATE_SNAPSHOT_"):
+			ateletEnv[k] = v
+		}
+	}
+	if size10 && apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] == "" {
+		apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] = "192"
+	}
+
+	for _, obj := range objs {
+		kind := obj.GetKind()
+		name := obj.GetName()
+		switch {
+		case kind == "Deployment" && name == "ate-api-server":
+			replicas := int64(0)
+			if size10 {
+				replicas = 6
+			}
+			if raw := envMap["ATE_API_SERVER_REPLICAS"]; raw != "" {
+				if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+					replicas = n
+				}
+			}
+			if replicas > 0 {
+				_ = unstructured.SetNestedField(obj.Object, replicas, "spec", "replicas")
+			}
+			mutatePodContainers(obj, func(cname string, c map[string]any) {
+				switch cname {
+				case "ate-api-server":
+					if size10 {
+						setContainerResources(c, "8", "16Gi", "16", "32Gi")
+					}
+					mergeContainerEnv(c, apiEnv)
+				case "objectstore-plugin":
+					mergeContainerEnv(c, pluginEnv)
+				}
+			})
+
+		case kind == "Deployment" && name == "ate-controller":
+			mutatePodContainers(obj, func(cname string, c map[string]any) {
+				if cname == "manager" || cname == "ate-controller" {
+					if size10 {
+						setContainerArgPrefix(c, "--worker-sync-concurrency=", "--worker-sync-concurrency=32")
+						setContainerResources(c, "4", "8Gi", "8", "16Gi")
+					}
+					mergeContainerEnv(c, controllerEnv)
+				}
+			})
+
+		case kind == "Deployment" && name == "atenet-router":
+			if size10 {
+				routerReplicas := int64(8)
+				if raw := envMap["ATENET_ROUTER_REPLICAS"]; raw != "" {
+					if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+						routerReplicas = n
+					}
+				}
+				_ = unstructured.SetNestedField(obj.Object, routerReplicas, "spec", "replicas")
+				mutatePodContainers(obj, func(_ string, c map[string]any) {
+					setContainerResources(c, "4", "4Gi", "8", "8Gi")
+				})
+			}
+
+		case kind == "DaemonSet" && name == "atelet":
+			if size10 {
+				_ = unstructured.SetNestedField(obj.Object, int64(30), "spec", "template", "spec", "terminationGracePeriodSeconds")
+			}
+			mutatePodContainers(obj, func(cname string, c map[string]any) {
+				switch cname {
+				case "atelet":
+					if size10 && fakeDataPlane {
+						setContainerResources(c, "2", "4Gi", "4", "8Gi")
+					}
+					mergeContainerEnv(c, ateletEnv)
+				case "objectstore-plugin":
+					mergeContainerEnv(c, pluginEnv)
+				}
+			})
+
+		case kind == "Deployment" && name == fakeWorkersyncDeployment:
+			if size10 && fakeDataPlane {
+				mutatePodContainers(obj, func(_ string, c map[string]any) {
+					setContainerResources(c, "2", "4Gi", "4", "8Gi")
+				})
+			}
+		}
+	}
+}
+
+func mutatePodContainers(obj *unstructured.Unstructured, fn func(name string, container map[string]any)) {
+	for _, field := range []string{"containers", "initContainers"} {
+		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		if err != nil || !found {
+			continue
+		}
+		for i, raw := range containers {
+			c, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			cname, _ := c["name"].(string)
+			fn(cname, c)
+			containers[i] = c
+		}
+		_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field)
+	}
+}
+
+func setContainerResources(c map[string]any, reqCPU, reqMem, limCPU, limMem string) {
+	_ = unstructured.SetNestedField(c, reqCPU, "resources", "requests", "cpu")
+	_ = unstructured.SetNestedField(c, reqMem, "resources", "requests", "memory")
+	if limCPU == "" {
+		unstructured.RemoveNestedField(c, "resources", "limits", "cpu")
+	} else {
+		_ = unstructured.SetNestedField(c, limCPU, "resources", "limits", "cpu")
+	}
+	_ = unstructured.SetNestedField(c, limMem, "resources", "limits", "memory")
+}
+
+func setContainerArgPrefix(c map[string]any, prefix, fullArg string) {
+	args, _, err := unstructured.NestedStringSlice(c, "args")
+	if err != nil {
+		return
+	}
+	replaced := false
+	for i, arg := range args {
+		if strings.HasPrefix(arg, prefix) {
+			args[i] = fullArg
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		args = append(args, fullArg)
+	}
+	_ = unstructured.SetNestedStringSlice(c, args, "args")
+}
+
+func mergeContainerEnv(c map[string]any, additions map[string]string) {
+	if len(additions) == 0 {
+		return
+	}
+	env, _, err := unstructured.NestedSlice(c, "env")
+	if err != nil {
+		return
+	}
+	keys := make([]string, 0, len(additions))
+	for k := range additions {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		val := additions[k]
+		found := false
+		for i, raw := range env {
+			ev, ok := raw.(map[string]any)
+			if ok && ev["name"] == k {
+				env[i] = map[string]any{"name": k, "value": val}
+				found = true
+				break
+			}
+		}
+		if !found {
+			env = append(env, map[string]any{"name": k, "value": val})
+		}
+	}
+	c["env"] = env
 }

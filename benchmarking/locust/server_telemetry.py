@@ -35,7 +35,7 @@ def query_prometheus_instant(
     base_url: str,
     query: str,
     time_ts: float | int | None = None,
-    timeout_s: float = 5.0,
+    timeout_s: float = 30.0,
 ) -> list[dict[str, Any]]:
     """Executes an instant query against Prometheus /api/v1/query."""
     params = {"query": query}
@@ -61,7 +61,7 @@ def query_prometheus_range(
     start_ts: int,
     end_ts: int,
     step: str = "5s",
-    timeout_s: float = 8.0,
+    timeout_s: float = 60.0,
 ) -> list[dict[str, Any]]:
     """Executes a range query against Prometheus /api/v1/query_range."""
     # Guard against Prometheus 400 Bad Request: end must be greater than start
@@ -159,7 +159,16 @@ def get_steady_state_window(
     steady_ts, last_ts = steady[0], steady[-1]
 
     if start_ts <= steady_ts <= end_ts:
-        return steady_ts, min(max(last_ts, steady_ts), end_ts)
+        steady_end = min(max(last_ts, steady_ts), end_ts)
+        window_dur = steady_end - steady_ts
+        if window_dur > 720:
+            # For long runs (>12m), exclude initial warm-up / cold-restore tail
+            # and clip to the final measurement plateau.
+            warmup = min(600, window_dur // 3)
+            steady_ts = steady_ts + warmup
+            if (steady_end - steady_ts) >= 1800:
+                steady_ts = max(steady_ts, steady_end - 1800)
+        return steady_ts, steady_end
     return start_ts, end_ts
 
 
@@ -239,10 +248,12 @@ def _psi_query(
     exports `_stalled_`, PSI "full" (all tasks stalled). "some" is the earlier
     warning signal and the CPU full-stall series carries none, so one series
     keeps the three comparable. Both are scraped, so "full" stays available.
+    Uses a 2m rate window because cAdvisor's housekeep interval can exceed 30s
+    on busy nodes, leaving fewer than two samples inside a 1m window.
     """
     return (
         f'sum by ({by}) (rate(container_pressure_{resource}_waiting_seconds_total'
-        f'{{{selector}}}[1m])) * 100'
+        f'{{{selector}}}[2m])) * 100'
     )
 
 
@@ -751,6 +762,262 @@ def _count_oom_events(prom_url: str, start_ts: int, end_ts: int) -> dict[str, An
     return out
 
 
+def _harvest_extended_telemetry(
+    prom_url: str,
+    start_ts: int,
+    end_ts: int,
+    steady_start_ts: int,
+    steady_end_ts: int,
+    lag_s: int = 0,
+) -> dict[str, Any]:
+    """Harvests extended control-plane, DB, phase, and cAdvisor metrics."""
+    shift = lag_s // 2
+    start_at, end_at = steady_start_ts + shift, steady_end_ts + shift
+    mb = 1024 * 1024
+
+    def q_range_pct(query: str, step: str = "15s") -> dict[str, float | None]:
+        res = query_prometheus_range(
+            prom_url, query, steady_start_ts, steady_end_ts, step=step
+        )
+        return compute_percentiles(
+            _steady_values(res, steady_start_ts, steady_end_ts)
+        )
+
+    def q_delta(selector: str, shifted: bool = True) -> float | None:
+        s, e = (start_at, end_at) if shifted else (steady_start_ts, steady_end_ts)
+        return _window_delta(prom_url, selector, s, e)[0]
+
+    def q_quantiles(
+        buckets: str, shifted: bool = True, scale: float = 1.0
+    ) -> dict[str, float | None]:
+        s, e = (start_at, end_at) if shifted else (steady_start_ts, steady_end_ts)
+        return {
+            f"p{int(q * 100)}": _query_window_quantile(
+                prom_url, q, buckets, s, e, unit_scale=scale
+            )
+            for q in (0.50, 0.90, 0.95, 0.99)
+        }
+
+    ext: dict[str, Any] = {}
+
+    # 1. Server-side ate_api_requests_total & ate_api_request_duration_seconds
+    for op in ("ResumeActor", "SuspendActor", "PauseActor", "GetActor", "CreateActor"):
+        op_l = op.lower()
+        ok_d = q_delta(
+            f'ate_api_requests_total{{operation="{op}", status_code="OK"}}'
+        )
+        err_d = q_delta(
+            f'ate_api_requests_total{{operation="{op}", status_code!="OK"}}'
+        )
+        ext[f"ate_api_{op_l}_ok_delta"] = ok_d
+        ext[f"ate_api_{op_l}_err_delta"] = err_d
+        if ok_d is not None or err_d is not None:
+            qs = q_quantiles(
+                f'ate_api_request_duration_seconds_bucket{{operation="{op}"}}',
+                scale=0.001,
+            )
+            for pk, pv in qs.items():
+                ext[f"ate_api_{op_l}_{pk}_ms"] = pv
+
+    # 2. Sub-phase checkpoint & restore breakdown (prepare, runtime, storage)
+    for op in ("checkpoint", "restore"):
+        for phase in ("prepare", "runtime", "storage"):
+            c = q_delta(
+                f'ate_actor_{op}_duration_seconds_count{{ate_snapshot_phase="{phase}"}}'
+            )
+            if c is not None:
+                qs = q_quantiles(
+                    f'ate_actor_{op}_duration_seconds_bucket{{ate_snapshot_phase="{phase}"}}',
+                    scale=0.001,
+                )
+                for pk, pv in qs.items():
+                    ext[f"{op}_phase_{phase}_{pk}_ms"] = pv
+                s = q_delta(
+                    f'ate_actor_{op}_duration_seconds_sum{{ate_snapshot_phase="{phase}"}}'
+                )
+                ext[f"{op}_phase_{phase}_mean_ms"] = _ratio(s, c, scale=0.001)
+
+    # 3. Cold restore vs warm restore breakdown
+    for kind in ("cold", "warm"):
+        cnt = q_delta(
+            f'ate_actor_restore_duration_seconds_count{{ate_snapshot_phase="total", ate_restore_kind="{kind}"}}'
+        )
+        ext[f"restore_{kind}_count"] = cnt
+        if cnt is not None:
+            qs = q_quantiles(
+                f'ate_actor_restore_duration_seconds_bucket{{ate_snapshot_phase="total", ate_restore_kind="{kind}"}}',
+                scale=0.001,
+            )
+            for pk, pv in qs.items():
+                ext[f"restore_{kind}_{pk}_ms"] = pv
+
+    # 4. DB pool stats (in_use, wait_count, wait_duration)
+    ext["db_pool_in_use"] = q_range_pct("sum(ate_api_db_pool_in_use)")
+    ext["db_pool_open_connections"] = q_range_pct(
+        "sum(ate_api_db_pool_open_connections)"
+    )
+    ext["db_pool_wait_count_delta"] = q_delta("ate_api_db_pool_wait_total")
+    ext["db_pool_wait_seconds_delta"] = q_delta(
+        "ate_api_db_pool_wait_seconds_total"
+    )
+
+    # 5. Placement claim & cache hit/miss counters
+    ext["placement_claim_attempts_delta"] = q_delta(
+        "ate_api_placement_claim_attempts_total"
+    )
+    ext["placement_claim_exhausted_delta"] = q_delta(
+        "ate_api_placement_claim_exhausted_total"
+    )
+    ext["placement_cache_hits_delta"] = q_delta(
+        'ate_api_placement_cache_requests_total{result="hit"}'
+    )
+    ext["placement_cache_misses_delta"] = q_delta(
+        'ate_api_placement_cache_requests_total{result="miss"}'
+    )
+
+    # 6. Atelet lifecycle RPCs & failed snapshots
+    for method in ("CreateActor", "RestoreActor", "CheckpointActor", "DeleteActor"):
+        m_l = method.lower()
+        ext[f"atelet_rpc_{m_l}_ok_delta"] = q_delta(
+            f'atelet_lifecycle_rpc_total{{method="{method}", status="ok"}}'
+        )
+        ext[f"atelet_rpc_{m_l}_err_delta"] = q_delta(
+            f'atelet_lifecycle_rpc_total{{method="{method}", status!="ok"}}'
+        )
+    ext["atelet_failed_snapshots_delta"] = q_delta(
+        "atelet_failed_snapshots_total"
+    )
+
+    # 7. Controller-runtime reconcile latency & workqueue depth (ate-controller & podcert)
+    for ctrl in ("workerpool", "actortemplate", "podcert-signer"):
+        c_l = ctrl.replace("-", "_")
+        err_d = q_delta(
+            f'controller_runtime_reconcile_errors_total{{controller="{ctrl}"}}',
+            shifted=False,
+        )
+        q_depth = q_range_pct(f'sum(workqueue_depth{{name="{ctrl}"}})')
+        ext[f"ctrl_{c_l}_reconcile_err_delta"] = err_d
+        ext[f"ctrl_{c_l}_queue_depth"] = q_depth
+        if err_d is not None or q_depth.get("p50") is not None:
+            qs = q_quantiles(
+                f'controller_runtime_reconcile_time_seconds_bucket{{controller="{ctrl}"}}',
+                shifted=False,
+                scale=0.001,
+            )
+            for pk, pv in qs.items():
+                ext[f"ctrl_{c_l}_reconcile_{pk}_ms"] = pv
+
+    # 8. Control-plane pod CPU & memory (ate-api-server, postgres, ate-controller, atelet)
+    for comp, pod_re in (
+        ("ate_api_server", "ate-api-server.*"),
+        ("postgres", "postgres.*"),
+        ("ate_controller", "ate-controller.*"),
+        ("atelet", "atelet.*"),
+        ("worker", "benchmark-worker.*"),
+    ):
+        ext[f"{comp}_cpu_cores_sum"] = q_range_pct(
+            f'sum(rate(container_cpu_usage_seconds_total{{pod=~"{pod_re}", container!=""}}[2m]))'
+        )
+        ext[f"{comp}_mem_working_set_mb_max"] = q_range_pct(
+            f'max(container_memory_working_set_bytes{{pod=~"{pod_re}", container!=""}}) / {mb}'
+        )
+
+    # 9. Node network & disk I/O throughput on worker nodes
+    ext["worker_node_net_rx_mb_s"] = q_range_pct(
+        f'sum(rate(container_network_receive_bytes_total{{pod=~"benchmark-worker.*"}}[2m])) / {mb}'
+    )
+    ext["worker_node_net_tx_mb_s"] = q_range_pct(
+        f'sum(rate(container_network_transmit_bytes_total{{pod=~"benchmark-worker.*"}}[2m])) / {mb}'
+    )
+    ext["worker_node_fs_write_mb_s"] = q_range_pct(
+        f'sum(rate(container_fs_writes_bytes_total{{container="node"}}[2m])) / {mb}'
+    )
+    ext["worker_node_fs_read_mb_s"] = q_range_pct(
+        f'sum(rate(container_fs_reads_bytes_total{{container="node"}}[2m])) / {mb}'
+    )
+
+    # 10. OTel pipeline health (telemetry-meter accepted vs refused)
+    ext["otel_accepted_metric_points_delta"] = q_delta(
+        "otelcol_receiver_accepted_metric_points_total", shifted=False
+    )
+    ext["otel_refused_metric_points_delta"] = q_delta(
+        "otelcol_receiver_refused_metric_points_total", shifted=False
+    )
+
+    # Keep only populated entries so empty mocks or absent optional series do not
+    # clutter server_summary.json or stats.jsonl with null blocks.
+    return {
+        k: v
+        for k, v in ext.items()
+        if v is not None and not (isinstance(v, dict) and v.get("p50") is None)
+    }
+
+
+def _compute_post_warm_client_stats(
+    requests_log_path: Path, steady_start_ts: int, steady_end_ts: int
+) -> dict[str, Any]:
+    """Computes client-side RPC latency percentiles and QPS strictly within [steady_start_ts, steady_end_ts]."""
+    if not requests_log_path.exists():
+        return {}
+    by_op: dict[str, list[float]] = {}
+    err_by_op: dict[str, int] = {}
+    total_by_op: dict[str, int] = {}
+    try:
+        with open(requests_log_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                ts = rec.get("timestamp") or rec.get("ts") or rec.get("start_ts")
+                if ts is None:
+                    continue
+                try:
+                    ts_f = float(ts)
+                    if ts_f > 1e12:  # ms -> s
+                        ts_f /= 1000.0
+                except (ValueError, TypeError):
+                    continue
+                if not (steady_start_ts <= ts_f <= steady_end_ts):
+                    continue
+                op = rec.get("name") or rec.get("operation") or "unknown"
+                dur = rec.get("response_time_ms")
+                if dur is None:
+                    dur = rec.get("response_time") or rec.get("latency_ms")
+                err = rec.get("exception") or rec.get("error")
+                total_by_op[op] = total_by_op.get(op, 0) + 1
+                if err:
+                    err_by_op[op] = err_by_op.get(op, 0) + 1
+                elif dur is not None:
+                    try:
+                        by_op.setdefault(op, []).append(float(dur))
+                    except (ValueError, TypeError):
+                        pass
+    except Exception as e:
+        print(
+            f"Warning: Failed reading {requests_log_path} for post-warm stats: {e}",
+            file=sys.stderr,
+        )
+        return {}
+
+    dur_s = max(1, steady_end_ts - steady_start_ts)
+    out: dict[str, Any] = {}
+    for op, total in sorted(total_by_op.items()):
+        pcts = compute_percentiles(by_op.get(op, []))
+        errs = err_by_op.get(op, 0)
+        out[op] = {
+            **pcts,
+            "count": total,
+            "errors": errs,
+            "error_rate": round(errs / total, 6) if total > 0 else 0.0,
+            "qps": round(total / dur_s, 4),
+        }
+    return out
+
+
 def harvest_server_telemetry(
     prom_url: str,
     start_ts: int,
@@ -766,7 +1033,7 @@ def harvest_server_telemetry(
     set and OOM counts aren't shifted and are read over the run window as is.
     """
     steady_end = end_ts if steady_end_ts is None else steady_end_ts
-    return {
+    res: dict[str, Any] = {
         "cluster_packing": _harvest_cluster_packing(
             prom_url, start_ts, end_ts, steady_start_ts, steady_end
         ),
@@ -787,6 +1054,12 @@ def harvest_server_telemetry(
         ),
         "oom_events": _count_oom_events(prom_url, start_ts, end_ts),
     }
+    ext = _harvest_extended_telemetry(
+        prom_url, start_ts, end_ts, steady_start_ts, steady_end, lag_s
+    )
+    if ext:
+        res["extended"] = ext
+    return res
 
 
 def extract_and_record_server_telemetry(
@@ -836,6 +1109,12 @@ def extract_and_record_server_telemetry(
     telemetry.setdefault("oom_events", {}).update(
         {k: (worker_pods or {}).get(k) for k in WORKER_POD_FIELDS}
     )
+    requests_log_path = stats_history_csv.parent / "requests_log.jsonl"
+    post_warm_rpc = _compute_post_warm_client_stats(
+        requests_log_path, steady_start, steady_end
+    )
+    if post_warm_rpc:
+        telemetry.setdefault("extended", {})["post_warm_client_rpc"] = post_warm_rpc
 
     full_artifact = {
         "metadata": {
@@ -895,6 +1174,22 @@ def extract_and_record_server_telemetry(
     oom = telemetry.get("oom_events", {})
     for key in ("node", "pod", *WORKER_POD_FIELDS):
         measurements[f"oom_events_{key}"] = oom.get(key)
+
+    ext = telemetry.get("extended", {})
+    for k, v in ext.items():
+        if k == "post_warm_client_rpc":
+            continue
+        if isinstance(v, dict):
+            for p in ps:
+                if v.get(p) is not None:
+                    measurements[f"ext_{k}_{p}"] = v.get(p)
+        elif v is not None:
+            measurements[f"ext_{k}"] = v
+    for op, stats in post_warm_rpc.items():
+        op_l = op.lower().replace(" ", "_")
+        for p in ("p50", "p90", "p95", "p99", "qps", "error_rate"):
+            if stats.get(p) is not None:
+                measurements[f"post_warm_{op_l}_{p}"] = stats.get(p)
 
     jsonl_row = {
         "timestamp": data_ts,

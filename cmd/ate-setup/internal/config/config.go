@@ -510,6 +510,9 @@ func environ() map[string]string {
 			env[name] = value
 		}
 	}
+	if _, ok := env["ATE_INSTALL_CLUSTER_SIZE"]; !ok && env["SCALE_PROFILE"] != "" {
+		env["ATE_INSTALL_CLUSTER_SIZE"] = env["SCALE_PROFILE"]
+	}
 	return env
 }
 

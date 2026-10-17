@@ -59,7 +59,7 @@ def ranges(packing, node=(), pod=(), active=(), ws=(), actor_ws=()):
         if "ate_actor_stats_memory_working_set_bytes" in query:
             return list(actor_ws)
         # Before the PSI branch: the node working set query has container="node".
-        if "container_memory_working_set_bytes" in query:
+        if query in server_telemetry.WORKING_SET_QUERIES.values():
             return list(ws)
         if 'container="node"' in query:
             return list(node) if worker_nodes in query and pod_slice in query else []
@@ -784,6 +784,96 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertTrue(telemetry.called)
         self.assertEqual(telemetry.call_args.kwargs["lag_s"], 70)
         self.assertNotIn("worker_pod_count", telemetry.call_args.kwargs)
+
+    def test_psi_query_uses_2m_rate_window(self):
+        q = server_telemetry._psi_query("cpu")
+        self.assertIn("[2m]", q)
+        self.assertNotIn("[1m]", q)
+        nq = server_telemetry._node_psi_query("memory")
+        self.assertIn("[2m]", nq)
+
+    def test_steady_state_window_long_run_warmup_and_plateau_clip(self):
+        # 3600s plateau [1000, 4600] -> warmup 600s -> [1600, 4600] -> clipped to final 1800s [2800, 4600].
+        path = history_csv([
+            ("900", "10"),
+            ("1000", "100"),
+            ("2500", "100"),
+            ("4600", "100"),
+        ])
+        try:
+            self.assertEqual(
+                server_telemetry.get_steady_state_window(path, 900, 4700),
+                (2800, 4600),
+            )
+        finally:
+            path.unlink()
+
+    @mock.patch("server_telemetry.query_prometheus_range")
+    @mock.patch("server_telemetry.query_prometheus_instant")
+    def test_extended_telemetry_and_post_warm_client_stats(
+        self, mock_instant, mock_range
+    ):
+        def fake_range(_url, query, *_args, **_kwargs):
+            if "ate_api_db_pool_in_use" in query:
+                return [{"metric": {}, "values": [[100, "12.0"], [105, "16.0"]]}]
+            return []
+
+        def fake_instant(_url, query, time_ts=None):
+            if 'ate_api_requests_total{operation="ResumeActor", status_code="OK"}' in query:
+                if "- (sum(" in query:
+                    return [{"value": [time_ts, "250.0"]}]
+                return [{"value": [time_ts, "300.0"]}]
+            if 'ate_api_request_duration_seconds_bucket{operation="ResumeActor"}' in query:
+                if query.startswith("histogram_quantile"):
+                    return [{"value": [time_ts, "18.5"]}]
+            return []
+
+        mock_range.side_effect = fake_range
+        mock_instant.side_effect = fake_instant
+
+        with tempfile.TemporaryDirectory() as td:
+            req_log = Path(td) / "requests_log.jsonl"
+            req_log.write_text(
+                "\n".join([
+                    json.dumps({"timestamp": 95, "name": "ResumeActor", "response_time_ms": 900.0}),
+                    json.dumps({"timestamp": 101, "name": "ResumeActor", "response_time_ms": 15.0}),
+                    json.dumps({"timestamp": 104, "name": "ResumeActor", "response_time_ms": 25.0}),
+                    json.dumps({"timestamp": 104, "name": "ResumeActor", "error": "timeout"}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            out_json = Path(td) / "server_summary.json"
+            out_jsonl = Path(td) / "stats.jsonl"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 mock.patch("time.time", return_value=200), \
+                 mock.patch("time.sleep"):
+                server_telemetry.extract_and_record_server_telemetry(
+                    prom_url="http://localhost:9090",
+                    start_ts=100,
+                    end_ts=105,
+                    stats_history_csv=Path(td) / "missing.csv",
+                    output_json_path=out_json,
+                    jsonl_path=out_jsonl,
+                    data_ts="2026-01-01",
+                    tag="unit",
+                    test_name="unit-run",
+                )
+            summary = json.loads(out_json.read_text())
+            row = json.loads(out_jsonl.read_text().splitlines()[0])
+
+        self.assertIn("extended", summary)
+        ext = summary["extended"]
+        self.assertEqual(ext["ate_api_resumeactor_ok_delta"], 250.0)
+        self.assertEqual(ext["ate_api_resumeactor_p99_ms"], 18.5)
+        self.assertEqual(ext["db_pool_in_use"]["p99"], 16.0)
+        pw = ext["post_warm_client_rpc"]["ResumeActor"]
+        self.assertEqual(pw["count"], 3)
+        self.assertEqual(pw["errors"], 1)
+        self.assertEqual(pw["p50"], 25.0)
+        m = row["measurements"]
+        self.assertEqual(m["ext_ate_api_resumeactor_ok_delta"], "250.0")
+        self.assertEqual(m["ext_db_pool_in_use_p99"], "16.0")
+        self.assertEqual(m["post_warm_resumeactor_p50"], "25.0")
 
 
 if __name__ == "__main__":

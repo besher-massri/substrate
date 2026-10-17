@@ -166,19 +166,45 @@ def gcloud_setup_for_target_cluster() -> None:
             "--quiet",
         ]
     )
-    run(
-        [
-            "gcloud",
-            "container",
-            "clusters",
-            "get-credentials",
-            os.environ["CLUSTER_NAME"],
-            "--location",
-            os.environ["CLUSTER_LOCATION"],
-            "--project",
-            os.environ["PROJECT_ID"],
-        ]
-    )
+    if os.environ.get("KUBECONFIG"):
+        probe = subprocess.run(
+            ["kubectl", "get", "ns", "default", "--request-timeout=30s"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            print(
+                f"Reusing existing valid KUBECONFIG={os.environ['KUBECONFIG']} "
+                "(skipping gcloud get-credentials)",
+                flush=True,
+            )
+            return
+    cmd = [
+        "gcloud",
+        "container",
+        "clusters",
+        "get-credentials",
+        os.environ["CLUSTER_NAME"],
+        "--location",
+        os.environ["CLUSTER_LOCATION"],
+        "--project",
+        os.environ["PROJECT_ID"],
+    ]
+    delays = (5, 10, 20, 30, 45)
+    for attempt in range(1, len(delays) + 2):
+        res = subprocess.run(cmd, check=False)
+        if res.returncode == 0:
+            return
+        if attempt > len(delays):
+            raise subprocess.CalledProcessError(res.returncode, cmd)
+        delay = delays[attempt - 1]
+        print(
+            f"[WARN] gcloud get-credentials attempt {attempt} failed "
+            f"(exit {res.returncode}); retrying in {delay}s...",
+            flush=True,
+        )
+        time.sleep(delay)
 
 
 def test_type(test: dict[str, Any]) -> str:
@@ -371,6 +397,20 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"test {name!r} has invalid sandboxClass {sandbox_class!r} "
                 f"(want one of {list(SANDBOX_CLASSES)})"
             )
+        actor_cpu = t.get("actorCPU")
+        if actor_cpu is not None:
+            if isinstance(actor_cpu, bool) or not isinstance(actor_cpu, (int, float, str)):
+                raise ValueError(
+                    f"test {name!r}: 'actorCPU' must be a positive number or non-empty string, got {actor_cpu!r}"
+                )
+            if isinstance(actor_cpu, (int, float)) and actor_cpu <= 0:
+                raise ValueError(
+                    f"test {name!r}: 'actorCPU' must be > 0, got {actor_cpu!r}"
+                )
+            if isinstance(actor_cpu, str) and not actor_cpu.strip():
+                raise ValueError(
+                    f"test {name!r}: 'actorCPU' must be a non-empty string"
+                )
         if "type" not in t:
             raise ValueError(
                 f"test {name!r} missing required 'type' field "
@@ -411,7 +451,21 @@ def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
         **os.environ,
         "ATE_API_AUTHZ_BOOTSTRAP_OWNERS": f"{CLIENT_PRINCIPAL},{BENCHMARK_RUNNER_PRINCIPAL}",
     }
-    run(["hack/install-ate.sh", "--deploy-ate-system", *(str(a) for a in ate_args)], env=env)
+    if env.get("SCALE_PROFILE") and not env.get("ATE_INSTALL_CLUSTER_SIZE"):
+        env["ATE_INSTALL_CLUSTER_SIZE"] = env["SCALE_PROFILE"]
+    cmd = ["hack/install-ate.sh", "--deploy-ate-system", *(str(a) for a in ate_args)]
+    for attempt in range(1, 4):
+        try:
+            run(cmd, env=env)
+            return
+        except subprocess.CalledProcessError:
+            if attempt == 3:
+                raise
+            print(
+                f"[WARN] deploy_substrate attempt {attempt}/3 failed; retrying in 15s...",
+                flush=True,
+            )
+            time.sleep(15)
 
 
 def teardown_substrate() -> None:
@@ -439,7 +493,8 @@ def deploy_workloads(
     wait_timeout_secs: int | str = "",
     worker_memory: str = "",
     fake_atelet_args: Iterable[str] = (),
-    actor_cpu: str = "",
+    actor_cpu: int | float | str = "",
+    actor_image_zone: str = "",
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -456,8 +511,10 @@ def deploy_workloads(
     # Empty keeps the default in workloads/deploy.sh (1 CPU). The scheduler
     # books the limit against worker CPU capacity, so dense suites set
     # actorCPU in tests.yaml to fit more actors per worker.
-    if actor_cpu:
-        cmd += ["--actor-cpu", actor_cpu]
+    if actor_cpu != "" and actor_cpu is not None:
+        cmd += ["--actor-cpu", str(actor_cpu)]
+    if actor_image_zone:
+        cmd += ["--actor-image-zone", str(actor_image_zone)]
     # Empty leaves the worker pods unsized; set workerMemory in tests.yaml to
     # control how many workers the scheduler packs onto a node.
     if worker_memory:
@@ -474,6 +531,54 @@ def deploy_workloads(
 
 def teardown_workloads() -> None:
     run_no_check(["benchmarking/workloads/deploy.sh", "--delete"])
+
+
+def snapshot_and_reset_prometheus(
+    step_name: str, dest: str, commit: str, reset_after: bool = True
+) -> None:
+    """Trigger a Prometheus TSDB snapshot after a benchmark step, upload it to
+    ${dest}/prometheus_snapshots/${step_name}_${commit}.tar.gz, and optionally
+    reset Prometheus before the next step so memory does not accumulate across
+    steps."""
+    print(f"[PROM-SNAPSHOT] Starting TSDB snapshot for step {step_name}...", flush=True)
+    snap_script = f"""
+set +e
+PROM_NS=""
+POD=""
+for NS in benchmarking ate-system; do
+  POD=$(kubectl get pods -n "$NS" -l app=prometheus -o jsonpath='{{.items[0].metadata.name}}' 2>/dev/null)
+  if [ -n "$POD" ]; then
+    PROM_NS="$NS"
+    break
+  fi
+done
+if [ -z "$POD" ]; then
+  echo "[PROM-SNAPSHOT] No prometheus pod found in benchmarking or ate-system; skipping."
+  exit 0
+fi
+SNAP_JSON=$(kubectl exec -n "$PROM_NS" "$POD" -- wget -qO- --post-data='' 'http://localhost:9090/api/v1/admin/tsdb/snapshot?skip_head=false' 2>/dev/null)
+echo "[PROM-SNAPSHOT] Snapshot response ($PROM_NS/$POD): $SNAP_JSON"
+kubectl exec -n "$PROM_NS" "$POD" -- wget -qO- 'http://localhost:9090/api/v1/status/tsdb' 2>/dev/null > /tmp/prom_tsdb_status_{step_name}.json || true
+SNAP_NAME=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("data",{{}}).get("name",""))' "$SNAP_JSON" 2>/dev/null)
+if [ -n "$SNAP_NAME" ]; then
+  kubectl exec -n "$PROM_NS" "$POD" -- sh -c "tar -czf - -C /prometheus/snapshots \\"$SNAP_NAME\\"" > /tmp/prom_snap_{step_name}.tar.gz 2>/dev/null
+  if [ -s /tmp/prom_snap_{step_name}.tar.gz ]; then
+    gcloud storage cp /tmp/prom_snap_{step_name}.tar.gz "{dest}/prometheus_snapshots/{step_name}_{commit}.tar.gz" 2>/dev/null || gsutil -q cp /tmp/prom_snap_{step_name}.tar.gz "{dest}/prometheus_snapshots/{step_name}_{commit}.tar.gz" 2>/dev/null || true
+    gcloud storage cp /tmp/prom_tsdb_status_{step_name}.json "{dest}/prometheus_snapshots/{step_name}_{commit}_tsdb_status.json" 2>/dev/null || gsutil -q cp /tmp/prom_tsdb_status_{step_name}.json "{dest}/prometheus_snapshots/{step_name}_{commit}_tsdb_status.json" 2>/dev/null || true
+    echo "[PROM-SNAPSHOT] Uploaded TSDB snapshot to {dest}/prometheus_snapshots/{step_name}_{commit}.tar.gz"
+  fi
+  rm -f /tmp/prom_snap_{step_name}.tar.gz /tmp/prom_tsdb_status_{step_name}.json
+  kubectl exec -n "$PROM_NS" "$POD" -- rm -rf "/prometheus/snapshots/$SNAP_NAME" 2>/dev/null || true
+fi
+if [ "{'true' if reset_after else 'false'}" = "true" ]; then
+  echo "[PROM-SNAPSHOT] Resetting Prometheus TSDB in $PROM_NS before next step..."
+  kubectl exec -n "$PROM_NS" "$POD" -- wget -qO- --post-data='' 'http://localhost:9090/api/v1/admin/tsdb/delete_series?match[]={{__name__=~".+"}}' 2>/dev/null || true
+  kubectl exec -n "$PROM_NS" "$POD" -- wget -qO- --post-data='' 'http://localhost:9090/api/v1/admin/tsdb/clean_tombstones' 2>/dev/null || true
+  kubectl delete pod -n "$PROM_NS" "$POD" --wait=false 2>/dev/null || kubectl rollout restart deploy/prometheus -n "$PROM_NS" 2>/dev/null || true
+  kubectl rollout status deploy/prometheus -n "$PROM_NS" --timeout=180s 2>/dev/null || true
+fi
+"""
+    subprocess.run(["bash", "-c", snap_script], check=False)
 
 
 def run_test(
@@ -505,9 +610,28 @@ def run_test(
     manifest = render_template(tmpl, subs, flags)
     wait_for_no_active_runners()
     print(f"Submitting Job {job}", flush=True)
-    subprocess.run(
-        ["kubectl", "apply", "-f", "-"], input=manifest, text=True, check=True
-    )
+    for _apply_try, _delay in enumerate((5, 10, 15, 20, 30), 1):
+        _res = subprocess.run(
+            ["kubectl", "apply", "--request-timeout=60s", "-f", "-"],
+            input=manifest,
+            text=True,
+            check=False,
+        )
+        if _res.returncode == 0:
+            break
+        if _apply_try == 5:
+            subprocess.run(
+                ["kubectl", "apply", "--request-timeout=60s", "-f", "-"],
+                input=manifest,
+                text=True,
+                check=True,
+            )
+        print(
+            f"[WARN] kubectl apply Job {job} attempt {_apply_try} failed; "
+            f"retrying in {_delay}s...",
+            flush=True,
+        )
+        time.sleep(_delay)
     timeout = parse_duration_seconds(test["duration"]) + 1800
     result = wait_for_job(job, timeout)
     print(f"Job {job} result: {result}", flush=True)
@@ -655,6 +779,7 @@ def main() -> None:
                     test.get("workerMemory", ""),
                     isolate_workload_args(test),
                     test.get("actorCPU", ""),
+                    test.get("actorImageZone", os.environ.get("ACTOR_IMAGE_ZONE", "")),
                 )
                 try:
                     status = run_test(
@@ -669,6 +794,18 @@ def main() -> None:
                 except Exception as e:
                     print(f"Test {test['name']} crashed: {e}", flush=True)
                     failure_msg = str(e)
+                finally:
+                    if (
+                        os.environ.get("PROMETHEUS_SNAPSHOT_PER_STEP", "").lower()
+                        in ("1", "true", "yes")
+                        or bool(os.environ.get("ENVELOPE_PRESET"))
+                    ):
+                        snapshot_and_reset_prometheus(
+                            test["name"],
+                            args.dest,
+                            commit,
+                            reset_after=(i + 1 < len(tests)),
+                        )
             except Exception as e:
                 print(f"Test {test['name']} setup failed: {e}", flush=True)
                 failure_msg = str(e)
