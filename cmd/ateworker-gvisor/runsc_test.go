@@ -313,3 +313,125 @@ func TestRestoreWorkloadRejectsEmptyRestoreDir(t *testing.T) {
 		})
 	}
 }
+
+func countOverlay2Args(args []string) int {
+	n := 0
+	for _, arg := range args {
+		if isOverlay2Arg(arg) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestProductionInternalFlagsOverlay2Memory(t *testing.T) {
+	store, err := newFlagStore(t.Context(), filepath.Join("kodata", "internal_flags.json"))
+	if err != nil {
+		t.Fatalf("newFlagStore(kodata/internal_flags.json) failed: %v", err)
+	}
+	r := &runsc{
+		path:      "/usr/bin/runsc",
+		actorUID:  "test-actor-123",
+		actorDirs: testActorDirs,
+		flags:     store,
+	}
+
+	t.Run("default root:memory on create start restore", func(t *testing.T) {
+		if got := overlay2Flag(); got != "--overlay2=root:memory" {
+			t.Fatalf("overlay2Flag() = %q, want \"--overlay2=root:memory\"", got)
+		}
+		for _, cmd := range []string{"create", "start", "restore"} {
+			args := r.buildArgs(cmd, "glutton")
+			if !slices.Contains(args, "--overlay2=root:memory") {
+				t.Errorf("buildArgs(%q) = %v, want --overlay2=root:memory", cmd, args)
+			}
+			if got := countOverlay2Args(args); got != 1 {
+				t.Errorf("buildArgs(%q) overlay2 flag count = %d, want 1 (%v)", cmd, got, args)
+			}
+		}
+		for _, cmd := range []string{"checkpoint", "fscheckpoint", "delete", "list", "wait"} {
+			args := r.buildArgs(cmd, "glutton")
+			if slices.ContainsFunc(args, isOverlay2Arg) {
+				t.Errorf("buildArgs(%q) = %v, did not expect --overlay2 flag", cmd, args)
+			}
+		}
+	})
+
+	t.Run("ATEWORKER_GVISOR_OVERLAY2 override", func(t *testing.T) {
+		t.Setenv("ATEWORKER_GVISOR_OVERLAY2", "all:memory")
+		if got := overlay2Flag(); got != "--overlay2=all:memory" {
+			t.Fatalf("overlay2Flag() = %q, want \"--overlay2=all:memory\"", got)
+		}
+		for _, cmd := range []string{"create", "start", "restore"} {
+			args := r.buildArgs(cmd, "glutton")
+			if !slices.Contains(args, "--overlay2=all:memory") {
+				t.Errorf("buildArgs(%q) = %v, want --overlay2=all:memory", cmd, args)
+			}
+			if slices.Contains(args, "--overlay2=root:memory") {
+				t.Errorf("buildArgs(%q) = %v, should have replaced default --overlay2=root:memory", cmd, args)
+			}
+			if got := countOverlay2Args(args); got != 1 {
+				t.Errorf("buildArgs(%q) overlay2 flag count = %d, want 1 (%v)", cmd, got, args)
+			}
+		}
+	})
+
+	t.Run("ATEWORKER_GVISOR_OVERLAY2 prefixed flag normalization", func(t *testing.T) {
+		t.Setenv("ATEWORKER_GVISOR_OVERLAY2", "-overlay2=root:self")
+		if got := overlay2Flag(); got != "--overlay2=root:self" {
+			t.Fatalf("overlay2Flag() = %q, want \"--overlay2=root:self\"", got)
+		}
+		args := r.restoreArgs("glutton", "/tmp/ckpt")
+		if !slices.Contains(args, "--overlay2=root:self") {
+			t.Errorf("restoreArgs() = %v, want --overlay2=root:self", args)
+		}
+		if got := countOverlay2Args(args); got != 1 {
+			t.Errorf("restoreArgs() overlay2 flag count = %d, want 1 (%v)", got, args)
+		}
+	})
+
+	t.Run("disable via none", func(t *testing.T) {
+		for _, val := range []string{"none", "off", "false", "--overlay2=none"} {
+			t.Setenv("ATEWORKER_GVISOR_OVERLAY2", val)
+			if got := overlay2Flag(); got != "" {
+				t.Fatalf("overlay2Flag() with %q = %q, want empty string when disabled", val, got)
+			}
+			for _, cmd := range []string{"create", "start", "restore"} {
+				args := r.buildArgs(cmd, "glutton")
+				if slices.ContainsFunc(args, isOverlay2Arg) {
+					t.Errorf("buildArgs(%q) with ATEWORKER_GVISOR_OVERLAY2=%q = %v, want no --overlay2 flag", cmd, val, args)
+				}
+			}
+		}
+	})
+}
+
+func BenchmarkBuildArgsOverlay2(b *testing.B) {
+	store, err := newFlagStore(b.Context(), filepath.Join("kodata", "internal_flags.json"))
+	if err != nil {
+		b.Fatalf("newFlagStore: %v", err)
+	}
+	r := &runsc{
+		path:      "/usr/bin/runsc",
+		actorUID:  "bench-actor-123",
+		actorDirs: testActorDirs,
+		flags:     store,
+	}
+
+	b.Run("default_config", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			_ = r.restoreArgs("glutton", "/node/actors/bench-actor-123/restore")
+		}
+	})
+
+	b.Run("env_override", func(b *testing.B) {
+		b.Setenv("ATEWORKER_GVISOR_OVERLAY2", "all:memory")
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			_ = r.restoreArgs("glutton", "/node/actors/bench-actor-123/restore")
+		}
+	})
+}

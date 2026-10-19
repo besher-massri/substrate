@@ -32,6 +32,105 @@ import (
 	"go.ate.dev/substrate/internal/sizing"
 )
 
+const (
+	// defaultOverlay2Config is the default runsc --overlay2 configuration for
+	// sandbox creation, start, and restore. Using a memory-backed root overlay
+	// keeps container rootfs upper layers inside sentry memory across
+	// checkpoint/restore cycles instead of writing host-backed filestore files
+	// into per-sandbox bundle directories on the node's root disk.
+	defaultOverlay2Config = "root:memory"
+
+	// envGVisorOverlay2 overrides the runsc --overlay2 configuration (e.g.
+	// "root:memory", "all:memory", "root:self", or "none" to omit the flag).
+	envGVisorOverlay2 = "ATEWORKER_GVISOR_OVERLAY2"
+)
+
+// overlay2EnvOverride inspects the ATEWORKER_GVISOR_OVERLAY2 environment
+// variable and reports whether an override is set, whether the --overlay2 flag
+// is explicitly disabled ("none", "off", "false", "disabled", or "0"), and the
+// normalized "--overlay2=<value>" flag to pass to runsc when enabled.
+func overlay2EnvOverride() (flag string, disabled bool, set bool) {
+	val := strings.TrimSpace(os.Getenv(envGVisorOverlay2))
+	if val == "" {
+		return "", false, false
+	}
+	if after, ok := strings.CutPrefix(val, "--overlay2="); ok {
+		val = strings.TrimSpace(after)
+	} else if after, ok := strings.CutPrefix(val, "-overlay2="); ok {
+		val = strings.TrimSpace(after)
+	}
+	if val == "" {
+		return "", false, false
+	}
+	switch strings.ToLower(val) {
+	case "none", "off", "false", "disabled", "0":
+		return "", true, true
+	}
+	return "--overlay2=" + val, false, true
+}
+
+// overlay2Flag returns the effective runsc --overlay2 global flag, defaulting
+// to "--overlay2=root:memory" unless overridden or disabled via
+// ATEWORKER_GVISOR_OVERLAY2.
+func overlay2Flag() string {
+	if flag, disabled, set := overlay2EnvOverride(); set {
+		if disabled {
+			return ""
+		}
+		return flag
+	}
+	return "--overlay2=" + defaultOverlay2Config
+}
+
+// isOverlay2Command reports whether command is a runsc subcommand ("create",
+// "start", or "restore") that accepts and applies the --overlay2 global flag.
+func isOverlay2Command(command string) bool {
+	switch command {
+	case "create", "start", "restore":
+		return true
+	default:
+		return false
+	}
+}
+
+// isOverlay2Arg reports whether arg is a single-token or two-token runsc
+// --overlay2 or -overlay2 global flag.
+func isOverlay2Arg(arg string) bool {
+	return strings.HasPrefix(arg, "--overlay2=") || strings.HasPrefix(arg, "-overlay2=") ||
+		arg == "--overlay2" || arg == "-overlay2"
+}
+
+// applyOverlay2Flag applies any ATEWORKER_GVISOR_OVERLAY2 environment override
+// to globalFlags for create, start, and restore commands, replacing any
+// existing --overlay2 or -overlay2 entries in globalFlags or stripping them
+// when disabled. When ATEWORKER_GVISOR_OVERLAY2 is unset, globalFlags is
+// returned unchanged without additional allocations.
+func applyOverlay2Flag(command string, globalFlags []string) []string {
+	if !isOverlay2Command(command) {
+		return globalFlags
+	}
+	flag, disabled, set := overlay2EnvOverride()
+	if !set {
+		return globalFlags
+	}
+	filtered := globalFlags[:0]
+	for i := 0; i < len(globalFlags); i++ {
+		arg := globalFlags[i]
+		if (arg == "--overlay2" || arg == "-overlay2") && i+1 < len(globalFlags) {
+			i++
+			continue
+		}
+		if isOverlay2Arg(arg) {
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	if !disabled && flag != "" {
+		filtered = append(filtered, flag)
+	}
+	return filtered
+}
+
 type runsc struct {
 	path     string
 	actorUID string
@@ -53,7 +152,7 @@ type runsc struct {
 //	<combined globalFlags> -root <stateDir> <command> <subcommandFlags> <extraArgs> [<containerName>]
 func (r *runsc) buildArgs(command, containerName string, extraArgs ...string) []string {
 	cfg := r.flags.get()
-	globalFlags := cfg.globalFlags(command)
+	globalFlags := applyOverlay2Flag(command, cfg.globalFlags(command))
 	subcommandFlags := cfg.subcommandFlags(command)
 
 	args := make([]string, 0,
