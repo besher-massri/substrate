@@ -25,6 +25,8 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -625,6 +627,23 @@ func (u *gluttonActor) ensureRAMFilled(ctx context.Context) {
 	bmetrics.RecordSuccess("http", "GluttonFillRAM", userClass, clientLatency, 0)
 }
 
+// EnvGluttonCPUBurnSliceMS optionally configures the cycle_length_ms field
+// sent on GluttonUseCPU requests from boomer (for example, "200" for 200ms
+// work/sleep cycles). When unset or non-positive, cycle_length_ms is left at
+// 0 so the glutton server applies its own default cycle length.
+const EnvGluttonCPUBurnSliceMS = "GLUTTON_CPU_BURN_SLICE_MS"
+
+// configuredCPUBurnSliceMS parses EnvGluttonCPUBurnSliceMS as a positive
+// 32-bit integer millisecond duration, returning 0 when unset or invalid.
+func configuredCPUBurnSliceMS() int32 {
+	if raw := strings.TrimSpace(os.Getenv(EnvGluttonCPUBurnSliceMS)); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 32); err == nil && ms > 0 {
+			return int32(ms)
+		}
+	}
+	return 0
+}
+
 // ensureCPULoad starts cpu_cores goroutines in the actor, each burning
 // cpu_duty_cycle of one core, through the glutton UseCPU API. Like
 // ensureRAMFilled it runs once per actor: the goroutines live in the
@@ -646,8 +665,9 @@ func (u *gluttonActor) ensureCPULoad(ctx context.Context) {
 	start := time.Now()
 
 	err := u.postProto(ctx, useCPUPath, &gluttonpb.UseCPURequest{
-		NumCores:  int32(knobs.CPUCores),
-		DutyCycle: knobs.CPUDutyCycle,
+		NumCores:      int32(knobs.CPUCores),
+		DutyCycle:     knobs.CPUDutyCycle,
+		CycleLengthMs: configuredCPUBurnSliceMS(),
 	}, &gluttonpb.UseCPUResponse{})
 	clientLatency := time.Since(start)
 	boomerutil.LogSampledTrace(span, "GluttonUseCPU", clientLatency, boomerutil.SourceClient, err)

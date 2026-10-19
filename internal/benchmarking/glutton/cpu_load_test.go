@@ -238,3 +238,59 @@ func processUserCPUTime(t *testing.T) time.Duration {
 	}
 	return time.Duration(ru.Utime.Sec)*time.Second + time.Duration(ru.Utime.Usec)*time.Microsecond
 }
+
+func TestDefaultCPULoadCycleAndEnvOverride(t *testing.T) {
+	if got := DefaultCPULoadCycle(); got != 200*time.Millisecond {
+		t.Fatalf("DefaultCPULoadCycle() default = %v, want 200ms", got)
+	}
+	t.Setenv(EnvGluttonCPUBurnSliceMS, " 50 ")
+	if got := DefaultCPULoadCycle(); got != 50*time.Millisecond {
+		t.Fatalf("DefaultCPULoadCycle() with GLUTTON_CPU_BURN_SLICE_MS=50 = %v, want 50ms", got)
+	}
+	for _, bad := range []string{"0", "-10", "invalid", "9999999999999"} {
+		t.Setenv(EnvGluttonCPUBurnSliceMS, bad)
+		if got := DefaultCPULoadCycle(); got != 200*time.Millisecond {
+			t.Fatalf("DefaultCPULoadCycle() with %q = %v, want 200ms fallback", bad, got)
+		}
+	}
+}
+
+func TestCPULoadStop_PromptMidCycle(t *testing.T) {
+	var c cpuLoad
+	if got := c.Set(1, 1.0, 10*time.Second, false); got != 1 {
+		t.Fatalf("Set = %d, want 1", got)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	start := time.Now()
+	c.Stop()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Stop() during 10s workBudget took %v, want prompt cancellation (<1s)", elapsed)
+	}
+}
+
+func BenchmarkCPUBurnBatch(b *testing.B) {
+	const legacyBatchIterations = 4096
+
+	b.Run("batch=65536", func(b *testing.B) {
+		b.ReportAllocs()
+		var x uint64 = 1
+		b.ResetTimer()
+		for range b.N {
+			x, _ = burnCPUBatch(x, cpuBurnBatchIterations)
+		}
+		cpuBurnSink.Store(x)
+	})
+
+	b.Run("batch=4096", func(b *testing.B) {
+		b.ReportAllocs()
+		var x uint64 = 1
+		b.ResetTimer()
+		for range b.N {
+			for range cpuBurnBatchIterations / legacyBatchIterations {
+				x, _ = burnCPUBatch(x, legacyBatchIterations)
+			}
+		}
+		cpuBurnSink.Store(x)
+	})
+}

@@ -79,3 +79,26 @@ func TestEnsureCPULoadRetriesAfterFailure(t *testing.T) {
 		t.Errorf("recorded UseCPU requests = %d, want 1 (the failed call is rejected before recording)", got)
 	}
 }
+
+func TestEnsureCPULoadBurnSliceEnvOverride(t *testing.T) {
+	t.Setenv(EnvGluttonCPUBurnSliceMS, "200")
+	srv := &fake.Server{}
+	u := newTestGluttonActor(t, srv, gluttonKnobs{CPUCores: 1, CPUDutyCycle: 0.05})
+
+	u.ensureCPULoad(context.Background())
+
+	reqs := srv.RecordedCPURequests()
+	if len(reqs) != 1 {
+		t.Fatalf("UseCPU calls = %d, want 1", len(reqs))
+	}
+	if got := reqs[0].GetCycleLengthMs(); got != 200 {
+		t.Errorf("CycleLengthMs = %d, want 200", got)
+	}
+
+	for _, bad := range []string{"0", "-5", "invalid", "9999999999999"} {
+		t.Setenv(EnvGluttonCPUBurnSliceMS, bad)
+		if got := configuredCPUBurnSliceMS(); got != 0 {
+			t.Errorf("configuredCPUBurnSliceMS() with %q = %d, want 0", bad, got)
+		}
+	}
+}
