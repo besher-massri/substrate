@@ -17,7 +17,10 @@ package glutton
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,8 +57,30 @@ func (s *Service) UseCPU(_ context.Context, req *gluttonpb.UseCPURequest) (*glut
 	return &gluttonpb.UseCPUResponse{NumCores: int32(n)}, nil
 }
 
-// cpuLoadDefaultCycle is applied when a request has cycle_length_ms=0.
-const cpuLoadDefaultCycle = 100 * time.Millisecond
+// EnvGluttonCPUBurnSliceMS overrides the default CPU burn cycle duration in
+// milliseconds when a UseCPURequest has cycle_length_ms=0.
+const EnvGluttonCPUBurnSliceMS = "GLUTTON_CPU_BURN_SLICE_MS"
+
+// cpuLoadDefaultCycle is applied when a request has cycle_length_ms=0 and
+// GLUTTON_CPU_BURN_SLICE_MS is not set. A 200ms slice lets sub-core actors
+// yield between short burn chunks instead of spinning for 1000ms uninterrupted.
+const cpuLoadDefaultCycle = 200 * time.Millisecond
+
+// cpuBurnBatchIterations is the number of LCG iterations between
+// clock_gettime(CLOCK_THREAD_CPUTIME_ID) reads so syscall traps (especially
+// under gVisor systrap) do not dominate the spin loop.
+const cpuBurnBatchIterations = 65536
+
+// DefaultCPULoadCycle returns the effective default CPU burn cycle duration,
+// honoring GLUTTON_CPU_BURN_SLICE_MS when set to a positive integer.
+func DefaultCPULoadCycle() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(EnvGluttonCPUBurnSliceMS)); raw != "" {
+		if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return cpuLoadDefaultCycle
+}
 
 // cpuBurnSink absorbs the inner loop's arithmetic so the compiler can't
 // prove the work is dead and elide it.
@@ -87,7 +112,7 @@ func (c *cpuLoad) Set(numCores int, dutyCycle float64, cycleLen time.Duration, c
 		}
 	}
 	if cycleLen <= 0 {
-		cycleLen = cpuLoadDefaultCycle
+		cycleLen = DefaultCPULoadCycle()
 	}
 	if dutyCycle < 0 {
 		dutyCycle = 0
@@ -169,9 +194,9 @@ func cpuLoadWorker(ctx context.Context, duty float64, cycle time.Duration) {
 		if workBudget > 0 {
 			start := threadCPUTime()
 			for {
-				// A short batch between clock reads keeps the CPU-time
-				// syscall cost from dominating the loop's own load.
-				for i := 0; i < 4096; i++ {
+				// A batch between clock reads keeps the CPU-time syscall cost
+				// from dominating the loop's own load (especially under gVisor).
+				for i := 0; i < cpuBurnBatchIterations; i++ {
 					x = x*1103515245 + 12345
 				}
 				if threadCPUTime()-start >= workBudget {

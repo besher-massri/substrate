@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -99,6 +100,17 @@ type runningActor struct {
 	// workloadIDs are the guest container ids of this actor's workloads, for the
 	// SIGTERM the graceful shutdown propagates into the guest (see shutdown.go).
 	workloadIDs []string
+
+	// memSlot is set when the actor's guest RAM is a golden slot file on the
+	// tmpfs (opt-in zero-copy restore, see slot_pool.go): the VMM maps it, so
+	// checkpoints build memory-ranges from it and teardown deletes it once the
+	// VMM and virtiofsd are gone. memSlotDev and memSlotIno identify the file,
+	// memSlotBase is the pool base it was staged from, and origMemory is the
+	// snapshot's config.json memory section, which checkpoints put back.
+	memSlot                string
+	memSlotDev, memSlotIno uint64
+	memSlotBase            string
+	origMemory             json.RawMessage
 }
 
 // baseIDFile is a tiny snapshot file (under the checkpoint/restore dir) holding
@@ -484,7 +496,7 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	// host upper, mounted into the shared dir) + durable-dir and CSI volumes (if any),
 	// and start the ONE virtiofsd that serves them all. CH connects to it at vm.create
 	// and demand-pages for the actor's lifetime, so ateworker owns the process (killed in teardownActor).
-	leaf, err := s.actorLeaf(actorUID, p.size)
+	leaf, err := s.actorLeafForActivation(actorUID, p.size)
 	if err != nil {
 		return err
 	}
@@ -591,6 +603,7 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	if err := wakeupprobe.WaitAll(ctx, containers, actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
 		return fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
+	s.applySteadyCPU(ctx, leaf, p.size)
 
 	// Everything from BootVM onward, split. ateworker used to log only the total, which
 	// hid where a cold boot actually goes: it is not the guest booting.

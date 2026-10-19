@@ -83,6 +83,104 @@ class DeploySubstrateTest(unittest.TestCase):
             orchestrator.deploy_substrate()
         self.assertEqual(run.call_args.kwargs["env"]["KO_DOCKER_REPO"], "example")
 
+    @mock.patch("orchestrator.run")
+    def test_scale_profile_propagates_to_ate_install_cluster_size(self, run):
+        with mock.patch.dict(os.environ, {"SCALE_PROFILE": "size10"}, clear=True):
+            orchestrator.deploy_substrate()
+        self.assertEqual(run.call_args.kwargs["env"]["ATE_INSTALL_CLUSTER_SIZE"], "size10")
+
+
+class ValidateActorCPUAndLocustCpuFlagsTest(unittest.TestCase):
+    def _base_locust_test(self, **overrides):
+        base = {
+            "name": "glutton_test",
+            "type": "locust",
+            "targetCluster": "dev",
+            "file": "/app/tests/glutton.py",
+            "duration": "1m",
+            "users": 10,
+        }
+        base.update(overrides)
+        return base
+
+    def test_invalid_actor_cpu_rejected(self):
+        for bad_cpu in (True, False, 0, -1, -0.5, "", "   ", ["1"]):
+            with self.subTest(actorCPU=bad_cpu):
+                with self.assertRaisesRegex(ValueError, "actorCPU"):
+                    orchestrator.validate_and_normalize_tests(
+                        [self._base_locust_test(actorCPU=bad_cpu)]
+                    )
+
+    def test_locust_cpu_cores_and_duty_cycle(self):
+        t = self._base_locust_test(
+            cpuCores=2,
+            cpuDutyCycle=0.5,
+            flags=["--min-wait-time", "1.0"],
+        )
+        orchestrator.validate_and_normalize_tests([t])
+        self.assertEqual(
+            t["flags"],
+            [
+                "--min-wait-time",
+                "1.0",
+                "--cpu-cores",
+                "2",
+                "--cpu-duty-cycle",
+                "0.5",
+            ],
+        )
+
+    def test_locust_cpu_flags_zero_allowed(self):
+        t = self._base_locust_test(cpuCores=0, cpuDutyCycle=0.0)
+        orchestrator.validate_and_normalize_tests([t])
+        self.assertIn("--cpu-cores", t["flags"])
+        self.assertIn("0", t["flags"])
+        self.assertIn("--cpu-duty-cycle", t["flags"])
+        self.assertIn("0.0", t["flags"])
+
+        t_max = self._base_locust_test(cpuCores=1, cpuDutyCycle=1)
+        orchestrator.validate_and_normalize_tests([t_max])
+        self.assertIn("1.0", t_max["flags"])
+
+    def test_locust_invalid_cpu_cores(self):
+        for bad_cores in (-1, 1.5, "2", True, False):
+            with self.subTest(cpuCores=bad_cores):
+                with self.assertRaisesRegex(ValueError, "cpuCores"):
+                    orchestrator.validate_and_normalize_tests(
+                        [self._base_locust_test(cpuCores=bad_cores)]
+                    )
+
+    def test_locust_invalid_cpu_duty_cycle(self):
+        for bad_duty in (-0.1, 1.1, "0.5", True, False):
+            with self.subTest(cpuDutyCycle=bad_duty):
+                with self.assertRaisesRegex(ValueError, "cpuDutyCycle"):
+                    orchestrator.validate_and_normalize_tests(
+                        [self._base_locust_test(cpuDutyCycle=bad_duty)]
+                    )
+
+
+class GcloudSetupKubeconfigReuseTest(unittest.TestCase):
+    @mock.patch("orchestrator.subprocess.run")
+    @mock.patch("orchestrator.run")
+    def test_reuses_valid_kubeconfig_without_gcloud_get_credentials(self, run_mock, subproc_mock):
+        subproc_mock.return_value = mock.Mock(returncode=0)
+        env = {
+            "KO_DOCKER_REPO": "us-central1-docker.pkg.dev/p/r",
+            "KUBECONFIG": "/tmp/existing-kubeconfig",
+            "CLUSTER_NAME": "c",
+            "CLUSTER_LOCATION": "l",
+            "PROJECT_ID": "p",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            orchestrator.gcloud_setup_for_target_cluster()
+        run_mock.assert_called_once()
+        subproc_mock.assert_called_once_with(
+            ["kubectl", "get", "ns", "default", "--request-timeout=30s"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
 
 class DeployWorkloadsTest(unittest.TestCase):
     @mock.patch("orchestrator.run")
@@ -105,6 +203,26 @@ class DeployWorkloadsTest(unittest.TestCase):
         cmd = run.call_args.args[0]
         i = cmd.index("--worker-memory")
         self.assertEqual(cmd[i + 1], "12Gi")
+
+    @mock.patch("orchestrator.run")
+    def test_actor_cpu_passed_when_set(self, run):
+        orchestrator.deploy_workloads(actor_cpu="500m")
+        cmd = run.call_args.args[0]
+        i = cmd.index("--actor-cpu")
+        self.assertEqual(cmd[i + 1], "500m")
+
+        run.reset_mock()
+        orchestrator.deploy_workloads(actor_cpu=2)
+        cmd = run.call_args.args[0]
+        i = cmd.index("--actor-cpu")
+        self.assertEqual(cmd[i + 1], "2")
+
+    @mock.patch("orchestrator.run")
+    def test_actor_image_zone_passed_when_set(self, run):
+        orchestrator.deploy_workloads(actor_image_zone="us-central1-a")
+        cmd = run.call_args.args[0]
+        i = cmd.index("--actor-image-zone")
+        self.assertEqual(cmd[i + 1], "us-central1-a")
 
     @mock.patch("orchestrator.run")
     def test_all_options(self, run):

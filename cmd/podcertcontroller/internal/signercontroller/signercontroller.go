@@ -64,7 +64,7 @@ func New(clock clock.PassiveClock, handler SignerImpl, hasher Hasher, pcrClient 
 		clock:        clock,
 		trustBundles: trustBundles,
 		pcrClient:    pcrClient,
-		pcrQueue:     workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		pcrQueue:     workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedItemExponentialFailureRateLimiter[string](10*time.Millisecond, 5*time.Second)),
 		handler:      handler,
 		hasher:       hasher,
 	}

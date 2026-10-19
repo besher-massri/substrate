@@ -19,12 +19,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc/codes"
@@ -313,3 +316,256 @@ func TestRestoreWorkloadRejectsEmptyRestoreDir(t *testing.T) {
 		})
 	}
 }
+
+func TestProductionInternalFlagsOverlay2Memory(t *testing.T) {
+	store, err := newFlagStore(t.Context(), filepath.Join("kodata", "internal_flags.json"))
+	if err != nil {
+		t.Fatalf("newFlagStore(kodata/internal_flags.json) failed: %v", err)
+	}
+	r := &runsc{
+		path:      "/usr/bin/runsc",
+		actorUID:  "test-actor-123",
+		actorDirs: testActorDirs,
+		flags:     store,
+	}
+
+	t.Run("default root:memory on create start restore", func(t *testing.T) {
+		if got := overlay2Flag(); got != "--overlay2=root:memory" {
+			t.Fatalf("overlay2Flag() = %q, want \"--overlay2=root:memory\"", got)
+		}
+		for _, cmd := range []string{"create", "start", "restore"} {
+			args := r.buildArgs(cmd, "glutton")
+			if !slices.Contains(args, "--overlay2=root:memory") {
+				t.Errorf("buildArgs(%q) = %v, want --overlay2=root:memory", cmd, args)
+			}
+		}
+		for _, cmd := range []string{"checkpoint", "delete", "list", "wait"} {
+			args := r.buildArgs(cmd, "glutton")
+			if slices.ContainsFunc(args, isOverlay2Arg) {
+				t.Errorf("buildArgs(%q) = %v, did not expect --overlay2 flag", cmd, args)
+			}
+		}
+	})
+
+	t.Run("ATEWORKER_GVISOR_OVERLAY2 override", func(t *testing.T) {
+		t.Setenv("ATEWORKER_GVISOR_OVERLAY2", "all:memory")
+		if got := overlay2Flag(); got != "--overlay2=all:memory" {
+			t.Fatalf("overlay2Flag() = %q, want \"--overlay2=all:memory\"", got)
+		}
+		for _, cmd := range []string{"create", "start", "restore"} {
+			args := r.buildArgs(cmd, "glutton")
+			if !slices.Contains(args, "--overlay2=all:memory") {
+				t.Errorf("buildArgs(%q) = %v, want --overlay2=all:memory", cmd, args)
+			}
+			if slices.Contains(args, "--overlay2=root:memory") {
+				t.Errorf("buildArgs(%q) = %v, should have replaced default --overlay2=root:memory", cmd, args)
+			}
+		}
+	})
+
+	t.Run("legacy ATEOM_GVISOR_OVERLAY2 fallback", func(t *testing.T) {
+		t.Setenv("ATEOM_GVISOR_OVERLAY2", "root:self")
+		if got := overlay2Flag(); got != "--overlay2=root:self" {
+			t.Fatalf("overlay2Flag() = %q, want \"--overlay2=root:self\"", got)
+		}
+		args := r.restoreArgs("glutton", "/tmp/ckpt")
+		if !slices.Contains(args, "--overlay2=root:self") {
+			t.Errorf("restoreArgs() = %v, want --overlay2=root:self", args)
+		}
+	})
+
+	t.Run("disable via none", func(t *testing.T) {
+		t.Setenv("ATEWORKER_GVISOR_OVERLAY2", "none")
+		if got := overlay2Flag(); got != "" {
+			t.Fatalf("overlay2Flag() = %q, want empty string when disabled", got)
+		}
+		for _, cmd := range []string{"create", "start", "restore"} {
+			args := r.buildArgs(cmd, "glutton")
+			if slices.ContainsFunc(args, isOverlay2Arg) {
+				t.Errorf("buildArgs(%q) with ATEWORKER_GVISOR_OVERLAY2=none = %v, want no --overlay2 flag", cmd, args)
+			}
+		}
+	})
+}
+
+type mockContainerWaiter struct {
+	waitCalls atomic.Int32
+	waitFn    func(ctx context.Context, name string) error
+}
+
+func (m *mockContainerWaiter) cmdWait(ctx context.Context, name string) error {
+	m.waitCalls.Add(1)
+	return m.waitFn(ctx, name)
+}
+
+func TestVerifyContainersRunningAndWakeupLiveness(t *testing.T) {
+	containers := []*ateworkerpb.Container{
+		{Name: "init"},
+		{Name: "glutton"},
+	}
+
+	t.Run("all containers stay running across verification window", func(t *testing.T) {
+		waiter := &mockContainerWaiter{
+			waitFn: func(ctx context.Context, _ string) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		if err := verifyContainersRunning(t.Context(), waiter, containers, 20*time.Millisecond); err != nil {
+			t.Fatalf("verifyContainersRunning() = %v, want nil", err)
+		}
+		if got := waiter.waitCalls.Load(); got != 2 {
+			t.Errorf("waitCalls = %d, want 2 (init + glutton)", got)
+		}
+	})
+
+	t.Run("container exiting early fails fast", func(t *testing.T) {
+		waiter := &mockContainerWaiter{
+			waitFn: func(ctx context.Context, name string) error {
+				if name == "glutton" {
+					return nil // exited immediately
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		err := verifyContainersRunning(t.Context(), waiter, containers, 250*time.Millisecond)
+		if err == nil || !strings.Contains(err.Error(), `application container "glutton" exited`) {
+			t.Fatalf("verifyContainersRunning() = %v, want error mentioning glutton exited", err)
+		}
+	})
+
+	t.Run("fast wakeup probe (<250ms) spawns zero wait subprocesses", func(t *testing.T) {
+		waiter := &mockContainerWaiter{
+			waitFn: func(ctx context.Context, _ string) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		err := waitForWakeupProbesWithLiveness(t.Context(), waiter, containers, wakeupLivenessCheckDelay, func(context.Context) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("waitForWakeupProbesWithLiveness() = %v, want nil", err)
+		}
+		if got := waiter.waitCalls.Load(); got != 0 {
+			t.Errorf("waitCalls = %d, want 0 on fast wakeup probe", got)
+		}
+	})
+
+	t.Run("dead container cancels slow wakeup probe after liveness delay", func(t *testing.T) {
+		waiter := &mockContainerWaiter{
+			waitFn: func(_ context.Context, name string) error {
+				if name == "init" {
+					return errors.New("container not running")
+				}
+				return nil
+			},
+		}
+		start := time.Now()
+		err := waitForWakeupProbesWithLiveness(t.Context(), waiter, containers, 15*time.Millisecond, func(probeCtx context.Context) error {
+			<-probeCtx.Done()
+			return probeCtx.Err()
+		})
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("waitForWakeupProbesWithLiveness() = nil, want error when container exits")
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("elapsed = %v, expected fast cancellation", elapsed)
+		}
+	})
+}
+
+func TestVerifyMemoryCheckpointPages(t *testing.T) {
+	t.Run("rejects 86016-byte pause-only pages.img", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "pages.img"), make([]byte, 86016), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dir, 1); err == nil {
+			t.Fatal("verifyMemoryCheckpointPages succeeded on 86,016-byte pause-only pages.img, want error")
+		}
+	})
+
+	t.Run("rejects tiny pause-only pages.img.zstd", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "pages.img.zstd"), make([]byte, 8192), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dir, 1); err == nil {
+			t.Fatal("verifyMemoryCheckpointPages succeeded on 8,192-byte pause-only pages.img.zstd, want error")
+		}
+	})
+
+	t.Run("accepts normal app pages.img and pages.img.zstd", func(t *testing.T) {
+		dirRaw := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dirRaw, "pages.img"), make([]byte, 256*1024), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dirRaw, 1); err != nil {
+			t.Fatalf("verifyMemoryCheckpointPages(256KiB pages.img) = %v, want nil", err)
+		}
+
+		dirZstd := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dirZstd, "pages.img.zstd"), make([]byte, 128*1024), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyMemoryCheckpointPages(dirZstd, 1); err != nil {
+			t.Fatalf("verifyMemoryCheckpointPages(128KiB pages.img.zstd) = %v, want nil", err)
+		}
+	})
+}
+
+func BenchmarkBuildArgsOverlay2(b *testing.B) {
+	store, err := newFlagStore(b.Context(), filepath.Join("kodata", "internal_flags.json"))
+	if err != nil {
+		b.Fatalf("newFlagStore: %v", err)
+	}
+	r := &runsc{
+		path:      "/usr/bin/runsc",
+		actorUID:  "bench-actor-123",
+		actorDirs: testActorDirs,
+		flags:     store,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = r.restoreArgs("glutton", "/node/actors/bench-actor-123/restore")
+	}
+}
+
+func BenchmarkWaitForWakeupProbesWithLiveness_FastPath(b *testing.B) {
+	containers := []*ateworkerpb.Container{{Name: "init"}, {Name: "glutton"}}
+	waiter := &mockContainerWaiter{
+		waitFn: func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	ctx := b.Context()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := waitForWakeupProbesWithLiveness(ctx, waiter, containers, wakeupLivenessCheckDelay, func(context.Context) error {
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkVerifyMemoryCheckpointPages(b *testing.B) {
+	dir := b.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pages.img"), make([]byte, 256*1024), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := verifyMemoryCheckpointPages(dir, 1); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+

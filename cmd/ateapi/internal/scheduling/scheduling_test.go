@@ -19,6 +19,7 @@ import (
 	"errors"
 	"testing"
 
+	"go.ate.dev/substrate/cmd/ateapi/internal/workercache"
 	"go.ate.dev/substrate/internal/hardware"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
@@ -213,6 +214,36 @@ func TestSchedule(t *testing.T) {
 					assignedFor("demo", "other", resources.CPUMemory(3000, 4<<30))),
 			},
 			constraints: Constraints{Limits: resources.CPUMemory(2000, 0)},
+		},
+		{
+			// A record that cannot be read cannot be trusted not to be full.
+			name: "a worker whose recorded capacity will not parse has no room",
+			fleet: fleet{
+				worker("w-garbled", "gvisor", "node-a", tierTwo, withMaxActors(4),
+					withCapacityStrings("cpu", "4", "memory", "lots")),
+			},
+			constraints: Constraints{SandboxClass: "gvisor", Limits: resources.CPUMemory(1000, 0)},
+		},
+		{
+			// Fractional binary quantities take the slow path through
+			// resource.ParseQuantity; the comparison is exact all the same.
+			name: "capacity reported off the int64 fast path still places exactly",
+			fleet: fleet{
+				worker("w-frac", "gvisor", "node-a", tierTwo, withMaxActors(4),
+					withCapacityStrings("memory", "3.5Gi"),
+					assignedFor("demo", "other", resources.CPUMemory(0, 2<<30))),
+			},
+			constraints: Constraints{SandboxClass: "gvisor", Limits: resources.CPUMemory(0, 1536<<20)},
+			wantPod:     "w-frac",
+		},
+		{
+			name: "capacity reported off the int64 fast path still comes up short",
+			fleet: fleet{
+				worker("w-frac", "gvisor", "node-a", tierTwo, withMaxActors(4),
+					withCapacityStrings("memory", "3.5Gi"),
+					assignedFor("demo", "other", resources.CPUMemory(0, 2<<30))),
+			},
+			constraints: Constraints{SandboxClass: "gvisor", Limits: resources.CPUMemory(0, 1536<<20+1)},
 		},
 		{
 			name: "what the residents left over is still placeable",
@@ -505,9 +536,17 @@ func TestApplies(t *testing.T) {
 	}
 }
 
+// fleet is a WorkerSource over bare records, deriving each Entry on every
+// call the way the cache derives it on ingestion.
 type fleet []*ateapipb.Worker
 
-func (f fleet) Workers() ([]*ateapipb.Worker, error) { return f, nil }
+func (f fleet) Entries() ([]*workercache.Entry, error) {
+	out := make([]*workercache.Entry, 0, len(f))
+	for _, w := range f {
+		out = append(out, workercache.NewEntry(w))
+	}
+	return out, nil
+}
 
 func worker(pod, class, node string, lbls map[string]string, opts ...func(*ateapipb.Worker)) *ateapipb.Worker {
 	w := &ateapipb.Worker{
@@ -591,6 +630,21 @@ func withCapacity(cpuMilli, memBytes int64) func(*ateapipb.Worker) {
 			w.Status.Capacity = &ateapipb.WorkerResources{}
 		}
 		w.Status.Capacity.Resources = resources.CPUMemory(cpuMilli, memBytes)
+	}
+}
+
+// withCapacityStrings reports capacity in whatever form the strings take, for
+// quantities CPUMemory would canonicalize away.
+func withCapacityStrings(pairs ...string) func(*ateapipb.Worker) {
+	return func(w *ateapipb.Worker) {
+		if w.Status.Capacity == nil {
+			w.Status.Capacity = &ateapipb.WorkerResources{}
+		}
+		w.Status.Capacity.Resources = &ateapipb.Resources{}
+		for i := 0; i < len(pairs); i += 2 {
+			w.Status.Capacity.Resources.Limits = append(w.Status.Capacity.Resources.Limits,
+				&ateapipb.Limits{Name: pairs[i], Quantity: pairs[i+1]})
+		}
 	}
 }
 
@@ -683,4 +737,110 @@ func TestScheduleMalformedLimitsIsNotNoCapacity(t *testing.T) {
 	if errors.Is(err, ErrNoCapacity) {
 		t.Fatalf("Schedule() error = %v, want an error other than ErrNoCapacity", err)
 	}
+}
+
+type indexedFleet struct {
+	entries []*workercache.Entry
+	byName  map[string]*workercache.Entry
+	byNode  map[string][]*workercache.Entry
+}
+
+func newIndexedFleet(f fleet) *indexedFleet {
+	entries, _ := f.Entries()
+	byName := make(map[string]*workercache.Entry, len(entries)*2)
+	byNode := make(map[string][]*workercache.Entry, len(entries))
+	for _, e := range entries {
+		if name := e.Worker.GetMetadata().GetName(); name != "" {
+			byName[name] = e
+		}
+		if pod := e.Worker.GetWorkerPod(); pod != "" {
+			byName[pod] = e
+		}
+		if node := e.Worker.GetNodeName(); node != "" {
+			byNode[node] = append(byNode[node], e)
+		}
+	}
+	return &indexedFleet{entries: entries, byName: byName, byNode: byNode}
+}
+
+func (f *indexedFleet) Entries() ([]*workercache.Entry, error) { return f.entries, nil }
+func (f *indexedFleet) Entry(name string) (*workercache.Entry, bool) {
+	e, ok := f.byName[name]
+	return e, ok
+}
+func (f *indexedFleet) EntriesByNode(node string) []*workercache.Entry {
+	return f.byNode[node]
+}
+
+func TestScheduleSoftAffinity(t *testing.T) {
+	t.Run("prefers exact PreferredWorker when it has room", func(t *testing.T) {
+		f := fleet{
+			worker("w-other", "gvisor", "node-a", nil, withMaxActors(4)),
+			worker("w-pref", "gvisor", "node-b", nil, withMaxActors(4), assigned("demo", "a")),
+		}
+		got, err := New(newIndexedFleet(f), WithIntn(firstIntn)).Schedule(context.Background(), Constraints{
+			SandboxClass:    "gvisor",
+			PreferredWorker: "w-pref",
+		})
+		if err != nil {
+			t.Fatalf("Schedule() error = %v", err)
+		}
+		if got.GetWorkerPod() != "w-pref" {
+			t.Errorf("Schedule() = %q, want PreferredWorker w-pref", got.GetWorkerPod())
+		}
+	})
+
+	t.Run("falls back to another worker on the same node when PreferredWorker is full", func(t *testing.T) {
+		f := fleet{
+			worker("w-remote", "gvisor", "node-a", nil, withMaxActors(4)),
+			worker("w-pref-full", "gvisor", "node-b", nil, withMaxActors(1), assigned("demo", "a")),
+			worker("w-same-node", "gvisor", "node-b", nil, withMaxActors(4)),
+		}
+		got, err := New(newIndexedFleet(f), WithIntn(firstIntn)).Schedule(context.Background(), Constraints{
+			SandboxClass:    "gvisor",
+			PreferredWorker: "w-pref-full",
+		})
+		if err != nil {
+			t.Fatalf("Schedule() error = %v", err)
+		}
+		if got.GetWorkerPod() != "w-same-node" {
+			t.Errorf("Schedule() = %q, want same-node fallback w-same-node", got.GetWorkerPod())
+		}
+	})
+
+	t.Run("prefers worker on PreferredNodes when available", func(t *testing.T) {
+		f := fleet{
+			worker("w-remote-1", "gvisor", "node-a", nil, withMaxActors(4)),
+			worker("w-remote-2", "gvisor", "node-b", nil, withMaxActors(4)),
+			worker("w-local", "gvisor", "node-local", nil, withMaxActors(4), assigned("demo", "a")),
+		}
+		got, err := New(f, WithIntn(firstIntn)).Schedule(context.Background(), Constraints{
+			SandboxClass:   "gvisor",
+			PreferredNodes: []string{"node-local"},
+		})
+		if err != nil {
+			t.Fatalf("Schedule() error = %v", err)
+		}
+		if got.GetWorkerPod() != "w-local" {
+			t.Errorf("Schedule() = %q, want w-local on PreferredNodes", got.GetWorkerPod())
+		}
+	})
+
+	t.Run("falls back to pool when PreferredNodes and PreferredWorker node are full", func(t *testing.T) {
+		f := fleet{
+			worker("w-pref-full", "gvisor", "node-local", nil, withMaxActors(1), assigned("demo", "a")),
+			worker("w-remote-free", "gvisor", "node-remote", nil, withMaxActors(4)),
+		}
+		got, err := New(newIndexedFleet(f), WithIntn(firstIntn)).Schedule(context.Background(), Constraints{
+			SandboxClass:    "gvisor",
+			PreferredWorker: "w-pref-full",
+			PreferredNodes:  []string{"node-local"},
+		})
+		if err != nil {
+			t.Fatalf("Schedule() error = %v", err)
+		}
+		if got.GetWorkerPod() != "w-remote-free" {
+			t.Errorf("Schedule() = %q, want pool-wide fallback w-remote-free", got.GetWorkerPod())
+		}
+	})
 }

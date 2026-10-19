@@ -1162,3 +1162,38 @@ func TestBuildDeploymentPreview(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerPassthroughEnv(t *testing.T) {
+	got := WorkerPassthroughEnv([]string{
+		"UNRELATED=1",
+		"ATEWORKER_GVISOR_OVERLAY=self:tmpfs",
+		"ATEOM_MAX_CONCURRENT_REQUESTS=64",
+		"ATE_ENABLE_ACTOR_CPU_BURST_FLOOR=true",
+		"ATEWORKER_EMPTY=",
+	})
+	want := []corev1.EnvVar{
+		{Name: "ATEOM_MAX_CONCURRENT_REQUESTS", Value: "64"},
+		{Name: "ATEWORKER_GVISOR_OVERLAY", Value: "self:tmpfs"},
+		{Name: "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR", Value: "true"},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("WorkerPassthroughEnv mismatch (-want +got):\n%s", diff)
+	}
+
+	c := buildDeploymentApplyConfig(
+		testWorkerPoolApplyConfig(nil),
+		workerOTelSettings{},
+		installdefaults.SystemNamespace,
+		installdefaults.AteletServiceAccount,
+		installdefaults.RouterServiceAccount,
+		egresspolicy.DNSEgressPolicyEnforceInAtunnel,
+		got...,
+	).Spec.Template.Spec.Containers[0]
+	env := envByName(c.Env)
+	for _, ev := range want {
+		info, ok := env[ev.Name]
+		if !ok || info.value != ev.Value {
+			t.Errorf("worker container env %s = %q (ok=%v), want %q", ev.Name, info.value, ok, ev.Value)
+		}
+	}
+}

@@ -123,12 +123,29 @@ var (
 
 	objectStorePluginSocket   = pflag.String("objectstore-plugin-socket", "/run/objectstore-plugin/node.sock", "Unix socket of the node object-store plugin that external snapshots are fetched and uploaded through, and every sandbox asset is fetched through. A gs:// asset the plugin cannot serve is then read anonymously.")
 	snapshotUploadDelay       = pflag.Duration("snapshot-upload-delay", snapshottracker.DefaultUploadDelay, "How long after an actor's oldest snapshot not yet in object storage was taken atelet uploads the actor's latest local snapshot in the background; later while an upload is in progress or failing.")
-	snapshotDetachDelay       = pflag.Duration("snapshot-detach-delay", snapshottracker.DefaultDetachDelay, "How long an actor stays suspended on this node, its latest snapshot kept locally, before atelet detaches it in the background.")
+	snapshotDetachDelay       = pflag.Duration("snapshot-detach-delay", snapshottracker.DefaultDetachDelay, "How long an actor stays suspended on this node, its latest snapshot kept locally, before atelet detaches it in the background (also configurable via ATELET_SNAPSHOT_DETACH_DELAY when the flag is unset).")
 	snapshotUploadWorkers     = pflag.Int("snapshot-upload-workers", snapshottracker.DefaultUploadWorkers, "How many background snapshot uploads atelet runs at once.")
 	snapshotDetachWorkers     = pflag.Int("snapshot-detach-workers", snapshottracker.DefaultDetachWorkers, "How many background detaches atelet runs at once.")
 	snapshotReportWorkers     = pflag.Int("snapshot-report-workers", snapshottracker.DefaultReportWorkers, "How many background snapshot state reports atelet runs at once. 0 disables background reporting.")
 	snapshotReportGiveUpAfter = pflag.Duration("snapshot-report-give-up-after", snapshottracker.DefaultReportGiveUpAfter, "How long after a background upload or detach atelet keeps retrying a failed snapshot state report before giving up on it.")
 )
+
+const snapshotDetachDelayEnv = "ATELET_SNAPSHOT_DETACH_DELAY"
+
+func resolveSnapshotDetachDelay(flagVal time.Duration, flagChanged bool, envVal string) (time.Duration, error) {
+	d := flagVal
+	if !flagChanged && envVal != "" {
+		parsed, err := time.ParseDuration(envVal)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s=%q: %w", snapshotDetachDelayEnv, envVal, err)
+		}
+		d = parsed
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--snapshot-detach-delay %v must be > 0", d)
+	}
+	return d, nil
+}
 
 var _ imagecache.CandidateKeychain = (*credentialprovider.Keychain)(nil)
 
@@ -150,6 +167,12 @@ func main() {
 	if err := rejectStorageEnv(); err != nil {
 		serverboot.Fatal(ctx, "Invalid environment", err)
 	}
+	detachDelayFlag := pflag.Lookup("snapshot-detach-delay")
+	detachDelay, err := resolveSnapshotDetachDelay(*snapshotDetachDelay, detachDelayFlag != nil && detachDelayFlag.Changed, os.Getenv(snapshotDetachDelayEnv))
+	if err != nil {
+		serverboot.Fatal(ctx, "Invalid --snapshot-detach-delay", err)
+	}
+	*snapshotDetachDelay = detachDelay
 	if err := validateSnapshotDelayFlags(); err != nil {
 		serverboot.Fatal(ctx, "Invalid snapshot delay flags", err)
 	}
@@ -697,7 +720,6 @@ func NewService(
 		objectStorePlugin:     objectStorePlugin,
 		assetPlugin:           assetPlugin,
 		pluginSocket:          pluginSocket,
-		snapshotScratchDir:    ateletpath.SnapshotScratchDir,
 		instruments:           instruments,
 		volumePlugins:         volumePlugins,
 		csiDriverConfigGetter: csiDriverConfigGetter,
@@ -1081,19 +1103,19 @@ func toWorkerFidelity(fidelity ateletpb.SnapshotFidelity) ateworkerpb.SnapshotFi
 }
 
 func (s *Atelet) moveLocalCheckpoint(ctx context.Context, req *ateletpb.CheckpointRequest, rec *sandboxAssetsRecord) error {
-	actorDir := ateletpath.ActorPath(req.GetActorUid())
-	root, err := os.OpenRoot(actorDir)
+	snapshotRoot := ateletpath.ActorSnapshotPath(req.GetActorUid())
+	root, err := os.OpenRoot(snapshotRoot)
 	if err != nil {
-		return fmt.Errorf("while opening actor directory: %w", err)
+		return fmt.Errorf("while opening actor snapshot directory: %w", err)
 	}
 	defer root.Close()
 
-	checkpointDir, err := filepath.Rel(actorDir, ateletpath.CheckpointStateDir(req.GetActorUid()))
+	checkpointDir, err := filepath.Rel(snapshotRoot, ateletpath.CheckpointStateDir(req.GetActorUid()))
 	if err != nil {
 		return err
 	}
 	snapshotName := req.GetSnapshot().GetSnapshotUuid()
-	localDir, err := filepath.Rel(actorDir, ateletpath.LocalSnapshotDir(req.GetActorUid(), snapshotName))
+	localDir, err := filepath.Rel(snapshotRoot, ateletpath.LocalSnapshotDir(req.GetActorUid(), snapshotName))
 	if err != nil {
 		return err
 	}
@@ -1597,6 +1619,16 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		return nil, err
 	}
 
+	if !directLocal {
+		// This restore downloaded a snapshot from object storage rather than
+		// using a node-local copy, so any earlier local snapshot for this actor
+		// on this node is superseded and can be reclaimed immediately.
+		s.snapshots.ForgetLocal(actorUID)
+		if err := snapshottracker.PruneLocalCheckpoints(ctx, actorUID, s.snapshots.LocalSnapshotsToKeep(actorUID)...); err != nil {
+			slog.WarnContext(ctx, "failed to prune superseded local checkpoints after remote restore", slog.Any("actor", actorRef), slog.Any("err", err))
+		}
+	}
+
 	return &ateletpb.RestoreResponse{}, nil
 }
 
@@ -1715,18 +1747,18 @@ func checkLocalSnapshotFiles(dir string, files []string) error {
 }
 
 // copyLocalCheckpoint stages files from the local checkpoint snapshotName under
-// srcDir into dstDir. Both must be inside actorDir, which confines every access.
-func (s *Atelet) copyLocalCheckpoint(ctx context.Context, actorDir, snapshotName, srcDir, dstDir string, files []string) error {
-	root, err := os.OpenRoot(actorDir)
+// srcDir into dstDir. Both must be inside snapshotRootDir, which confines every access.
+func (s *Atelet) copyLocalCheckpoint(ctx context.Context, snapshotRootDir, snapshotName, srcDir, dstDir string, files []string) error {
+	root, err := os.OpenRoot(snapshotRootDir)
 	if err != nil {
-		return fmt.Errorf("while opening actor directory: %w", err)
+		return fmt.Errorf("while opening actor snapshot directory: %w", err)
 	}
 	defer root.Close()
-	srcDir, err = filepath.Rel(actorDir, filepath.Join(srcDir, snapshotName))
+	srcDir, err = filepath.Rel(snapshotRootDir, filepath.Join(srcDir, snapshotName))
 	if err != nil {
 		return err
 	}
-	dstDir, err = filepath.Rel(actorDir, dstDir)
+	dstDir, err = filepath.Rel(snapshotRootDir, dstDir)
 	if err != nil {
 		return err
 	}
@@ -1748,10 +1780,10 @@ func (s *Atelet) copyLocalCheckpoint(ctx context.Context, actorDir, snapshotName
 		if err := root.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			return fmt.Errorf("while creating parent directory for %s: %w", dst, err)
 		}
-		// Link rather than copy. The local checkpoint lives under the same actor dir
-		// as the restore staging area, so this stages the memory image in constant
-		// time instead of re-writing its whole working set. Nothing rewrites the
-		// shared inode: CH demand-pages from the staged image read-only,
+		// Link rather than copy. The local checkpoint lives under the same actor
+		// snapshot dir as the restore staging area, so this stages the memory image
+		// in constant time instead of re-writing its whole working set. Nothing rewrites
+		// the shared inode: CH demand-pages from the staged image read-only,
 		// rewriteSnapshotSocketPaths renames its rewritten config.json into place
 		// rather than truncating, and MergeDeltaIntoBase refuses its in-place overlay
 		// once the image carries a second link.
@@ -2161,10 +2193,14 @@ func removeActorDirs(actorUID string) error {
 	if err := resetActorDirs(actorUID); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(ateletpath.ActorPath(actorUID)); err != nil {
-		return wrapFileSystemErr("while deleting actor dir", err)
+	var errs []error
+	if err := os.RemoveAll(ateletpath.ActorSnapshotPath(actorUID)); err != nil {
+		errs = append(errs, wrapFileSystemErr("while deleting actor snapshot dir", err))
 	}
-	return nil
+	if err := os.RemoveAll(ateletpath.ActorPath(actorUID)); err != nil {
+		errs = append(errs, wrapFileSystemErr("while deleting actor dir", err))
+	}
+	return errors.Join(errs...)
 }
 
 // ateletServerTLSConfig builds a *tls.Config for a gRPC server that presents the

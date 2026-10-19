@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
 	"go.ate.dev/substrate/internal/pluginsocket"
 	objectstorev1 "go.ate.dev/substrate/pkg/proto/objectstorepb/v1"
 	"google.golang.org/grpc"
@@ -109,10 +110,14 @@ func (s *Atelet) uploadManifest(ctx context.Context, snapshotURI string, manifes
 // snapshotScratch creates a fresh directory for one manifest transfer. The
 // caller removes it.
 func (s *Atelet) snapshotScratch() (string, error) {
-	if err := os.MkdirAll(s.snapshotScratchDir, 0o700); err != nil {
+	scratchDir := s.snapshotScratchDir
+	if scratchDir == "" {
+		scratchDir = ateletpath.SnapshotScratchDir()
+	}
+	if err := os.MkdirAll(scratchDir, 0o700); err != nil {
 		return "", fmt.Errorf("while creating snapshot scratch dir: %w", err)
 	}
-	dir, err := os.MkdirTemp(s.snapshotScratchDir, "manifest-")
+	dir, err := os.MkdirTemp(scratchDir, "manifest-")
 	if err != nil {
 		return "", fmt.Errorf("while creating snapshot scratch dir: %w", err)
 	}

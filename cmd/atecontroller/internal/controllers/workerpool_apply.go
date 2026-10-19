@@ -104,11 +104,44 @@ const (
 	workerCapacityVolume        = "worker-capacity"
 )
 
+// WorkerPassthroughEnv extracts opt-in worker and object-mount tuning
+// environment variables (ATEWORKER_*, ATEOM_*, and
+// ATE_ENABLE_ACTOR_CPU_BURST_FLOOR) from environ in sorted key order so the
+// controller can propagate them to worker pods.
+func WorkerPassthroughEnv(environ []string) []corev1.EnvVar {
+	byName := make(map[string]string)
+	for _, entry := range environ {
+		k, v, ok := strings.Cut(entry, "=")
+		if !ok || v == "" {
+			continue
+		}
+		if strings.HasPrefix(k, "ATEWORKER_") ||
+			strings.HasPrefix(k, "ATEOM_") ||
+			k == "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR" ||
+			k == "ATE_ACTOR_CPU_LIMIT_FLOOR" {
+			byName[k] = v
+		}
+	}
+	if len(byName) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(byName))
+	for k := range byName {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	out := make([]corev1.EnvVar, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, corev1.EnvVar{Name: k, Value: byName[k]})
+	}
+	return out
+}
+
 // buildDeploymentApplyConfig constructs the SSA apply configuration for the
 // Deployment managed by a WorkerPool. Only fields owned by this controller
 // are declared here. otel is propagated to the worker container (see
 // workerContainerEnv).
-func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy string) *appsv1ac.DeploymentApplyConfiguration {
+func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy string, passthroughEnv ...corev1.EnvVar) *appsv1ac.DeploymentApplyConfiguration {
 	labels := map[string]string{}
 	annotations := map[string]string{}
 	if wp.Spec.Template != nil {
@@ -188,7 +221,7 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSetti
 				WithPath("/readyz").
 				WithPort(intstr.FromString("readyz")))).
 		WithSecurityContext(workerSecurityContext(wp.Spec.DefaultSandboxClass())).
-		WithEnv(workerContainerEnv(otel)...).
+		WithEnv(workerContainerEnv(otel, passthroughEnv...)...).
 		WithVolumeMounts(
 			corev1ac.VolumeMount().
 				WithName(workerCapacityVolume).
@@ -292,7 +325,7 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel workerOTelSetti
 // exports through atelet's relay whenever atelet has a collector, and adds the
 // OTLP endpoint only when one is configured. Every ref precedes
 // OTEL_RESOURCE_ATTRIBUTES so its $(...) substitutions resolve.
-func workerContainerEnv(otel workerOTelSettings) []*corev1ac.EnvVarApplyConfiguration {
+func workerContainerEnv(otel workerOTelSettings, passthroughEnv ...corev1.EnvVar) []*corev1ac.EnvVarApplyConfiguration {
 	// The pool pair also labels every usage record. A worker pod runs in its
 	// WorkerPool's namespace.
 	envs := []*corev1ac.EnvVarApplyConfiguration{
@@ -340,6 +373,21 @@ func workerContainerEnv(otel workerOTelSettings) []*corev1ac.EnvVarApplyConfigur
 		envs = append(envs, corev1ac.EnvVar().
 			WithName("OTEL_METRICS_EXPORTER").
 			WithValue(otel.MetricsExporter))
+	}
+	if len(passthroughEnv) > 0 {
+		seen := make(map[string]bool, len(envs))
+		for _, e := range envs {
+			if e.Name != nil {
+				seen[*e.Name] = true
+			}
+		}
+		for _, pe := range passthroughEnv {
+			if pe.Name == "" || seen[pe.Name] {
+				continue
+			}
+			seen[pe.Name] = true
+			envs = append(envs, corev1ac.EnvVar().WithName(pe.Name).WithValue(pe.Value))
+		}
 	}
 	return envs
 }

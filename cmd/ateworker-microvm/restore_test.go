@@ -19,7 +19,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/ttrpc"
 	"google.golang.org/grpc/codes"
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/ch"
@@ -490,6 +493,226 @@ func TestNewReseedNonce(t *testing.T) {
 	}
 }
 
+type fakeReseeder struct {
+	calls int
+	fn    func(ctx context.Context, attempt int, data []byte) error
+}
+
+func (f *fakeReseeder) ReseedRandomDev(ctx context.Context, data []byte) error {
+	f.calls++
+	return f.fn(ctx, f.calls, data)
+}
+
+func TestReseedGuestCRNG(t *testing.T) {
+	t.Run("succeeds on first attempt", func(t *testing.T) {
+		f := &fakeReseeder{
+			fn: func(_ context.Context, _ int, data []byte) error {
+				if len(data) != 32 {
+					t.Errorf("nonce length = %d, want 32", len(data))
+				}
+				return nil
+			},
+		}
+		if err := reseedGuestCRNG(context.Background(), f); err != nil {
+			t.Fatalf("reseedGuestCRNG: %v", err)
+		}
+		if f.calls != 1 {
+			t.Errorf("calls = %d, want 1", f.calls)
+		}
+	})
+
+	t.Run("retries transient timeout and succeeds", func(t *testing.T) {
+		var firstNonce []byte
+		f := &fakeReseeder{
+			fn: func(_ context.Context, attempt int, data []byte) error {
+				if attempt == 1 {
+					firstNonce = append([]byte(nil), data...)
+					return context.DeadlineExceeded
+				}
+				if !bytes.Equal(data, firstNonce) {
+					t.Errorf("retry nonce changed across attempts")
+				}
+				return nil
+			},
+		}
+		if err := reseedGuestCRNG(context.Background(), f); err != nil {
+			t.Fatalf("reseedGuestCRNG: %v", err)
+		}
+		if f.calls != 2 {
+			t.Errorf("calls = %d, want 2", f.calls)
+		}
+	})
+
+	t.Run("fails after exhausting all attempts", func(t *testing.T) {
+		sentinel := errors.New("guest agent stalled")
+		f := &fakeReseeder{
+			fn: func(_ context.Context, _ int, _ []byte) error {
+				return sentinel
+			},
+		}
+		err := reseedGuestCRNG(context.Background(), f)
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("reseedGuestCRNG error = %v, want %v", err, sentinel)
+		}
+		if f.calls != reseedMaxAttempts {
+			t.Errorf("calls = %d, want %d", f.calls, reseedMaxAttempts)
+		}
+	})
+
+	t.Run("does not retry when ttrpc connection is closed", func(t *testing.T) {
+		f := &fakeReseeder{
+			fn: func(_ context.Context, _ int, _ []byte) error {
+				return ttrpc.ErrClosed
+			},
+		}
+		err := reseedGuestCRNG(context.Background(), f)
+		if !errors.Is(err, ttrpc.ErrClosed) {
+			t.Fatalf("reseedGuestCRNG error = %v, want %v", err, ttrpc.ErrClosed)
+		}
+		if f.calls != 1 {
+			t.Errorf("calls = %d, want 1 (closed connection cannot recover)", f.calls)
+		}
+	})
+
+	t.Run("stops retrying when caller context is canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		f := &fakeReseeder{
+			fn: func(_ context.Context, _ int, _ []byte) error {
+				cancel()
+				return context.Canceled
+			},
+		}
+		err := reseedGuestCRNG(ctx, f)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("reseedGuestCRNG error = %v, want %v", err, context.Canceled)
+		}
+		if f.calls != 1 {
+			t.Errorf("calls = %d, want 1", f.calls)
+		}
+	})
+
+	t.Run("respects ATEWORKER_MICROVM_CRNG_TIMEOUT_MS override", func(t *testing.T) {
+		t.Setenv("ATEWORKER_MICROVM_CRNG_TIMEOUT_MS", "15000")
+		if got := reseedAttemptTimeoutForRestore(); got != 15*time.Second {
+			t.Fatalf("reseedAttemptTimeoutForRestore() = %v, want 15s", got)
+		}
+	})
+}
+
+func TestDifferentialSnapshotCheckpointAndRestoreRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		deltaFormat        string
+		preserveRestoreDir bool
+	}{
+		{name: "sparse deflate staging dir", deltaFormat: "sparse", preserveRestoreDir: false},
+		{name: "sparse deflate preserved local snapshot", deltaFormat: "sparse", preserveRestoreDir: true},
+		{name: "compact delta staging dir", deltaFormat: "compact", preserveRestoreDir: false},
+		{name: "compact delta preserved local snapshot", deltaFormat: "compact", preserveRestoreDir: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ATEWORKER_MICROVM_DIFF_SNAPSHOT", "true")
+			t.Setenv("ATEWORKER_MICROVM_DELTA_FORMAT", tc.deltaFormat)
+
+			ctx := context.Background()
+			ateRoot := t.TempDir()
+			baseDir := filepath.Join(ateRoot, "actors")
+			if err := os.MkdirAll(baseDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			origActorsDir := nodepath.ActorsDir
+			nodepath.ActorsDir = baseDir
+			t.Cleanup(func() { nodepath.ActorsDir = origActorsDir })
+			s := &AteWorkerService{}
+
+			const baseID = "golden-uid"
+			const actorUID = "actor-1"
+			const size = 2 << 20 // 2 MiB
+			const pageSize = 4096
+
+			baseImg := make([]byte, size)
+			for i := 0; i < size; i += 2 * pageSize {
+				for j := 0; j < pageSize; j++ {
+					baseImg[i+j] = byte((i/pageSize + j) % 251 + 1)
+				}
+			}
+			warmImg := append([]byte(nil), baseImg...)
+			// Dirty 4 pages.
+			for _, p := range []int{0, 10, 40, 200} {
+				off := p * pageSize
+				for j := 0; j < pageSize; j++ {
+					warmImg[off+j] = 0xEE
+				}
+			}
+			wantHash := sha256.Sum256(warmImg)
+
+			// 1. Cold restore caches golden base.
+			coldRestoreDir := filepath.Join(ateRoot, "cold-restore")
+			if err := os.MkdirAll(coldRestoreDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(coldRestoreDir, "memory-ranges"), baseImg, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := s.reconstructDeltaIfNeeded(ctx, actorUID, baseID, coldRestoreDir, false); err != nil {
+				t.Fatalf("cold reconstructDeltaIfNeeded: %v", err)
+			}
+			if _, err := os.Stat(goldenBaseMemoryRangesPath(baseID)); err != nil {
+				t.Fatalf("golden base cache not populated on cold restore: %v", err)
+			}
+
+			// 2. Warm checkpoint deflates against cached golden base.
+			checkpointDir := filepath.Join(ateRoot, "warm-checkpoint")
+			if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(checkpointDir, "config.json"), []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(checkpointDir, "state.json"), []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(checkpointDir, baseIDFile), []byte(baseID), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(checkpointDir, "memory-ranges"), warmImg, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.maybeDeflateCheckpointAgainstGoldenBase(ctx, baseID, actorUID, checkpointDir); err != nil {
+				t.Fatalf("maybeDeflateCheckpointAgainstGoldenBase: %v", err)
+			}
+			if !isDeltaSnapshot(checkpointDir) {
+				t.Fatal("expected checkpointDir to be marked as delta snapshot")
+			}
+
+			// 3. Warm restore reconstructs byte-for-byte identical memory-ranges.
+			vmmDir, vmmPreserve, err := s.reconstructDeltaIfNeeded(ctx, actorUID, baseID, checkpointDir, tc.preserveRestoreDir)
+			if err != nil {
+				t.Fatalf("warm reconstructDeltaIfNeeded: %v", err)
+			}
+			if vmmPreserve {
+				t.Fatal("expected vmmPreserve=false after delta reconstruction")
+			}
+			if tc.preserveRestoreDir {
+				if vmmDir == checkpointDir {
+					t.Fatal("expected preserved delta snapshot to stage into separate restore dir")
+				}
+				if !isDeltaSnapshot(checkpointDir) {
+					t.Fatal("expected preserved delta snapshot directory to retain delta markers")
+				}
+			}
+
+			gotBytes, err := os.ReadFile(filepath.Join(vmmDir, "memory-ranges"))
+			if err != nil {
+				t.Fatalf("reading reconstructed memory-ranges: %v", err)
+			}
+			if gotHash := sha256.Sum256(gotBytes); gotHash != wantHash {
+				t.Fatalf("reconstructed SHA256 = %x, want %x", gotHash, wantHash)
+			}
+		})
+	}
+}
+
 func TestRPCsRejectUntrustedRuntimeAssetPaths(t *testing.T) {
 	s := &AteWorkerService{}
 	ctx := context.Background()
@@ -577,3 +800,141 @@ func TestRestoreMemoryFidelityRequiresKernelAndImage(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkRestorePrep_ParallelVsSequential(b *testing.B) {
+	const id = "bench-actor-uid"
+	const kernel = "/var/lib/ate/actors/bench-actor-uid/sandbox-assets/kata-kernel"
+	const image = "/var/lib/ate/actors/bench-actor-uid/sandbox-assets/kata-image"
+
+	setupDir := func(b *testing.B) string {
+		b.Helper()
+		dir := b.TempDir()
+		cfg := map[string]any{
+			"vsock":   map[string]any{"cid": 3, "socket": "/run/vc/vm/golden/clh.sock"},
+			"console": map[string]any{"mode": "File", "file": "/run/vc/vm/golden/console.log"},
+			"serial":  map[string]any{"mode": "File", "file": "/run/vc/vm/golden/serial.log"},
+			"fs":      []map[string]any{{"tag": kata.FsTag, "socket": "/run/vc/vm/golden/virtiofsd.sock"}},
+			"payload": map[string]any{"kernel": "/var/lib/ate/actors/golden/sandbox-assets/kata-kernel", "cmdline": "console=hvc0"},
+			"pmem":    []map[string]any{{"id": guestImagePmemID, "file": "/var/lib/ate/actors/golden/sandbox-assets/kata-image", "discard_writes": true}},
+		}
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0o600); err != nil {
+			b.Fatal(err)
+		}
+		return dir
+	}
+
+	b.Run("SequentialPrep", func(b *testing.B) {
+		dir := setupDir(b)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			// Simulate sequential PrepareEgress RPC + lowers/VMM restore + config.json rewrite
+			time.Sleep(2 * time.Millisecond)
+			time.Sleep(2 * time.Millisecond)
+			if err := rewriteSnapshotPaths(dir, id, kernel, image); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("ParallelPrep", func(b *testing.B) {
+		dir := setupDir(b)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			egressDone := make(chan error, 1)
+			go func() {
+				// Simulate async PrepareEgress RPC overlapped across lowers + VMM restore
+				time.Sleep(2 * time.Millisecond)
+				egressDone <- nil
+			}()
+			reconstructDone := make(chan error, 1)
+			go func() {
+				reconstructDone <- rewriteSnapshotPaths(dir, id, kernel, image)
+			}()
+			// Simulate lowers + VMM restore overlapped with async PrepareEgress and config.json rewrite
+			time.Sleep(2 * time.Millisecond)
+			if err := <-reconstructDone; err != nil {
+				b.Fatal(err)
+			}
+			if err := <-egressDone; err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkApplyMemoryRangesDelta(b *testing.B) {
+	ctx := context.Background()
+	dir := b.TempDir()
+	const residentSize = 64 << 20 // 64 MiB
+	const pageSize = 4096
+
+	baseFile := filepath.Join(dir, "golden-base")
+	targetFile := filepath.Join(dir, "target-full")
+	deltaSparseFile := filepath.Join(dir, "delta-sparse")
+
+	chunk := bytes.Repeat([]byte{0x5A}, 1<<20)
+	bf, err := os.Create(baseFile)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tf, err := os.Create(targetFile)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for written := 0; written < residentSize; written += len(chunk) {
+		if _, err := bf.Write(chunk); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := tf.Write(chunk); err != nil {
+			b.Fatal(err)
+		}
+	}
+	bf.Close()
+	dirtyPage := bytes.Repeat([]byte{0xA5}, pageSize)
+	for p := 0; p < residentSize/pageSize; p += 25 {
+		if _, err := tf.WriteAt(dirtyPage, int64(p*pageSize)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	tf.Close()
+	if err := ch.CopySparseFileFast(ctx, targetFile, deltaSparseFile); err != nil {
+		b.Fatal(err)
+	}
+	if _, _, err := ch.DeflateAgainstBase(ctx, baseFile, deltaSparseFile); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("FullCopy_64MB", func(b *testing.B) {
+		outFile := filepath.Join(dir, "full-copy-out")
+		b.SetBytes(residentSize)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := ch.CopySparseFileFast(ctx, targetFile, outFile); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("DifferentialOverlayOnSlot_64MB", func(b *testing.B) {
+		slotFile := filepath.Join(dir, "slot-out")
+		if err := ch.CopySparseFileFast(ctx, baseFile, slotFile); err != nil {
+			b.Fatal(err)
+		}
+		b.SetBytes(residentSize)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if _, _, err := ch.OverlaySparseRegionsRecorded(ctx, deltaSparseFile, slotFile); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+

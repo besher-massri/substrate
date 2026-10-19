@@ -88,6 +88,22 @@ func uploadBufferMemory(client ObjectStorage) int64 {
 	}
 }
 
+// uploadBufferMemoryForFile returns the backend buffer reservation for a file
+// whose populated byte count is known. On GCS, files with populated bytes below
+// uploadCompositeMin/2 cannot produce a compressed stream >= uploadCompositeMin
+// and therefore stay on putSingle without allocating composite part buffers.
+func uploadBufferMemoryForFile(client ObjectStorage, populated int64) int64 {
+	switch client.(type) {
+	case *gcsClient:
+		if populated < uploadCompositeMin/2 {
+			return max(populated*2, 4<<20)
+		}
+		return uploadCompositeMin + 2*uploadConcurrency*uploadPartSize
+	default:
+		return uploadBufferMemory(client)
+	}
+}
+
 type uploadPlan struct {
 	workers int
 	parts   int
@@ -96,6 +112,7 @@ type uploadPlan struct {
 
 func (u *Uploader) plan(content io.Reader) (uploadPlan, error) {
 	buffers := uploadBufferMemory(u.client)
+	fileBuffers := buffers
 	workers := min(int64(runtime.GOMAXPROCS(0)), (u.budget.capacity-buffers)/parallelWorkerMemory)
 	parts := 1
 	if f, ok := content.(*os.File); ok {
@@ -115,11 +132,13 @@ func (u *Uploader) plan(content io.Reader) (uploadPlan, error) {
 		if seekErr != nil {
 			return uploadPlan{}, seekErr
 		}
+		fileBuffers = min(buffers, uploadBufferMemoryForFile(u.client, populated))
+		workers = min(int64(runtime.GOMAXPROCS(0)), (u.budget.capacity-fileBuffers)/parallelWorkerMemory)
 		// Holes never enter the compressor or range uploads.
 		workers = min(workers, populated/parZstdChunk+1)
 		parts = min(sparsePartCount(populated), int(u.budget.capacity/sparseUploadMemory))
 	}
-	memory := buffers + workers*parallelWorkerMemory
+	memory := fileBuffers + workers*parallelWorkerMemory
 	if _, ok := u.client.(sparseFilePutter); ok {
 		// The range-parallel path and streaming fallback are alternatives,
 		// so reserve the larger requirement rather than adding both.
@@ -147,6 +166,11 @@ func (u *Uploader) Send(ctx context.Context, url string, content io.Reader) erro
 		return err
 	}
 	memory := uploadBufferMemory(u.client)
+	if f, ok := content.(*os.File); ok {
+		if info, err := f.Stat(); err == nil && info.Mode().IsRegular() {
+			memory = min(memory, uploadBufferMemoryForFile(u.client, info.Size()))
+		}
+	}
 	if err := u.budget.reserved.Acquire(ctx, memory); err != nil {
 		return err
 	}

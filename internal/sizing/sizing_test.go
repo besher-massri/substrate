@@ -101,3 +101,64 @@ func TestApplyToOCISpecNoopWhenEmpty(t *testing.T) {
 		t.Error("empty SandboxSize mutated spec")
 	}
 }
+
+func TestApplyToOCISpecWithCPUBurstFloor(t *testing.T) {
+	t.Run("default unset preserves fractional quota", func(t *testing.T) {
+		spec := &specs.Spec{}
+		size := SandboxSize{MilliCPU: 250, MemoryBytes: 536870912}
+		size.ApplyToOCISpec(spec)
+		if got := *spec.Linux.Resources.CPU.Quota; got != 25000 {
+			t.Fatalf("default Quota for 250m = %d, want 25000", got)
+		}
+		if size.MilliCPU != 250 {
+			t.Fatalf("size.MilliCPU mutated to %d, want 250", size.MilliCPU)
+		}
+	})
+
+	t.Run("ATE_ENABLE_ACTOR_CPU_BURST_FLOOR=true enforces 1000m floor on sub-core actor", func(t *testing.T) {
+		t.Setenv(EnvEnableActorCPUBurstFloor, "true")
+		spec := &specs.Spec{}
+		size := SandboxSize{MilliCPU: 250, MemoryBytes: 536870912}
+		size.ApplyToOCISpec(spec)
+		if got := *spec.Linux.Resources.CPU.Quota; got != 100000 {
+			t.Fatalf("Quota with burst floor for 250m = %d, want 100000 (1 core)", got)
+		}
+		// Proportional MilliCPU on SandboxSize stays 250m.
+		if size.MilliCPU != 250 {
+			t.Fatalf("size.MilliCPU = %d, want 250", size.MilliCPU)
+		}
+		// Above-floor actor (2000m) keeps its 2000m quota.
+		spec2 := &specs.Spec{}
+		(SandboxSize{MilliCPU: 2000}).ApplyToOCISpec(spec2)
+		if got := *spec2.Linux.Resources.CPU.Quota; got != 200000 {
+			t.Fatalf("Quota with burst floor for 2000m = %d, want 200000", got)
+		}
+	})
+
+	t.Run("ATE_ACTOR_CPU_LIMIT_FLOOR=1 and 500m", func(t *testing.T) {
+		t.Setenv(EnvActorCPULimitFloor, "1")
+		spec := &specs.Spec{}
+		(SandboxSize{MilliCPU: 250}).ApplyToOCISpec(spec)
+		if got := *spec.Linux.Resources.CPU.Quota; got != 100000 {
+			t.Fatalf("Quota with ATE_ACTOR_CPU_LIMIT_FLOOR=1 for 250m = %d, want 100000", got)
+		}
+
+		t.Setenv(EnvActorCPULimitFloor, "500m")
+		spec500 := &specs.Spec{}
+		(SandboxSize{MilliCPU: 250}).ApplyToOCISpec(spec500)
+		if got := *spec500.Linux.Resources.CPU.Quota; got != 50000 {
+			t.Fatalf("Quota with ATE_ACTOR_CPU_LIMIT_FLOOR=500m for 250m = %d, want 50000", got)
+		}
+	})
+}
+
+func BenchmarkApplyToOCISpecWithBurstFloor(b *testing.B) {
+	b.Setenv(EnvEnableActorCPUBurstFloor, "true")
+	size := SandboxSize{MilliCPU: 250, MemoryBytes: 536870912}
+	spec := &specs.Spec{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		size.ApplyToOCISpec(spec)
+	}
+}

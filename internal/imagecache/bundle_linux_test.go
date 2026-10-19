@@ -367,3 +367,122 @@ func TestSetupBundleRootfs_ImageVolumes(t *testing.T) {
 		})
 	}
 }
+
+func TestMountPointsUnderStatx_NonExistentAndUnmountedBundle(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	points, err := mountPointsUnderStatx(missing)
+	if err != nil {
+		t.Fatalf("mountPointsUnderStatx(missing) error = %v", err)
+	}
+	if len(points) != 0 {
+		t.Fatalf("mountPointsUnderStatx(missing) = %v, want empty", points)
+	}
+
+	bundle := t.TempDir()
+	for _, sub := range []string{
+		filepath.Join(bundle, "rootfs", "etc"),
+		filepath.Join(bundle, "upper", "var"),
+		filepath.Join(bundle, "work", "work"),
+		filepath.Join(bundle, "volumes", "agent"),
+	} {
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", sub, err)
+		}
+	}
+	points, err = mountPointsUnderStatx(bundle)
+	if err != nil {
+		t.Fatalf("mountPointsUnderStatx(unmounted bundle) error = %v", err)
+	}
+	if len(points) != 0 {
+		t.Fatalf("mountPointsUnderStatx(unmounted bundle) = %v, want empty", points)
+	}
+
+	// Verify UnmountAllUnder succeeds under both fast statx and mountinfo modes.
+	t.Setenv(EnvFastUnmount, "true")
+	if err := UnmountAllUnder(bundle); err != nil {
+		t.Fatalf("UnmountAllUnder(fast=true): %v", err)
+	}
+	t.Setenv(EnvFastUnmount, "false")
+	if err := UnmountAllUnder(bundle); err != nil {
+		t.Fatalf("UnmountAllUnder(fast=false): %v", err)
+	}
+}
+
+func TestUnmountAllUnder_DetachesRegularFileBindMount(t *testing.T) {
+	roottest.Require(t, "mount/unmount")
+	stateDir := t.TempDir()
+	src := filepath.Join(t.TempDir(), "netns")
+	target := filepath.Join(stateDir, "null-netns")
+	for _, f := range []string{src, target} {
+		if err := os.WriteFile(f, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.Mount(src, target, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind mount: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(target, unix.MNT_DETACH) })
+
+	pts, err := mountPointsUnderStatx(stateDir)
+	if err != nil {
+		t.Fatalf("mountPointsUnderStatx: %v", err)
+	}
+	if len(pts) != 1 || pts[0] != target {
+		t.Fatalf("mountPointsUnderStatx = %v, want [%q]", pts, target)
+	}
+
+	t.Setenv(EnvFastUnmount, "true")
+	if err := UnmountAllUnder(stateDir); err != nil {
+		t.Fatalf("UnmountAllUnder(fast=true): %v", err)
+	}
+	if err := os.RemoveAll(stateDir); err != nil {
+		t.Fatalf("RemoveAll(stateDir) after UnmountAllUnder: %v", err)
+	}
+}
+
+func BenchmarkUnmountAllUnder_FastStatxVsMountinfo(b *testing.B) {
+	bundle := b.TempDir()
+	for _, sub := range []string{
+		filepath.Join(bundle, "rootfs"),
+		filepath.Join(bundle, "upper"),
+		filepath.Join(bundle, "work"),
+		filepath.Join(bundle, "volumes", "vol0"),
+		filepath.Join(bundle, "volumes", "vol1"),
+	} {
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			b.Fatalf("MkdirAll(%q): %v", sub, err)
+		}
+	}
+
+	// Construct a synthetic 5,000-line mountinfo table representative of a
+	// dense node with hundreds of active sandboxes and long overlay options.
+	var sb strings.Builder
+	lowerChain := strings.Repeat("/var/lib/ate/image-cache/layers/sha256/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/fs:", 16)
+	for i := range 5000 {
+		fmt.Fprintf(&sb, "%d 100 0:250 / /var/lib/ate/actors/actor-%04d/containers/main/rootfs rw,relatime shared:%d - overlay overlay rw,lowerdir=%s,upperdir=/var/lib/ate/actors/actor-%04d/containers/main/upper,workdir=/var/lib/ate/actors/actor-%04d/containers/main/work\n",
+			1000+i, i, 500+i, lowerChain, i, i)
+	}
+	fmt.Fprintf(&sb, "9999 100 0:999 / %s/rootfs rw,relatime - overlay overlay rw,lowerdir=%s\n", bundle, lowerChain)
+	syntheticMountinfo := []byte(sb.String())
+
+	b.Run("statx_mnt_id", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if _, err := mountPointsUnderStatx(bundle); err != nil {
+				b.Fatalf("mountPointsUnderStatx: %v", err)
+			}
+		}
+	})
+
+	b.Run("mountinfo_5000_mounts", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			pts, err := mountPointsIn(strings.NewReader(string(syntheticMountinfo)), bundle)
+			if err != nil || len(pts) != 1 {
+				b.Fatalf("mountPointsIn: pts=%v err=%v", pts, err)
+			}
+		}
+	})
+}

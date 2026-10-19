@@ -114,17 +114,71 @@ func (s *AteWorkerService) actorLeaf(actorUID string, size sizing.SandboxSize) (
 	return cgroup.OpenActorLeaf(actorUID, size.MilliCPU)
 }
 
+// actorLeafForActivation opens the actor's cgroup with the activation CPU limit
+// and activation cpu.weight (when configured). Once the wakeup probe passes,
+// applySteadyCPU restores the steady limit and weight.
+func (s *AteWorkerService) actorLeafForActivation(actorUID string, size sizing.SandboxSize) (*cgroup.ActorLeaf, error) {
+	leaf, err := s.actorLeaf(actorUID, s.cpuPriority.activationSize(size))
+	if err != nil || leaf == nil {
+		return leaf, err
+	}
+	if w := s.cpuPriority.activationWeight(); w > 0 {
+		if err := leaf.SetCPUWeight(w); err != nil {
+			_ = leaf.Close()
+			return nil, err
+		}
+	}
+	return leaf, nil
+}
+
+// applySteadyCPU restores the actor's declared CPU limit and lowers its
+// cpu.weight to the steady-state priority once the wakeup probe succeeds.
+func (s *AteWorkerService) applySteadyCPU(ctx context.Context, leaf *cgroup.ActorLeaf, size sizing.SandboxSize) {
+	if s.cpuPriority.boosted(size) {
+		if err := leaf.SetCPULimit(size.MilliCPU); err != nil {
+			slog.WarnContext(ctx, "Could not restore steady CPU limit on actor cgroup", slog.Any("err", err))
+		}
+	}
+	if w := s.cpuPriority.steadyWeight(); w > 0 {
+		if err := leaf.SetCPUWeight(w); err != nil {
+			slog.WarnContext(ctx, "Could not set steady cpu.weight on actor cgroup", slog.Any("err", err))
+		}
+	}
+}
+
+// raiseActorWeightForTeardown raises the actor's cgroup cpu.weight back to the
+// activation weight before snapshotting or tearing down the VM, so CH is not
+// starved by steady-state CPU weight while writing snapshots or shutting down.
+func (s *AteWorkerService) raiseActorWeightForTeardown(ctx context.Context, actorUID string) {
+	if !s.actorCgroups {
+		return
+	}
+	if w := s.cpuPriority.activationWeight(); w > 0 {
+		if err := cgroup.SetActorLeafCPUWeight(actorUID, w); err != nil {
+			slog.WarnContext(ctx, "Could not raise actor cpu.weight for checkpoint/teardown",
+				slog.String("actorUID", actorUID), slog.Any("err", err))
+		}
+	}
+}
+
 // cleanupSandboxState kills what is left of the actor's host processes and
 // clears its sandbox directories.
 func (s *AteWorkerService) cleanupSandboxState(ctx context.Context, actorUID string) {
+	cgroupKilled := false
 	if s.actorCgroups {
 		killCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := cgroup.KillActorLeaf(killCtx, actorUID); err != nil {
 			slog.WarnContext(ctx, "Failed to kill the actor's leftover processes", slog.Any("err", err))
+		} else {
+			cgroupKilled = true
 		}
 		cancel()
 	}
-	kata.CleanupSandboxState(ctx, actorUID)
+	opts := kata.DefaultCleanupOptions()
+	if kata.FastSandboxCleanupEnabled() && cgroupKilled {
+		opts.SkipOrphanScan = true
+	}
+	kata.CleanupSandboxStateOpts(ctx, actorUID, opts)
 }
 
 // unhostActor removes an actor, its network, and its cgroup. Repeated calls are
