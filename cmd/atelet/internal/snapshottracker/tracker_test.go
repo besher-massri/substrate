@@ -958,3 +958,29 @@ func TestTrackerCommitsSkipOlderGenerations(t *testing.T) {
 		t.Errorf("upload_due_time after CommitDurable(s5) during backoff = %v, want %v", got, wantRetry)
 	}
 }
+
+func BenchmarkCommitLocalAndPruneCheckpoints(b *testing.B) {
+	root := b.TempDir()
+	origActors := nodepath.ActorsDir
+	nodepath.ActorsDir = filepath.Join(root, "actors")
+	b.Cleanup(func() { nodepath.ActorsDir = origActors })
+	if err := os.MkdirAll(ateletpath.ActorPath(trackedActorUID), 0o700); err != nil {
+		b.Fatal(err)
+	}
+
+	t0 := time.Unix(1_700_000_000, 0)
+	tr := New(b.Context(), nil, clocktesting.NewFakeClock(t0),
+		WithUploadDelay(testUploadDelay),
+		WithDetachDelay(testDetachDelay))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		ref := testRef(fmt.Sprintf("snap-%d", i), int32(i+1), t0)
+		tr.CommitLocal(trackedActorUID, ref)
+		_ = PruneLocalCheckpoints(b.Context(), trackedActorUID, tr.LocalSnapshotsToKeep(trackedActorUID)...)
+		if i%2 == 1 {
+			tr.ForgetLocal(trackedActorUID)
+		}
+	}
+}

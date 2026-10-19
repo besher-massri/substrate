@@ -129,7 +129,7 @@ var (
 
 	objectStorePluginSocket   = pflag.String("objectstore-plugin-socket", "/run/objectstore-plugin/node.sock", "Unix socket of the node object-store plugin that external snapshots are fetched and uploaded through, and every sandbox asset is fetched through. A gs:// asset the plugin cannot serve is then read anonymously.")
 	snapshotUploadDelay       = pflag.Duration("snapshot-upload-delay", snapshottracker.DefaultUploadDelay, "How long after an actor's oldest snapshot not yet in object storage was taken atelet uploads the actor's latest local snapshot in the background; later while an upload is in progress or failing.")
-	snapshotDetachDelay       = pflag.Duration("snapshot-detach-delay", snapshottracker.DefaultDetachDelay, "How long an actor stays suspended on this node, its latest snapshot kept locally, before atelet detaches it in the background.")
+	snapshotDetachDelay       = pflag.Duration("snapshot-detach-delay", snapshottracker.DefaultDetachDelay, "How long an actor stays suspended on this node, its latest snapshot kept locally, before atelet detaches it in the background (also configurable via ATELET_SNAPSHOT_DETACH_DELAY when the flag is unset).")
 	snapshotUploadTimeout     = pflag.Duration("snapshot-upload-timeout", snapshottracker.DefaultUploadTimeout, "How long one background snapshot upload, including the one a background detach runs first, may run before atelet cancels and retries it, on top of the time the snapshot takes at --snapshot-upload-est-throughput-mib. Each consecutive failure doubles the next attempt's timeout, to at most 8 times the first's. 0 turns the timeout off.")
 	snapshotUploadEstMiBps    = pflag.Int("snapshot-upload-est-throughput-mib", snapshottracker.DefaultUploadEstThroughput>>20, "Estimated background snapshot upload throughput, in MiB per second of the snapshot's allocated size: each upload attempt may run --snapshot-upload-timeout plus the time the snapshot takes at this rate. 0 adds no time for the snapshot's size.")
 	snapshotUploadWorkers     = pflag.Int("snapshot-upload-workers", snapshottracker.DefaultUploadWorkers, "How many background snapshot uploads atelet runs at once.")
@@ -137,6 +137,27 @@ var (
 	snapshotReportWorkers     = pflag.Int("snapshot-report-workers", snapshottracker.DefaultReportWorkers, "How many background snapshot state reports atelet runs at once. 0 disables background reporting.")
 	snapshotReportGiveUpAfter = pflag.Duration("snapshot-report-give-up-after", snapshottracker.DefaultReportGiveUpAfter, "How long after a background upload or detach atelet keeps retrying a failed snapshot state report before giving up on it.")
 )
+
+const snapshotDetachDelayEnv = "ATELET_SNAPSHOT_DETACH_DELAY"
+
+// resolveSnapshotDetachDelay returns the local snapshot detach delay to use,
+// preferring an explicit --snapshot-detach-delay flag over the
+// ATELET_SNAPSHOT_DETACH_DELAY environment variable and rejecting non-positive
+// durations.
+func resolveSnapshotDetachDelay(flagVal time.Duration, flagChanged bool, envVal string) (time.Duration, error) {
+	d := flagVal
+	if !flagChanged && envVal != "" {
+		parsed, err := time.ParseDuration(envVal)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s=%q: %w", snapshotDetachDelayEnv, envVal, err)
+		}
+		d = parsed
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--snapshot-detach-delay %v must be > 0", d)
+	}
+	return d, nil
+}
 
 var _ imagecache.CandidateKeychain = (*credentialprovider.Keychain)(nil)
 
@@ -158,6 +179,12 @@ func main() {
 	if err := rejectStorageEnv(); err != nil {
 		serverboot.Fatal(ctx, "Invalid environment", err)
 	}
+	detachDelayFlag := pflag.Lookup("snapshot-detach-delay")
+	detachDelay, err := resolveSnapshotDetachDelay(*snapshotDetachDelay, detachDelayFlag != nil && detachDelayFlag.Changed, os.Getenv(snapshotDetachDelayEnv))
+	if err != nil {
+		serverboot.Fatal(ctx, "Invalid --snapshot-detach-delay", err)
+	}
+	*snapshotDetachDelay = detachDelay
 	if err := validateSnapshotDelayFlags(); err != nil {
 		serverboot.Fatal(ctx, "Invalid snapshot delay flags", err)
 	}
@@ -1676,6 +1703,16 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	if err := writeSandboxRecord(actorUID, runtimeRec); err != nil {
 		// Note: crash the actor right away, if we cannot write the sandbox record now, we will not be able to checkpoint it later.
 		return nil, err
+	}
+
+	if !directLocal {
+		// This restore downloaded a snapshot from object storage rather than
+		// using a node-local copy, so any earlier local snapshot for this actor
+		// on this node is superseded and can be reclaimed immediately.
+		s.snapshots.ForgetLocal(actorUID)
+		if err := snapshottracker.PruneLocalCheckpoints(ctx, actorUID, s.snapshots.LocalSnapshotsToKeep(actorUID)...); err != nil {
+			slog.WarnContext(ctx, "failed to prune superseded local checkpoints after remote restore", slog.Any("actor", actorRef), slog.Any("err", err))
+		}
 	}
 
 	return &ateletpb.RestoreResponse{}, nil
