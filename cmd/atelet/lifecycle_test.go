@@ -2722,3 +2722,52 @@ func TestCheckpointSkipsStaleCommitAndKeepsNewerLocal(t *testing.T) {
 		t.Errorf("stale local snapshot pause-snap-2: stat = %v, want pruned", err)
 	}
 }
+
+// TestOneSnapshotPerActorEviction verifies the 1-snapshot-per-actor eviction
+// invariant across successive immediate checkpoints and remote restores:
+//  1. Checkpoint N+1 evicts local checkpoint N once N+1 commits.
+//  2. Restoring a remote snapshot that is not present locally evicts the prior
+//     local checkpoint once the remote restore succeeds.
+func TestOneSnapshotPerActorEviction(t *testing.T) {
+	a := runPluginActor(t)
+
+	snap1 := a.snapshot("snap-gen-1", 1)
+	if _, err := a.checkpoint(t, snap1, ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE); err != nil {
+		t.Fatalf("Checkpoint gen 1: %v", err)
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "snap-gen-1")); err != nil {
+		t.Fatalf("snap-gen-1 missing locally after immediate checkpoint: %v", err)
+	}
+
+	a.restoreLocal(t, "snap-gen-1", 1)
+	snap2 := a.snapshot("snap-gen-2", 2)
+	if _, err := a.checkpoint(t, snap2, ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE); err != nil {
+		t.Fatalf("Checkpoint gen 2: %v", err)
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "snap-gen-1")); !os.IsNotExist(err) {
+		t.Errorf("superseded snap-gen-1 survived checkpoint gen 2: err = %v", err)
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "snap-gen-2")); err != nil {
+		t.Fatalf("snap-gen-2 missing locally after immediate checkpoint: %v", err)
+	}
+
+	if _, err := a.s.Restore(t.Context(), &ateletpb.RestoreRequest{
+		Atespace:              "ate-demo",
+		ActorName:             "counter",
+		ActorUid:              pluginActorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          pluginWorkerPodUID,
+		SandboxRuntime:        runtimeFor(t, a.rec),
+		Spec:                  a.spec,
+		Snapshot:              snap1,
+	}); err != nil {
+		t.Fatalf("Restore from remote snap-gen-1: %v", err)
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(pluginActorUID, "snap-gen-2")); !os.IsNotExist(err) {
+		t.Errorf("superseded snap-gen-2 survived remote restore: err = %v", err)
+	}
+	if got := a.s.snapshots.State(pluginActorUID).GetLatestLocal(); got != nil {
+		t.Errorf("latest_local = %v after remote restore, want nil", got)
+	}
+}

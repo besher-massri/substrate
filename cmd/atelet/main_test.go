@@ -1648,3 +1648,62 @@ func TestServingCheck(t *testing.T) {
 		t.Errorf("servingCheck after the port opened = %v, want nil", err)
 	}
 }
+
+func TestResolveSnapshotDetachDelay(t *testing.T) {
+	tests := []struct {
+		name        string
+		flagVal     time.Duration
+		flagChanged bool
+		envVal      string
+		want        time.Duration
+		wantErr     bool
+	}{
+		{
+			name:    "default 30m when neither flag nor env is set",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			want:    30 * time.Minute,
+		},
+		{
+			name:    "env var overrides default when flag is unset",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			envVal:  "45m",
+			want:    45 * time.Minute,
+		},
+		{
+			name:        "explicit flag overrides env var",
+			flagVal:     15 * time.Minute,
+			flagChanged: true,
+			envVal:      "45m",
+			want:        15 * time.Minute,
+		},
+		{
+			name:    "invalid env var duration fails",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			envVal:  "not-a-duration",
+			wantErr: true,
+		},
+		{
+			name:    "non-positive env var duration fails",
+			flagVal: snapshottracker.DefaultDetachDelay,
+			envVal:  "0s",
+			wantErr: true,
+		},
+		{
+			name:        "non-positive flag duration fails",
+			flagVal:     -time.Minute,
+			flagChanged: true,
+			wantErr:     true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveSnapshotDetachDelay(tc.flagVal, tc.flagChanged, tc.envVal)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("resolveSnapshotDetachDelay() err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Errorf("resolveSnapshotDetachDelay() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
