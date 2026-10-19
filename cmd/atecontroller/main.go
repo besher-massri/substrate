@@ -197,6 +197,8 @@ func main() {
 	slog.InfoContext(ctx, "Metrics listener", slog.Bool("enabled", servePull), slog.String("addr", metricsBindAddr(servePull)))
 
 	k8sConfig := ctrl.GetConfigOrDie()
+	k8sConfig.QPS = 200
+	k8sConfig.Burst = 400
 	k8sClient, err := kubernetes.NewForConfig(k8sConfig)
 	if err != nil {
 		setupLog.Error(err, "creating kubernetes client for ateapi dialer")
@@ -265,6 +267,7 @@ func main() {
 		AteletServiceAccount:     *ateletServiceAccount,
 		RouterServiceAccount:     *routerServiceAccount,
 		DNSEgressPolicy:          *dnsEgressPolicy,
+		PassthroughEnv:           controllers.WorkerPassthroughEnv(os.Environ()),
 		Recorder:                 mgr.GetEventRecorder("workerpool-controller"),
 		APIReader:                mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
