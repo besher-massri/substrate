@@ -1162,3 +1162,59 @@ func TestBuildDeploymentPreview(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerPassthroughEnv(t *testing.T) {
+	got := WorkerPassthroughEnv([]string{
+		"UNRELATED=1",
+		"ATEOM_LEGACY_IGNORED=64",
+		"ATEWORKER_MICROVM_DIFF_SNAPSHOT=1",
+		"ATEWORKER_MICROVM_ZERO_COPY_RESTORE=1",
+		"ATEWORKER_GVISOR_OVERLAY=self:tmpfs",
+		"ATEWORKER_EMPTY=",
+	})
+	want := []corev1.EnvVar{
+		{Name: "ATEWORKER_GVISOR_OVERLAY", Value: "self:tmpfs"},
+		{Name: "ATEWORKER_MICROVM_DIFF_SNAPSHOT", Value: "1"},
+		{Name: "ATEWORKER_MICROVM_ZERO_COPY_RESTORE", Value: "1"},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("WorkerPassthroughEnv mismatch (-want +got):\n%s", diff)
+	}
+
+	c := buildDeploymentApplyConfig(
+		testWorkerPoolApplyConfig(nil),
+		workerOTelSettings{},
+		installdefaults.SystemNamespace,
+		installdefaults.AteletServiceAccount,
+		installdefaults.RouterServiceAccount,
+		egresspolicy.DNSEgressPolicyEnforceInAtunnel,
+		append(got, corev1.EnvVar{Name: "POD_UID", Value: "override-blocked"})...,
+	).Spec.Template.Spec.Containers[0]
+	env := envByName(c.Env)
+	for _, ev := range want {
+		info, ok := env[ev.Name]
+		if !ok || info.value != ev.Value {
+			t.Errorf("worker container env %s = %q (ok=%v), want %q", ev.Name, info.value, ok, ev.Value)
+		}
+	}
+	if info := env["POD_UID"]; info.value != "" {
+		t.Errorf("built-in POD_UID was overridden: %+v", info)
+	}
+}
+
+func BenchmarkWorkerPassthroughEnv(b *testing.B) {
+	environ := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOSTNAME=ate-controller-0",
+		"KUBERNETES_SERVICE_HOST=10.96.0.1",
+		"KUBERNETES_SERVICE_PORT=443",
+		"ATEWORKER_MICROVM_DIFF_SNAPSHOT=1",
+		"ATEWORKER_MICROVM_ZERO_COPY_RESTORE=1",
+		"ATEWORKER_GVISOR_OVERLAY=self:tmpfs",
+		"ATEWORKER_EMPTY=",
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = WorkerPassthroughEnv(environ)
+	}
+}
