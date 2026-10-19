@@ -175,9 +175,10 @@ overlay-composed) bundle rootfs into virtiofsd's shared dir and the guest
 keeps building its own tmpfs upper, as before.
 
 **Teardown**: `UnmountAllUnder(bundleDir)` lazily detaches every mount below
-an actor's bundle directory (via `/proc/self/mountinfo`) before atelet wipes
-it — called from the checkpoint cleanup path in ateworker-gvisor and
-`teardownActor` in ateworker-microvm.
+an actor's bundle directory (discovered via `statx` `STATX_MNT_ID`, falling
+back to `/proc/self/mountinfo`) before atelet wipes it, called from the
+checkpoint cleanup path in ateworker-gvisor and `teardownActor` in
+ateworker-microvm.
 
 ## Garbage collection
 
