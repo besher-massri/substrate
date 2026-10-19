@@ -27,6 +27,7 @@ import (
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/nodepath"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/sizing"
 )
 
 // specFile is the OCI spec file name within a bundle.
@@ -58,8 +59,10 @@ const (
 )
 
 // ociResources maps the resolved limits onto the OCI spec's linux.resources.
-// Returns nil when nothing is set, so the spec carries no linux.resources at
-// all for a container that declares no limits.
+// Positive CPU limits are raised to at least sizing.EffectiveContainerMilliCPU
+// when an opt-in container CFS burst floor is configured, and clamped to at
+// least cpuQuotaMinUS. Returns nil when nothing is set, so the spec carries no
+// linux.resources at all for a container that declares no limits.
 func ociResources(r *ateworkerpb.ResourceRequirements) *specs.LinuxResources {
 	l := r.GetLimits()
 	if l.GetMemoryBytes() <= 0 && l.GetCpuMillicores() <= 0 {
@@ -70,7 +73,8 @@ func ociResources(r *ateworkerpb.ResourceRequirements) *specs.LinuxResources {
 		out.Memory = &specs.LinuxMemory{Limit: &b}
 	}
 	if m := l.GetCpuMillicores(); m > 0 {
-		quota := max(m*cpuQuotaPeriodUS/1000, cpuQuotaMinUS)
+		effectiveMillis := sizing.EffectiveContainerMilliCPU(m)
+		quota := max(effectiveMillis*cpuQuotaPeriodUS/1000, cpuQuotaMinUS)
 		period := uint64(cpuQuotaPeriodUS)
 		out.CPU = &specs.LinuxCPU{Quota: &quota, Period: &period}
 	}

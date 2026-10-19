@@ -765,7 +765,7 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 			// Handled via Secret.
 		case strings.HasPrefix(k, "ATE_API_"):
 			apiEnv[k] = v
-		case strings.HasPrefix(k, "ATEWORKER_"):
+		case strings.HasPrefix(k, "ATEWORKER_") || k == "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR" || k == "ATE_ACTOR_CPU_LIMIT_FLOOR":
 			controllerEnv[k] = v
 		}
 	}
