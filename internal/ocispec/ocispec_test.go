@@ -25,6 +25,7 @@ import (
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/nodepath"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/sizing"
 )
 
 // mountFor returns the spec's mount at destination dest, or fails.
@@ -257,5 +258,17 @@ func TestBuild_ResourcesApplied(t *testing.T) {
 	}
 	if *spec.Linux.Resources.Memory.Limit != 67108864 {
 		t.Errorf("Memory.Limit = %d, want 67108864", *spec.Linux.Resources.Memory.Limit)
+	}
+}
+
+func TestOCIResources_WithCPUBurstFloor(t *testing.T) {
+	t.Setenv(sizing.EnvEnableActorCPUBurstFloor, "true")
+	got := ociResources(&ateworkerpb.ResourceLimits{CpuMillis: 250})
+	if got == nil || got.CPU == nil || got.CPU.Quota == nil || got.CPU.Period == nil {
+		t.Fatalf("ociResources(250m) = %v, want CPU quota and period", got)
+	}
+	if millis := *got.CPU.Quota * 1000 / int64(*got.CPU.Period); millis != sizing.DefaultBurstFloorMilliCPU {
+		t.Errorf("quota/period with burst floor = %dm, want %dm (quota=%d period=%d)",
+			millis, sizing.DefaultBurstFloorMilliCPU, *got.CPU.Quota, *got.CPU.Period)
 	}
 }
