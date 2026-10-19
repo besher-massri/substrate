@@ -114,7 +114,7 @@ func WorkerPassthroughEnv(environ []string) []corev1.EnvVar {
 		if !ok || v == "" {
 			continue
 		}
-		if strings.HasPrefix(k, "ATEWORKER_") {
+		if strings.HasPrefix(k, "ATEWORKER_") || k == "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR" || k == "ATE_ACTOR_CPU_LIMIT_FLOOR" {
 			byName[k] = v
 		}
 	}

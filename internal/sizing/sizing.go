@@ -23,6 +23,12 @@
 package sizing
 
 import (
+	"math"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
+
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 )
@@ -31,7 +37,130 @@ const (
 	// cpuQuotaPeriodMicros is the cgroup v2 cpu.max period (100ms, the kernel
 	// default) against which the CPU quota is expressed.
 	cpuQuotaPeriodMicros = 100000
+
+	// maxMilliCPU bounds millicore values so multiplying by cpuQuotaPeriodMicros
+	// cannot overflow int64.
+	maxMilliCPU int64 = math.MaxInt64 / cpuQuotaPeriodMicros
+
+	// DefaultBurstFloorMilliCPU is the 1-core (1000m) minimum container CFS CPU
+	// quota floor applied when ATE_ENABLE_ACTOR_CPU_BURST_FLOOR=true. Enforcing a
+	// 1-core minimum CFS quota on sub-core actor containers prevents multi-thread
+	// runtime startups (e.g. Go runtime initialization and gVisor systrap threads)
+	// from exhausting a 25ms/100ms quota mid-boot while keeping pod scheduling
+	// requests proportional.
+	DefaultBurstFloorMilliCPU int64 = 1000
+
+	// EnvActorCPULimitFloor configures an explicit minimum container CFS CPU
+	// limit floor (e.g. "1", "1000m", "500m").
+	EnvActorCPULimitFloor = "ATE_ACTOR_CPU_LIMIT_FLOOR"
+
+	// EnvEnableActorCPUBurstFloor enables the default 1-core (1000m) minimum
+	// container CFS CPU limit floor when set to a truthy boolean ("true", "1").
+	EnvEnableActorCPUBurstFloor = "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR"
 )
+
+// cachedFloor memoizes the parsed millicore floor for the most recently observed
+// environment variable strings so repeated OCI spec construction avoids
+// re-parsing strings on every container while still honoring runtime env updates
+// (such as t.Setenv in tests).
+type cachedFloor struct {
+	rawFloor   string
+	rawEnable  string
+	milli      int64
+	floorValid bool
+}
+
+var floorCache atomic.Pointer[cachedFloor]
+
+// ParseCPULimitFloorMilli parses a CPU limit floor string (for example "1",
+// "1000m", or "0.5") into millicores. Empty, "0", "off", "false", "none", or
+// "disabled" returns (0, true) to indicate that the burst floor is disabled.
+// Negative, non-numeric, or overflowing inputs return (0, false).
+func ParseCPULimitFloorMilli(raw string) (int64, bool) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "", "0", "off", "false", "none", "disabled":
+		return 0, true
+	}
+	if m, ok := strings.CutSuffix(v, "m"); ok {
+		n, err := strconv.ParseInt(strings.TrimSpace(m), 10, 64)
+		if err != nil || n < 0 || n > maxMilliCPU {
+			return 0, false
+		}
+		return n, true
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	scaled := math.Ceil(f * 1000)
+	if scaled > float64(maxMilliCPU) {
+		return 0, false
+	}
+	return int64(scaled), true
+}
+
+// ConfiguredCPULimitFloorMilli returns the opt-in minimum container CFS CPU
+// limit floor in millicores from ATE_ACTOR_CPU_LIMIT_FLOOR or
+// ATE_ENABLE_ACTOR_CPU_BURST_FLOOR, or 0 when neither is enabled. The parsed
+// floor is cached across calls as long as the underlying environment variables
+// remain unchanged.
+func ConfiguredCPULimitFloorMilli() int64 {
+	rawFloor := os.Getenv(EnvActorCPULimitFloor)
+	c := floorCache.Load()
+	if c != nil && c.rawFloor == rawFloor && c.floorValid {
+		return c.milli
+	}
+	rawEnable := os.Getenv(EnvEnableActorCPUBurstFloor)
+	if c != nil && c.rawFloor == rawFloor && c.rawEnable == rawEnable {
+		return c.milli
+	}
+	milli, floorValid := parseConfiguredCPULimitFloorMilli(rawFloor, rawEnable)
+	floorCache.Store(&cachedFloor{
+		rawFloor:   rawFloor,
+		rawEnable:  rawEnable,
+		milli:      milli,
+		floorValid: floorValid,
+	})
+	return milli
+}
+
+// parseConfiguredCPULimitFloorMilli resolves the minimum container CFS CPU
+// limit floor in millicores from the raw ATE_ACTOR_CPU_LIMIT_FLOOR and
+// ATE_ENABLE_ACTOR_CPU_BURST_FLOOR strings. The returned boolean reports whether
+// rawFloor alone determined the result without consulting rawEnable.
+func parseConfiguredCPULimitFloorMilli(rawFloor, rawEnable string) (int64, bool) {
+	if trimmed := strings.TrimSpace(rawFloor); trimmed != "" {
+		if floor, ok := ParseCPULimitFloorMilli(trimmed); ok {
+			return floor, true
+		}
+	}
+	if trimmed := strings.TrimSpace(rawEnable); trimmed != "" {
+		if enabled, err := strconv.ParseBool(trimmed); err == nil && enabled {
+			return DefaultBurstFloorMilliCPU, false
+		}
+	}
+	return 0, false
+}
+
+// EffectiveContainerMilliCPU returns milliCPU raised to at least the configured
+// opt-in CFS burst floor when milliCPU > 0. An unset (<= 0) limit stays 0.
+func EffectiveContainerMilliCPU(milliCPU int64) int64 {
+	return EffectiveContainerMilliCPUWithFloor(milliCPU, ConfiguredCPULimitFloorMilli())
+}
+
+// EffectiveContainerMilliCPUWithFloor returns milliCPU raised to at least
+// floorMilliCPU when both milliCPU > 0 and floorMilliCPU > 0. An unset (<= 0)
+// milliCPU limit always returns 0 so unlimited containers remain unlimited.
+func EffectiveContainerMilliCPUWithFloor(milliCPU, floorMilliCPU int64) int64 {
+	if milliCPU <= 0 {
+		return 0
+	}
+	if floorMilliCPU > milliCPU {
+		return floorMilliCPU
+	}
+	return milliCPU
+}
 
 // SandboxSize is the sandbox's target size, derived from the actor's declared
 // resource limits. A zero field means "unset".
@@ -68,8 +197,18 @@ func (s SandboxSize) VCPUs() int {
 // linux.resources so the sandbox cgroup is created with the right values. This is
 // the gVisor sandbox-cgroup path: only ateworker-gvisor calls it, so runsc applies the
 // result to the host cgroup leaf. Fields that are unset in SandboxSize are left
-// untouched, preserving any existing values on the spec.
+// untouched, preserving any existing values on the spec. When an opt-in CPU burst
+// floor is configured via ATE_ACTOR_CPU_LIMIT_FLOOR or
+// ATE_ENABLE_ACTOR_CPU_BURST_FLOOR, sub-floor positive CPU limits are raised to
+// the floor for the container CFS quota while s.MilliCPU remains unchanged.
 func (s SandboxSize) ApplyToOCISpec(spec *specs.Spec) {
+	s.ApplyToOCISpecWithFloor(spec, ConfiguredCPULimitFloorMilli())
+}
+
+// ApplyToOCISpecWithFloor is ApplyToOCISpec with an explicit minimum millicore
+// floor for the container's CFS quota. A floorMilliCPU <= 0 applies s.MilliCPU
+// as-is.
+func (s SandboxSize) ApplyToOCISpecWithFloor(spec *specs.Spec, floorMilliCPU int64) {
 	if s.MilliCPU <= 0 && s.MemoryBytes <= 0 {
 		return
 	}
@@ -83,8 +222,9 @@ func (s SandboxSize) ApplyToOCISpec(spec *specs.Spec) {
 		if spec.Linux.Resources.CPU == nil {
 			spec.Linux.Resources.CPU = &specs.LinuxCPU{}
 		}
+		effectiveMilli := min(EffectiveContainerMilliCPUWithFloor(s.MilliCPU, floorMilliCPU), maxMilliCPU)
 		period := uint64(cpuQuotaPeriodMicros)
-		quota := s.MilliCPU * cpuQuotaPeriodMicros / 1000
+		quota := effectiveMilli * cpuQuotaPeriodMicros / 1000
 		spec.Linux.Resources.CPU.Period = &period
 		spec.Linux.Resources.CPU.Quota = &quota
 	}
