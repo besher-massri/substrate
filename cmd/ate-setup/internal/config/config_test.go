@@ -150,9 +150,19 @@ func TestLoadClusterSize(t *testing.T) {
 			wantSize: ClusterSizeSize10,
 		},
 		{
+			name:     "flag size100",
+			opts:     Options{ClusterSize: ClusterSizeSize100},
+			wantSize: ClusterSizeSize100,
+		},
+		{
 			name:     "environment",
 			env:      map[string]string{"ATE_INSTALL_CLUSTER_SIZE": ClusterSizeSize10},
 			wantSize: ClusterSizeSize10,
+		},
+		{
+			name:     "environment size100",
+			env:      map[string]string{"ATE_INSTALL_CLUSTER_SIZE": ClusterSizeSize100},
+			wantSize: ClusterSizeSize100,
 		},
 		{
 			name:     "flag beats the environment",
@@ -179,13 +189,18 @@ func TestLoadClusterSize(t *testing.T) {
 			if cfg.ClusterSize != tc.wantSize {
 				t.Errorf("ClusterSize = %q, want %q", cfg.ClusterSize, tc.wantSize)
 			}
-			if cfg.Size10() != (tc.wantSize == ClusterSizeSize10) {
-				t.Errorf("Size10() = %v, want %v", cfg.Size10(), tc.wantSize == ClusterSizeSize10)
+			wantSize10 := tc.wantSize == ClusterSizeSize10 || tc.wantSize == ClusterSizeSize100
+			if cfg.Size10() != wantSize10 {
+				t.Errorf("Size10() = %v, want %v", cfg.Size10(), wantSize10)
+			}
+			wantSize100 := tc.wantSize == ClusterSizeSize100
+			if cfg.Size100() != wantSize100 {
+				t.Errorf("Size100() = %v, want %v", cfg.Size100(), wantSize100)
 			}
 			env := scriptEnvMap(t, cfg)
-			if tc.wantSize == ClusterSizeSize10 {
-				if env["ATE_INSTALL_CLUSTER_SIZE"] != ClusterSizeSize10 {
-					t.Errorf("ScriptEnv()[ATE_INSTALL_CLUSTER_SIZE] = %q, want size10", env["ATE_INSTALL_CLUSTER_SIZE"])
+			if tc.wantSize != ClusterSizeSize0 {
+				if env["ATE_INSTALL_CLUSTER_SIZE"] != tc.wantSize {
+					t.Errorf("ScriptEnv()[ATE_INSTALL_CLUSTER_SIZE] = %q, want %s", env["ATE_INSTALL_CLUSTER_SIZE"], tc.wantSize)
 				}
 			} else if _, ok := env["ATE_INSTALL_CLUSTER_SIZE"]; ok {
 				t.Errorf("ScriptEnv() exports ATE_INSTALL_CLUSTER_SIZE = %q for the default profile, want it absent", env["ATE_INSTALL_CLUSTER_SIZE"])

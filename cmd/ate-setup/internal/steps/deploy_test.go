@@ -18,6 +18,7 @@ import (
 	"errors"
 	"io/fs"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -71,7 +72,7 @@ func workersPerSigner(t *testing.T, objs []*unstructured.Unstructured) []any {
 // Runs over the real manifests, so a renamed variable or Deployment fails here
 // rather than on an install that silently keeps one worker.
 func TestSetPodcertWorkersPerSigner(t *testing.T) {
-	for _, size := range []string{config.ClusterSizeSize0, config.ClusterSizeSize10} {
+	for _, size := range []string{config.ClusterSizeSize0, config.ClusterSizeSize10, config.ClusterSizeSize100} {
 		t.Run(size, func(t *testing.T) {
 			objs := podcertObjects(t, size)
 			if got := workersPerSigner(t, objs); len(got) != 1 {
@@ -227,5 +228,109 @@ func TestComponentManifestsMatchSystemBundle(t *testing.T) {
 				t.Errorf("router=%s kind=%v: %s renders a different %s/%s than the system bundle (-bundle +standalone):\n%s", tc.router, tc.kind, component.path, component.kind, component.name, diff)
 			}
 		}
+	}
+}
+
+func containerEnvMap(t *testing.T, obj *unstructured.Unstructured, cname string) map[string]string {
+	t.Helper()
+	for _, field := range []string{"containers", "initContainers"} {
+		containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		for _, raw := range containers {
+			c, ok := raw.(map[string]any)
+			if !ok || c["name"] != cname {
+				continue
+			}
+			env, _, _ := unstructured.NestedSlice(c, "env")
+			out := make(map[string]string, len(env))
+			for _, item := range env {
+				ev, ok := item.(map[string]any)
+				if ok {
+					name, _ := ev["name"].(string)
+					val, _ := ev["value"].(string)
+					out[name] = val
+				}
+			}
+			return out
+		}
+	}
+	t.Fatalf("%s has no container %q", kube.Describe(obj), cname)
+	return nil
+}
+
+func TestApplyWorkloadRuntimeAndScaleOverrides(t *testing.T) {
+	e := &Env{Cfg: &config.Config{Root: repoRoot(t), Router: config.RouterEnvoy}}
+	manifest, err := e.render(e.Cfg.Path(SystemOverlay(e.Cfg)))
+	if err != nil {
+		t.Fatalf("render system overlay: %v", err)
+	}
+	objs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		t.Fatalf("decode system overlay: %v", err)
+	}
+
+	environ := []string{
+		"ATE_STORAGE_BACKEND=gcs",
+		"ATE_GCS_ENDPOINT=https://storage.googleapis.com",
+		"ATE_API_SNAPSHOT_LOCATION=gs://test-bucket/snapshots",
+		"ATEWORKER_MICROVM_ZERO_COPY_RESTORE=true",
+		"ATEWORKER_MICROVM_DIFF_SNAPSHOT=true",
+		"ATEOM_LEGACY_IGNORED=64",
+	}
+	applyWorkloadRuntimeAndScaleOverrides(objs, true, false, environ)
+
+	apiDep := findObject(objs, "Deployment", "ate-api-server")
+	if replicas, _, _ := unstructured.NestedInt64(apiDep.Object, "spec", "replicas"); replicas != 6 {
+		t.Errorf("size100 ate-api-server replicas = %d, want 6", replicas)
+	}
+	apiEnv := containerEnvMap(t, apiDep, "ate-api-server")
+	if apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] != "192" {
+		t.Errorf("ATE_API_POSTGRES_POOL_MAX_CONNS = %q, want 192", apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"])
+	}
+	if apiEnv["ATE_API_SNAPSHOT_LOCATION"] != "gs://test-bucket/snapshots" {
+		t.Errorf("ate-api-server env missing forwarded vars: %v", apiEnv)
+	}
+	if _, bad := apiEnv["ATE_STORAGE_BACKEND"]; bad {
+		t.Errorf("ate-api-server must never receive ATE_STORAGE_BACKEND")
+	}
+	apiPluginEnv := containerEnvMap(t, apiDep, "objectstore-plugin")
+	if apiPluginEnv["ATE_STORAGE_BACKEND"] != "gcs" || apiPluginEnv["ATE_GCS_ENDPOINT"] != "https://storage.googleapis.com" {
+		t.Errorf("ate-api-server objectstore-plugin env = %v, want ATE_STORAGE_BACKEND=gcs and ATE_GCS_ENDPOINT=https://storage.googleapis.com", apiPluginEnv)
+	}
+
+	ctrlDep := findObject(objs, "Deployment", "ate-controller")
+	ctrlContainers, _, _ := unstructured.NestedSlice(ctrlDep.Object, "spec", "template", "spec", "containers")
+	ctrlArgs, _, _ := unstructured.NestedStringSlice(ctrlContainers[0].(map[string]any), "args")
+	if !slices.Contains(ctrlArgs, "--worker-sync-concurrency=32") {
+		t.Errorf("size100 ate-controller args = %v, want --worker-sync-concurrency=32", ctrlArgs)
+	}
+	ctrlEnv := containerEnvMap(t, ctrlDep, "ate-controller")
+	for k, want := range map[string]string{
+		"ATEWORKER_MICROVM_ZERO_COPY_RESTORE": "true",
+		"ATEWORKER_MICROVM_DIFF_SNAPSHOT":     "true",
+	} {
+		if ctrlEnv[k] != want {
+			t.Errorf("ate-controller env[%s] = %q, want %q", k, ctrlEnv[k], want)
+		}
+	}
+	if _, bad := ctrlEnv["ATEOM_LEGACY_IGNORED"]; bad {
+		t.Errorf("ate-controller must not forward legacy ATEOM_* variables")
+	}
+
+	routerDep := findObject(objs, "Deployment", "atenet-router")
+	if replicas, _, _ := unstructured.NestedInt64(routerDep.Object, "spec", "replicas"); replicas != 8 {
+		t.Errorf("size100 atenet-router replicas = %d, want 8", replicas)
+	}
+
+	ateletDS := findObject(objs, "DaemonSet", "atelet")
+	if grace, _, _ := unstructured.NestedInt64(ateletDS.Object, "spec", "template", "spec", "terminationGracePeriodSeconds"); grace != 30 {
+		t.Errorf("size100 atelet terminationGracePeriodSeconds = %d, want 30", grace)
+	}
+	ateletEnv := containerEnvMap(t, ateletDS, "atelet")
+	if _, bad := ateletEnv["ATE_STORAGE_BACKEND"]; bad {
+		t.Errorf("atelet container must never receive ATE_STORAGE_BACKEND")
+	}
+	ateletPluginEnv := containerEnvMap(t, ateletDS, "objectstore-plugin")
+	if ateletPluginEnv["ATE_STORAGE_BACKEND"] != "gcs" {
+		t.Errorf("atelet objectstore-plugin ATE_STORAGE_BACKEND = %q, want gcs", ateletPluginEnv["ATE_STORAGE_BACKEND"])
 	}
 }
