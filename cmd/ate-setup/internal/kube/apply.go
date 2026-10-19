@@ -71,8 +71,8 @@ func (c *Client) Apply(ctx context.Context, objs []*unstructured.Unstructured) e
 // has not reached the apiserver handling this request — without turning a
 // genuinely broken cluster into a long wait.
 var applyBackoff = wait.Backoff{
-	Steps:    5,
-	Duration: 500 * time.Millisecond,
+	Steps:    7,
+	Duration: 1 * time.Second,
 	Factor:   2.0,
 	Jitter:   0.1,
 }

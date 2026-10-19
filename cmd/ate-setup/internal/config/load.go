@@ -406,8 +406,8 @@ func validateResolved(cfg *Config, r *Resolved) error {
 		}
 	}
 
-	if size, _ := r.Value("clusterSize"); cfg.ClusterSize != ClusterSizeSize0 && cfg.ClusterSize != ClusterSizeSize10 {
-		return &InvalidError{Value: size, Want: ClusterSizeSize0 + " or " + ClusterSizeSize10}
+	if size, _ := r.Value("clusterSize"); cfg.ClusterSize != ClusterSizeSize0 && cfg.ClusterSize != ClusterSizeSize10 && cfg.ClusterSize != ClusterSizeSize100 {
+		return &InvalidError{Value: size, Want: ClusterSizeSize0 + ", " + ClusterSizeSize10 + ", or " + ClusterSizeSize100}
 	}
 
 	// The router rejects a malformed ID at startup; catch it before the
