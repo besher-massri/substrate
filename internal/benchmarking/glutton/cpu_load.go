@@ -17,7 +17,10 @@ package glutton
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,8 +57,33 @@ func (s *Service) UseCPU(_ context.Context, req *gluttonpb.UseCPURequest) (*glut
 	return &gluttonpb.UseCPUResponse{NumCores: int32(n)}, nil
 }
 
-// cpuLoadDefaultCycle is applied when a request has cycle_length_ms=0.
-const cpuLoadDefaultCycle = 100 * time.Millisecond
+// EnvGluttonCPUBurnSliceMS overrides the default CPU burn cycle duration in
+// milliseconds when a UseCPURequest has cycle_length_ms=0.
+const EnvGluttonCPUBurnSliceMS = "GLUTTON_CPU_BURN_SLICE_MS"
+
+// cpuLoadDefaultCycle is applied when a request has cycle_length_ms=0 and
+// GLUTTON_CPU_BURN_SLICE_MS is not set. A 200ms cycle halves timer wakeup and
+// scheduler context-switch rates across dense sub-core actor pools compared to
+// a 100ms cycle while keeping each work slice bounded within two Linux CFS
+// quota periods.
+const cpuLoadDefaultCycle = 200 * time.Millisecond
+
+// cpuBurnBatchIterations is the number of LCG iterations executed between
+// clock_gettime(CLOCK_THREAD_CPUTIME_ID) reads so non-vDSO clock syscall traps
+// (especially under gVisor systrap) do not dominate the spin loop.
+const cpuBurnBatchIterations = 65536
+
+// DefaultCPULoadCycle returns the effective default CPU burn cycle duration,
+// honoring GLUTTON_CPU_BURN_SLICE_MS when set to a positive 32-bit integer
+// millisecond value and falling back to cpuLoadDefaultCycle otherwise.
+func DefaultCPULoadCycle() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(EnvGluttonCPUBurnSliceMS)); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 32); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return cpuLoadDefaultCycle
+}
 
 // cpuBurnSink absorbs the inner loop's arithmetic so the compiler can't
 // prove the work is dead and elide it.
@@ -87,7 +115,7 @@ func (c *cpuLoad) Set(numCores int, dutyCycle float64, cycleLen time.Duration, c
 		}
 	}
 	if cycleLen <= 0 {
-		cycleLen = cpuLoadDefaultCycle
+		cycleLen = DefaultCPULoadCycle()
 	}
 	if dutyCycle < 0 {
 		dutyCycle = 0
@@ -169,13 +197,16 @@ func cpuLoadWorker(ctx context.Context, duty float64, cycle time.Duration) {
 		if workBudget > 0 {
 			start := threadCPUTime()
 			for {
-				// A short batch between clock reads keeps the CPU-time
-				// syscall cost from dominating the loop's own load.
-				for i := 0; i < 4096; i++ {
-					x = x*1103515245 + 12345
-				}
-				if threadCPUTime()-start >= workBudget {
+				var now time.Duration
+				x, now = burnCPUBatch(x, cpuBurnBatchIterations)
+				if now-start >= workBudget {
 					break
+				}
+				select {
+				case <-ctx.Done():
+					cpuBurnSink.Store(x)
+					return
+				default:
 				}
 			}
 		}
@@ -193,6 +224,18 @@ func cpuLoadWorker(ctx context.Context, duty float64, cycle time.Duration) {
 			}
 		}
 	}
+}
+
+// burnCPUBatch advances the LCG accumulator by batchIterations steps and
+// returns the updated accumulator together with the thread's consumed CPU
+// time. Batching amortizes the non-vDSO clock_gettime(CLOCK_THREAD_CPUTIME_ID)
+// syscall across enough arithmetic work that syscall traps do not dominate the
+// burn loop.
+func burnCPUBatch(x uint64, batchIterations int) (uint64, time.Duration) {
+	for i := 0; i < batchIterations; i++ {
+		x = x*1103515245 + 12345
+	}
+	return x, threadCPUTime()
 }
 
 // threadCPUTime returns CPU time consumed by the current OS thread.
