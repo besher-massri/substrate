@@ -356,7 +356,10 @@ func applyPostgresSize100Overrides(objs []*unstructured.Unstructured) error {
 			return fmt.Errorf("%s carries no postgresql.conf to resize for size100", kube.Describe(obj))
 		}
 		conf = strings.ReplaceAll(conf, "max_connections = 300", "max_connections = 2000")
-		conf = strings.ReplaceAll(conf, "max_wal_size = 16GB", "max_wal_size = 32GB")
+		conf = strings.ReplaceAll(conf, "max_wal_size = 16GB", "max_wal_size = 32GB\n    checkpoint_timeout = 30min")
+		if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && !strings.Contains(conf, "synchronous_commit = off") {
+			conf += "\n    synchronous_commit = off\n    wal_writer_delay = 10ms\n    wal_writer_flush_after = 1MB\n"
+		}
 		return unstructured.SetNestedField(obj.Object, conf, "data", "postgresql.conf")
 	}
 	return fmt.Errorf("the postgres manifest has no configmap/postgres-config to resize for size100")

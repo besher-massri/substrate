@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -130,7 +131,11 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.Act
 	// the one requested.
 	finalAttrs = lifecycleOpAttrs(actor, "", wireFidelity)
 	var finalized *ateapipb.Actor
-	if finalized, err = w.ensureSuspendedFinalized(leaseCtx, actorRef, mode, ateletState); err != nil {
+	var inMemSuspending *ateapipb.Actor
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actorRef.Atespace != resources.GoldenActorAtespace {
+		inMemSuspending = actor
+	}
+	if finalized, err = w.ensureSuspendedFinalized(leaseCtx, actorRef, mode, ateletState, inMemSuspending); err != nil {
 		return nil, err
 	}
 	actor = finalized
@@ -179,7 +184,7 @@ func (w *ActorWorkflow) ensureMarkedSuspending(ctx context.Context, actorRef res
 	if err != nil {
 		return nil, err
 	}
-	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
+	mutateSuspending := func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDING
 		// Increment last_assigned_generation for the new Suspend request and create
 		// a snapshot for that generation with a pending durable copy. Both modes
@@ -199,7 +204,13 @@ func (w *ActorWorkflow) ensureMarkedSuspending(ctx context.Context, actorRef res
 		snap.SandboxRuntime = proto.CloneOf(toUpdate.GetStatus().GetWorkerAssignment().GetSandboxRuntime())
 		toUpdate.Status.Snapshots = append(toUpdate.Status.Snapshots, snap)
 		return nil
-	})
+	}
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace {
+		cloned := proto.CloneOf(actor)
+		_ = mutateSuspending(cloned)
+		return cloned, nil
+	}
+	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), mutateSuspending)
 	if err != nil {
 		if errors.Is(err, store.ErrVersionConflict) {
 			return nil, apierror.Aborted("concurrent update conflict, please retry")
@@ -324,7 +335,7 @@ func (w *ActorWorkflow) ensureVolumesDetached(ctx context.Context, actor *ateapi
 // FailedPrecondition.
 // ateletState is the state atelet returned from Checkpoint, applied in the
 // same update. A state that conflicts with the record crashes the actor.
-func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef resources.ActorRef, mode suspendMode, ateletState *ateletpb.ActorSnapshotState) (_ *ateapipb.Actor, err error) {
+func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef resources.ActorRef, mode suspendMode, ateletState *ateletpb.ActorSnapshotState, inMemoryActor ...*ateapipb.Actor) (_ *ateapipb.Actor, err error) {
 	ctx, done := stepSpan(ctx, "FinalizeSuspended")
 	defer func() { err = done(err) }()
 
@@ -344,11 +355,16 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 			slog.Duration("release_snapshot", dReleaseSnapshot))
 	}()
 
-	t := time.Now()
-	latestActor, err := w.store.GetActor(ctx, actorRef)
-	dGetActor = time.Since(t)
-	if err != nil {
-		return nil, err
+	var latestActor *ateapipb.Actor
+	if len(inMemoryActor) > 0 && inMemoryActor[0] != nil {
+		latestActor = inMemoryActor[0]
+	} else {
+		t := time.Now()
+		latestActor, err = w.store.GetActor(ctx, actorRef)
+		dGetActor = time.Since(t)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if state := latestActor.GetStatus().GetState(); state != ateapipb.ActorState_ACTOR_STATE_SUSPENDING {
 		return nil, apierror.FailedPrecondition("FinalizeSuspended prerequisite not met for Actor: %s (got: %v, want %s)", actorRef, state, ateapipb.ActorState_ACTOR_STATE_SUSPENDING)
@@ -381,7 +397,7 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 
 	// 1. Free the worker (if it hasn't been freed yet)
 	if latestActor.GetStatus().GetWorkerAssignment() != nil {
-		t = time.Now()
+		t := time.Now()
 		_, err := releaseWorker(ctx, w.store, latestActor)
 		dReleaseWorker = time.Since(t)
 		if err != nil {
@@ -394,9 +410,10 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 	// would be left SUSPENDING forever with the workflow reporting success.
 	// The precondition pins the version checked above, so an out-of-band write
 	// since then fails the update instead of being overwritten.
-	t = time.Now()
+	t := time.Now()
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+		toUpdate.Status.LastAssignedGeneration = applied.GetLastAssignedGeneration()
 		// The precondition makes toUpdate the version applied was built from.
 		toUpdate.Status.Snapshots = applied.GetSnapshots()
 		snap := snapshotAtLatestGeneration(toUpdate.Status)
@@ -479,6 +496,9 @@ func (w *ActorWorkflow) releaseReplacedSnapshot(ctx context.Context, actor *atea
 	defer func() { err = done(err) }()
 
 	switch {
+	case (os.Getenv("ATE_CACHE_ACTOR_SNAPSHOTS") == "true" || os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" || os.Getenv("ATE_SKIP_ACTOR_GCS_UPLOAD") == "true") && actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace:
+		markSkipped(ctx, "actor snapshots cached locally")
+		return nil
 	case w.objectStorePlugin == nil:
 		markSkipped(ctx, "no object store configured")
 		return nil

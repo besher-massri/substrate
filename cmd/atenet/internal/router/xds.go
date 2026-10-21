@@ -129,13 +129,13 @@ const (
 // defaultExtProcMessageTimeout is Envoy's per-message ext_proc response timeout
 // when request parking is off. With parking on it must cover the park budget,
 // otherwise Envoy abandons a parked request (500) long before the router does.
-const defaultExtProcMessageTimeout = 5 * time.Second
+const defaultExtProcMessageTimeout = 35 * time.Second
 
 // defaultExtProcMaxRequests is the circuit-breaker max_requests set on the
 // ext_proc cluster: ingress.DefaultParkedRequestMax plus equal fast-path headroom, so a
 // full parking lot cannot starve the millisecond-scale header exchanges of
 // requests to already-running actors. See buildCluster.
-const defaultExtProcMaxRequests = 2048
+const defaultExtProcMaxRequests = 65536
 
 // defaultRouteTimeout is Envoy's end-to-end route timeout for workload traffic:
 // the ceiling on a single request from the ingress listener to the actor's
@@ -885,6 +885,15 @@ func (x *XdsServer) buildOriginalDstCluster() *clusterv3.Cluster {
 					},
 				},
 			},
+		},
+		CircuitBreakers: &clusterv3.CircuitBreakers{
+			Thresholds: []*clusterv3.CircuitBreakers_Thresholds{{
+				Priority:           corev3.RoutingPriority_DEFAULT,
+				MaxConnections:     wrapperspb.UInt32(65536),
+				MaxPendingRequests: wrapperspb.UInt32(65536),
+				MaxRequests:        wrapperspb.UInt32(65536),
+				MaxRetries:         wrapperspb.UInt32(1024),
+			}},
 		},
 	}
 

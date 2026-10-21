@@ -384,6 +384,9 @@ func StartPoll(
 func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetchTimeout time.Duration, onError func(err error, fetched bool)) error {
 	var fetched atomic.Bool
 	return boomer.Events.Subscribe("boomer:spawn", func(spawnCount int, spawnRate float64) {
+		if fetched.Load() && spawnCount >= 100 {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 		defer cancel()
 		if err := fetchAndApply(ctx, "spawn", url, holder, sampler); err != nil {

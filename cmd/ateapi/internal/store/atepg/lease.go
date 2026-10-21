@@ -19,11 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // defaultLeaseTTL is how long a lease may go unrenewed before another client
@@ -36,6 +39,12 @@ const defaultLeaseTTL = 30 * time.Second
 const leaseCleanupBatch = 1000
 
 func (p *Persistence) AcquireLease(ctx context.Context, key string) (*store.Lease, error) {
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
+		strings.HasPrefix(key, "lease:actor:") &&
+		!strings.HasPrefix(key, "lease:actor:"+resources.GoldenActorAtespace+":") {
+		leaseCtx, cancel := context.WithCancel(ctx)
+		return store.NewLease(leaseCtx, cancel), nil
+	}
 	ttl := p.leaseTTL
 	token := uuid.NewString()
 	// Acquisition runs before any workflow step span opens, so log the

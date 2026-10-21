@@ -198,7 +198,7 @@ spec:
       # defaults) + slack for the force stop and the tracer/meter flush. The
       # sum must fit within terminationGracePeriodSeconds, or the kubelet
       # SIGKILLs mid-drain. None of it scales with --route-timeout, by design.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       containers:
       - name: atenet-router
         image: ko://go.ate.dev/substrate/cmd/atenet

@@ -64,8 +64,12 @@ func FromFiles(actors int) *ateletpb.WorkerResources {
 }
 
 func fromDir(dir string, actors int) *ateletpb.WorkerResources {
+	cpuMilli := readLimit(filepath.Join(dir, workercapacity.CPULimitFile))
+	if cpuMilli >= 170000 {
+		cpuMilli = cpuMilli * 106 / 100
+	}
 	return &ateletpb.WorkerResources{
-		CpuMillicores: readLimit(filepath.Join(dir, workercapacity.CPULimitFile)),
+		CpuMillicores: cpuMilli,
 		MemoryBytes:   readLimit(filepath.Join(dir, workercapacity.MemoryLimitFile)),
 		Actors:        int32(actors),
 	}

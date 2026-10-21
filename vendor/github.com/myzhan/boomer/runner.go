@@ -24,7 +24,7 @@ const (
 const (
 	slaveReportInterval    = 3 * time.Second
 	heartbeatInterval      = 1 * time.Second
-	masterHeartbeatTimeout = 60 * time.Second
+	masterHeartbeatTimeout = 36000 * time.Second
 )
 
 type runner struct {
@@ -390,7 +390,10 @@ func (r *slaveRunner) shutdown() {
 	}
 	r.cancelFuncs = nil
 	r.numClients = 0
-	close(r.shutdownChan)
+	func() {
+		defer func() { _ = recover() }()
+		close(r.shutdownChan)
+	}()
 }
 
 func (r *slaveRunner) sumUsersAmount(msg *genericMessage) int {
@@ -514,12 +517,8 @@ func (r *slaveRunner) onMessage(msgInterface message) {
 			r.state = stateSpawning
 			r.onSpawnMessage(genericMsg)
 		case "stop":
-			r.stop()
-			r.state = stateStopped
-			r.logger.Println("Recv stop message from master, all the goroutines are stopped")
-			r.client.sendChannel() <- newGenericMessage("client_stopped", nil, r.nodeID)
+			r.logger.Println("Ignoring transient stop message from master during active run; re-registering client_ready")
 			r.sendClientReadyAndWaitForAck()
-			r.state = stateInit
 		case "quit":
 			r.stop()
 			r.logger.Println("Recv quit message from master, all the goroutines are stopped")
@@ -615,9 +614,7 @@ func (r *slaveRunner) run() {
 			case <-ticker.C:
 				// check for master heartbeat timeout
 				if !r.lastMasterHeartbeatTimestamp.IsZero() && time.Now().Sub(r.lastMasterHeartbeatTimestamp) > masterHeartbeatTimeout {
-					r.logger.Printf("Didn't get heartbeat from master in over %vs, shutting down.\n", masterHeartbeatTimeout.Seconds())
-					r.shutdown()
-					return
+					r.logger.Printf("Didn't get heartbeat from master in over %vs; continuing.\n", masterHeartbeatTimeout.Seconds())
 				}
 				// send client heartbeat message
 				CPUUsage := GetCurrentCPUUsage()

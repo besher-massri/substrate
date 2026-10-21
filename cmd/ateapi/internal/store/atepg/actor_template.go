@@ -18,6 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -26,8 +29,30 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type cachedTemplateEntry struct {
+	tmpl      *ateapipb.ActorTemplate
+	expiresAt time.Time
+}
+
+var (
+	templateCacheMu sync.RWMutex
+	templateCache   = make(map[string]cachedTemplateEntry)
+)
+
+// invalidateTemplateCache evicts the cached entry for ref.
+func (p *Persistence) invalidateTemplateCache(ref resources.ActorTemplateRef) {
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") != "true" {
+		return
+	}
+	key := fmt.Sprintf("%p|%s/%s", p, ref.Atespace, ref.Name)
+	templateCacheMu.Lock()
+	delete(templateCache, key)
+	templateCacheMu.Unlock()
+}
+
 func (p *Persistence) CreateActorTemplate(ctx context.Context, template *ateapipb.ActorTemplate) (*ateapipb.ActorTemplate, error) {
 	atespace, name := template.GetMetadata().GetAtespace(), template.GetMetadata().GetName()
+	p.invalidateTemplateCache(resources.ActorTemplateRef{Atespace: atespace, Name: name})
 	dbTemplate := proto.Clone(template).(*ateapipb.ActorTemplate)
 	if dbTemplate.Metadata == nil {
 		dbTemplate.Metadata = &ateapipb.ResourceMetadata{}
@@ -54,6 +79,19 @@ func (p *Persistence) CreateActorTemplate(ctx context.Context, template *ateapip
 }
 
 func (p *Persistence) GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error) {
+	useCache := os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true"
+	cacheKey := fmt.Sprintf("%p|%s/%s", p, templateRef.Atespace, templateRef.Name)
+	if useCache {
+		now := time.Now()
+		templateCacheMu.RLock()
+		if entry, ok := templateCache[cacheKey]; ok && now.Before(entry.expiresAt) {
+			cached := proto.Clone(entry.tmpl).(*ateapipb.ActorTemplate)
+			templateCacheMu.RUnlock()
+			return cached, nil
+		}
+		templateCacheMu.RUnlock()
+	}
+
 	var protoBytes []byte
 	err := p.pool.QueryRow(ctx, `SELECT proto FROM actor_templates WHERE atespace = $1 AND name = $2`, templateRef.Atespace, templateRef.Name).Scan(&protoBytes)
 	if err != nil {
@@ -65,6 +103,14 @@ func (p *Persistence) GetActorTemplate(ctx context.Context, templateRef resource
 	out := &ateapipb.ActorTemplate{}
 	if err := unmarshalStored(protoBytes, out); err != nil {
 		return nil, fmt.Errorf("unmarshaling actor template: %w", err)
+	}
+	if useCache && (out.GetSnapshotConfig().GetGoldenSnapshotConfig().GetMode() == ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED || out.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag() != nil) {
+		templateCacheMu.Lock()
+		templateCache[cacheKey] = cachedTemplateEntry{
+			tmpl:      proto.Clone(out).(*ateapipb.ActorTemplate),
+			expiresAt: time.Now().Add(30 * time.Second),
+		}
+		templateCacheMu.Unlock()
 	}
 	return out, nil
 }
@@ -91,6 +137,7 @@ func (p *Persistence) MarkActorTemplateForDeletion(ctx context.Context, template
 }
 
 func (p *Persistence) updateActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions, mutate func(*ateapipb.ActorTemplate) error, markForDeletion bool) (*ateapipb.ActorTemplate, error) {
+	p.invalidateTemplateCache(templateRef)
 	var currentUID string
 	var currentVersion int64
 	var currentBytes []byte
@@ -222,6 +269,7 @@ func (p *Persistence) ListActorTemplates(ctx context.Context, atespace string, o
 }
 
 func (p *Persistence) DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapipb.ActorTemplate, error) {
+	p.invalidateTemplateCache(templateRef)
 	var protoBytes []byte
 	err := p.pool.QueryRow(ctx, `
 		DELETE FROM actor_templates AS t

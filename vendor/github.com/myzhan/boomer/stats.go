@@ -39,10 +39,10 @@ func newRequestStats() (stats *requestStats) {
 		entries: entries,
 		errors:  errors,
 	}
-	stats.requestSuccessChan = make(chan *requestSuccess, 100)
-	stats.requestFailureChan = make(chan *requestFailure, 100)
+	stats.requestSuccessChan = make(chan *requestSuccess, 65536)
+	stats.requestFailureChan = make(chan *requestFailure, 65536)
 	stats.clearStatsChan = make(chan bool)
-	stats.messageToRunnerChan = make(chan map[string]interface{}, 10)
+	stats.messageToRunnerChan = make(chan map[string]interface{}, 1024)
 	stats.shutdownChan = make(chan bool)
 
 	stats.total = &statsEntry{

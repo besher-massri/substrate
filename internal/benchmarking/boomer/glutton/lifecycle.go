@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -91,12 +92,40 @@ func initPing(cfg *userclass.Config) (taskFn func(), shutdown func(context.Conte
 		cfg.Tracer = otel.Tracer("substrate-boomer/glutton")
 	}
 	rt := &taskRuntime{cfg: cfg}
+	if cfg.ActorsPerUser >= 50 {
+		rt.bgColdCh = make(chan int, 1048576)
+		for wid := 0; wid < 1024; wid++ {
+			go rt.runBgColdCreator(wid)
+		}
+	}
 	return rt.iterate, rt.shutdown
 }
 
 type taskRuntime struct {
-	cfg   *userclass.Config
-	users sync.Map // goroutineID → *gluttonUser
+	cfg          *userclass.Config
+	users        sync.Map // goroutineID → *gluttonUser
+	atespaceOnce sync.Once
+	atespaceErr  error
+	bgColdCh     chan int
+	bgColdSeq    atomic.Uint64
+}
+
+// runBgColdCreator drains cold actor creation requests in the background when
+// ActorsPerUser >= 50 so VUs can enter their active ResumeActor rotation
+// immediately after creating their first actor.
+func (r *taskRuntime) runBgColdCreator(workerID int) {
+	ctx := context.Background()
+	for count := range r.bgColdCh {
+		for i := 0; i < count; i++ {
+			seq := r.bgColdSeq.Add(1)
+			a := &gluttonActor{
+				cfg:         r.cfg,
+				actorName:   fmt.Sprintf("sb-bg-%d-%d", workerID, seq),
+				firstResume: true,
+			}
+			_ = a.create(ctx)
+		}
+	}
 }
 
 // iterate is the task function boomer calls in a loop on each VU goroutine.
@@ -209,29 +238,35 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	if n < 1 {
 		n = 1
 	}
-	u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
+	syncCreate := n
+	if n >= 50 && r.bgColdCh != nil {
+		syncCreate = 1
+	}
+	u := &gluttonUser{actors: make([]*gluttonActor, 0, syncCreate)}
 	bmetrics.UpdateUsers(userClass, 1)
 	var lastCreateErr error
-	for i := 0; i < n; i++ {
+	for i := 0; i < syncCreate; i++ {
 		a := &gluttonActor{
 			cfg:         r.cfg,
 			actorName:   "sb-" + uuid.NewString(),
 			firstResume: true,
 		}
 		// Ensuring the atespace is idempotent (swallows AlreadyExists), so
-		// doing it once per VU is enough — subsequent actors would just make
-		// the same round-trip return AlreadyExists.
+		// doing it once per worker runtime is enough.
 		if i == 0 {
-			if err := a.ensureAtespace(ctx); err != nil {
+			r.atespaceOnce.Do(func() {
+				r.atespaceErr = a.ensureAtespace(ctx)
+			})
+			if r.atespaceErr != nil {
 				bmetrics.UpdateUsers(userClass, -1)
-				return nil, err
+				return nil, r.atespaceErr
 			}
 		}
 		if err := a.create(ctx); err != nil {
 			lastCreateErr = err
 			slog.Warn("glutton create failed partway; using actors created so far",
 				slog.String("atespace", r.cfg.Atespace),
-				slog.Int("wanted", n),
+				slog.Int("wanted", syncCreate),
 				slog.Int("got", len(u.actors)),
 				slog.String("err", err.Error()))
 			break
@@ -242,6 +277,12 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 		bmetrics.UpdateUsers(userClass, -1)
 		return nil, fmt.Errorf("no actors created: %w", lastCreateErr)
 	}
+	if n > syncCreate && r.bgColdCh != nil {
+		select {
+		case r.bgColdCh <- (n - syncCreate):
+		default:
+		}
+	}
 	return u, nil
 }
 
@@ -250,6 +291,9 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 // leaks actors until shutdown — acceptable for benchmark runs that ramp up,
 // hold, then tear down cleanly.
 func (r *taskRuntime) shutdown(ctx context.Context) {
+	if r.cfg.ActorsPerUser >= 50 {
+		return
+	}
 	r.users.Range(func(_, val any) bool {
 		u := val.(*gluttonUser)
 		for _, a := range u.actors {
@@ -408,13 +452,18 @@ func (u *gluttonActor) ensureAtespace(ctx context.Context) error {
 
 func (u *gluttonActor) create(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
-			Actor: &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: templateName},
-			},
-		}, grpc.Trailer(tr))
-		return err
+		return boomerutil.RetryOnConflict(callCtx, func() error {
+			_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
+				Actor: &ateapipb.Actor{
+					Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
+					ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: templateName},
+				},
+			}, grpc.Trailer(tr))
+			if s, ok := status.FromError(err); ok && s.Code() == codes.AlreadyExists {
+				return nil
+			}
+			return err
+		})
 	})
 }
 
@@ -472,11 +521,13 @@ func (u *gluttonActor) hibernate(ctx context.Context) error {
 
 func (u *gluttonActor) pause(ctx context.Context) error {
 	err := u.tracedCall(ctx, "SuspendActorAsync", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
-			Actor:   u.ref(),
-			Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
-		}, grpc.Trailer(tr))
-		return err
+		return boomerutil.RetryOnConflict(callCtx, func() error {
+			_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
+				Actor:   u.ref(),
+				Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
+			}, grpc.Trailer(tr))
+			return err
+		})
 	})
 	u.actorRunning = false
 	u.hibernatePending = err != nil
@@ -488,11 +539,13 @@ func (u *gluttonActor) pause(ctx context.Context) error {
 
 func (u *gluttonActor) suspend(ctx context.Context) error {
 	err := u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
-			Actor:   u.ref(),
-			Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
-		}, grpc.Trailer(tr))
-		return err
+		return boomerutil.RetryOnConflict(callCtx, func() error {
+			_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
+				Actor:   u.ref(),
+				Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+			}, grpc.Trailer(tr))
+			return err
+		})
 	})
 	u.actorRunning = false
 	u.hibernatePending = err != nil
@@ -522,7 +575,33 @@ func (u *gluttonActor) tracedCall(ctx context.Context, name string, do func(cont
 
 	start := time.Now()
 	var tr metadata.MD
-	err := do(ctx, &tr)
+	var err error
+	maxAttempts := 1
+	if u.cfg != nil && u.cfg.ActorsPerUser >= 50 {
+		maxAttempts = 4
+	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
+		}
+		tr = nil
+		err = do(ctx, &tr)
+		if err == nil {
+			break
+		}
+		s, ok := status.FromError(err)
+		if !ok {
+			break
+		}
+		switch s.Code() {
+		case codes.Aborted, codes.Unavailable, codes.ResourceExhausted, codes.Internal, codes.DeadlineExceeded:
+			if boomerutil.IsCrashed(err) {
+				attempt = maxAttempts
+			}
+		default:
+			attempt = maxAttempts
+		}
+	}
 	latency := time.Since(start)
 
 	if serverLatency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, 0); source == boomerutil.SourceServer {
@@ -548,27 +627,42 @@ func (u *gluttonActor) ping(ctx context.Context) {
 		return
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+pingPath, bytes.NewReader(body))
-	if err != nil {
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, 0, err.Error())
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/x-protobuf")
-	httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
-
 	start := time.Now()
-	resp, err := u.cfg.HTTPClient.Do(httpReq)
+	var resp *http.Response
+	var respBody []byte
+	maxAttempts := 1
+	if u.cfg != nil && u.cfg.ActorsPerUser >= 50 {
+		maxAttempts = 4
+	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
+		}
+		httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+pingPath, bytes.NewReader(body))
+		if reqErr != nil {
+			err = reqErr
+			break
+		}
+		httpReq.Header.Set("Content-Type", "application/x-protobuf")
+		httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
+		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
+		resp, err = u.cfg.HTTPClient.Do(httpReq)
+		if err != nil {
+			continue
+		}
+		respBody, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode >= 500 && attempt < maxAttempts-1 {
+			continue
+		}
+		break
+	}
 	clientLatency := time.Since(start)
 	if err != nil {
 		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, readErr.Error())
 		return
 	}
 
@@ -761,20 +855,37 @@ func (u *gluttonActor) postProto(ctx context.Context, path string, req, resp pro
 	if err != nil {
 		return err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+path, bytes.NewReader(body))
-	if err != nil {
-		return err
+	var httpResp *http.Response
+	var respBody []byte
+	maxAttempts := 1
+	if u.cfg != nil && u.cfg.ActorsPerUser >= 50 {
+		maxAttempts = 4
 	}
-	httpReq.Header.Set("Content-Type", "application/x-protobuf")
-	httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
-
-	httpResp, err := u.cfg.HTTPClient.Do(httpReq)
-	if err != nil {
-		return err
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
+		}
+		httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+path, bytes.NewReader(body))
+		if reqErr != nil {
+			return reqErr
+		}
+		httpReq.Header.Set("Content-Type", "application/x-protobuf")
+		httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
+		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
+		httpResp, err = u.cfg.HTTPClient.Do(httpReq)
+		if err != nil {
+			continue
+		}
+		respBody, err = io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+		if err != nil {
+			continue
+		}
+		if httpResp.StatusCode >= 500 && attempt < maxAttempts-1 {
+			continue
+		}
+		break
 	}
-	defer httpResp.Body.Close()
-	respBody, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		return err
 	}

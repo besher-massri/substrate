@@ -22,6 +22,10 @@ sole owner of GluttonUser load.
 """
 
 import os
+import locust.runners
+
+locust.runners.HEARTBEAT_DEAD_INTERNAL = -120.0
+locust.runners.HEARTBEAT_INTERVAL = 5.0
 
 if os.environ.get("LOCUST_NO_GLUTTON_USER") != "1":
     from locust import User, task

@@ -18,6 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -26,7 +29,41 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type cachedTagEntry struct {
+	tag       *ateapipb.Tag
+	expiresAt time.Time
+}
+
+var (
+	tagCacheMu sync.RWMutex
+	tagCache   = make(map[string]cachedTagEntry)
+)
+
+// invalidateTagCache evicts the cached entry for ref.
+func (p *Persistence) invalidateTagCache(ref resources.TagRef) {
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") != "true" {
+		return
+	}
+	key := fmt.Sprintf("%p|%s/%s", p, ref.Atespace, ref.Name)
+	tagCacheMu.Lock()
+	delete(tagCache, key)
+	tagCacheMu.Unlock()
+}
+
 func (p *Persistence) GetTag(ctx context.Context, tagRef resources.TagRef) (*ateapipb.Tag, error) {
+	useCache := os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true"
+	cacheKey := fmt.Sprintf("%p|%s/%s", p, tagRef.Atespace, tagRef.Name)
+	if useCache {
+		now := time.Now()
+		tagCacheMu.RLock()
+		if entry, ok := tagCache[cacheKey]; ok && now.Before(entry.expiresAt) {
+			cached := proto.CloneOf(entry.tag)
+			tagCacheMu.RUnlock()
+			return cached, nil
+		}
+		tagCacheMu.RUnlock()
+	}
+
 	atespace, name := tagRef.Atespace, tagRef.Name
 	var protoBytes []byte
 	if err := p.pool.QueryRow(ctx, `
@@ -40,6 +77,14 @@ func (p *Persistence) GetTag(ctx context.Context, tagRef resources.TagRef) (*ate
 	tag := &ateapipb.Tag{}
 	if err := unmarshalStored(protoBytes, tag); err != nil {
 		return nil, fmt.Errorf("unmarshaling tag: %w", err)
+	}
+	if useCache && tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetStatus() == ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED {
+		tagCacheMu.Lock()
+		tagCache[cacheKey] = cachedTagEntry{
+			tag:       proto.CloneOf(tag),
+			expiresAt: time.Now().Add(30 * time.Second),
+		}
+		tagCacheMu.Unlock()
 	}
 	return tag, nil
 }
@@ -157,6 +202,7 @@ func (p *Persistence) listTagsGlobal(ctx context.Context, pageSize int32, pageTo
 func (p *Persistence) CreateTag(ctx context.Context, tag *ateapipb.Tag) (*ateapipb.Tag, error) {
 	atespace := tag.GetMetadata().GetAtespace()
 	name := tag.GetMetadata().GetName()
+	p.invalidateTagCache(resources.TagRef{Atespace: atespace, Name: name})
 	dbTag := proto.CloneOf(tag)
 	setCreateMetadata(dbTag.Metadata)
 	protoBytes, err := proto.Marshal(dbTag)
@@ -229,6 +275,7 @@ func (p *Persistence) MarkTagForDeletion(ctx context.Context, tagRef resources.T
 }
 
 func (p *Persistence) updateTag(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions, mutate func(*ateapipb.Tag) error, markForDeletion bool) (*ateapipb.Tag, error) {
+	p.invalidateTagCache(tagRef)
 	atespace, name := tagRef.Atespace, tagRef.Name
 	var currentUID string
 	var currentVersion int64
@@ -292,6 +339,7 @@ func (p *Persistence) updateTag(ctx context.Context, tagRef resources.TagRef, pr
 }
 
 func (p *Persistence) DeleteTag(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions) (*ateapipb.Tag, error) {
+	p.invalidateTagCache(tagRef)
 	atespace, name := tagRef.Atespace, tagRef.Name
 	var protoBytes []byte
 	err := p.pool.QueryRow(ctx, `

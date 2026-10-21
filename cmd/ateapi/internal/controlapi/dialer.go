@@ -110,7 +110,7 @@ func (d *AteletDialer) NodeGone(ctx context.Context, nodeName string) (bool, err
 func NewAteletDialer(ateletIndexer cache.Indexer, ateletSPIFFEID, clientBundlePath, serverCAPath string, opts ...DialerOption) *AteletDialer {
 	d := &AteletDialer{
 		ateletIndexer: ateletIndexer,
-		ateletConns:   newAteletConnCache(1024),
+		ateletConns:   newAteletConnCache(16384),
 		dialCredentials: func(expectedPodUID string) (credentials.TransportCredentials, error) {
 			tlsConfig, err := buildTLSConfig(ateletSPIFFEID, clientBundlePath, serverCAPath, expectedPodUID)
 			if err != nil {

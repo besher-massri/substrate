@@ -18,4 +18,9 @@ const (
 	// ResourceNameRegexPattern is the regular expression pattern for a valid
 	// Substrate resource name.
 	ResourceNameRegexPattern = `[a-z0-9]([-a-z0-9]*[a-z0-9])?`
+
+	// GoldenActorAtespace is the atespace holding golden seed actors and
+	// templates whose snapshots must be uploaded to durable storage even when
+	// node-local actor snapshot caching is enabled.
+	GoldenActorAtespace = "benchmark-workloads"
 )

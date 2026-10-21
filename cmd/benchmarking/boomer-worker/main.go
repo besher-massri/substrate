@@ -152,9 +152,10 @@ func main() {
 	// suspend/resume round trip.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 0 // no total cap; the per-host cap governs
-	transport.MaxIdleConnsPerHost = *httpMaxIdleConnsPerHost
+	transport.MaxIdleConnsPerHost = max(*httpMaxIdleConnsPerHost, 16384)
+	transport.MaxConnsPerHost = 16384
 	transport.IdleConnTimeout = 5 * time.Minute
-	httpClient := &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	httpClient := &http.Client{Timeout: 60 * time.Second, Transport: transport}
 
 	if *masterWebPort > 0 {
 		masterHost := flag.Lookup("master-host").Value.String()

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/kube"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/kustomize"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 )
@@ -514,7 +515,12 @@ func (e *Env) applyAtenetEgress(ctx context.Context, provider config.CredentialP
 		return err
 	}
 
-	if err := e.Kube.ApplyBytes(ctx, manifests); err != nil {
+	objs, err := kube.DecodeManifestBytes(manifests)
+	if err != nil {
+		return err
+	}
+	applyWorkloadRuntimeAndScaleOverrides(objs, e.Cfg.Size100(), e.Cfg.FakeDataPlane, os.Environ())
+	if err := e.Kube.Apply(ctx, objs); err != nil {
 		return err
 	}
 

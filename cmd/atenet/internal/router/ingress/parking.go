@@ -26,15 +26,15 @@ import (
 // Default request-parking parameters. See ParkedRequestConfig for the meaning of each
 // field; these are also the flag defaults wired up in NewRouterCmd.
 const (
-	DefaultParkedRequestBudget = 5 * time.Second
+	DefaultParkedRequestBudget = 30 * time.Second
 
 	// DefaultParkedRequestMax is sized together with the ext_proc cluster's
 	// circuit breaker (--extproc-max-requests, derived as twice the lot by default): each parked
 	// request holds one ext_proc stream, i.e. one active request against that
 	// cluster, for its entire wait. Startup validation keeps an explicit breaker >= the
-	// lot, and the default pair (1024 lot / 2048 breaker) leaves equal headroom
+	// lot, and the default pair (32768 lot / 65536 breaker) leaves equal headroom
 	// for the fast path. See buildCluster in xds.go.
-	DefaultParkedRequestMax = 1024
+	DefaultParkedRequestMax = 32768
 
 	// Retry cadence between resume attempts while a request is parked: a gentle
 	// exponential backoff.

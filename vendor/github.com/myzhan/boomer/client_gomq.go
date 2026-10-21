@@ -106,8 +106,8 @@ func newClient(masterHost string, masterPort int, identity string) (client *gomq
 		masterHost:             masterHost,
 		masterPort:             masterPort,
 		identity:               identity,
-		fromMaster:             make(chan message, 100),
-		toMaster:               make(chan message, 100),
+		fromMaster:             make(chan message, 65536),
+		toMaster:               make(chan message, 65536),
 		disconnectedFromMaster: make(chan bool),
 		shutdownChan:           make(chan bool),
 	}

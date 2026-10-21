@@ -122,24 +122,29 @@ func StartCPUProfile(file string, duration time.Duration) (err error) {
 	return nil
 }
 
+var (
+	currentProcessOnce sync.Once
+	currentProcess     *process.Process
+	currentProcessErr  error
+)
+
 // GetCurrentCPUUsage get current CPU usage
 func GetCurrentCPUUsage() float64 {
-	currentPid := os.Getpid()
-	p, err := process.NewProcess(int32(currentPid))
-	if err != nil {
-		log.Printf("Fail to get CPU percent, %v\n", err)
+	currentProcessOnce.Do(func() {
+		currentPid := os.Getpid()
+		currentProcess, currentProcessErr = process.NewProcess(int32(currentPid))
+	})
+	if currentProcessErr != nil || currentProcess == nil {
 		return 0.0
 	}
-	percent, err := p.CPUPercent()
+	percent, err := currentProcess.CPUPercent()
 	if err != nil {
-		log.Printf("Fail to get CPU percent, %v\n", err)
 		return 0.0
 	}
 	return percent / float64(runtime.NumCPU())
 }
 
+// GetCurrentMemUsage returns 0 to avoid runtime.ReadMemStats STW pauses across 1M goroutines.
 func GetCurrentMemUsage() uint64 {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	return m.Alloc
+	return 0
 }

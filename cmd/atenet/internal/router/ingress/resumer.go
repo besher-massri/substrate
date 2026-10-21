@@ -17,6 +17,7 @@ package ingress
 import (
 	"context"
 	"math"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,6 +117,14 @@ type ActorResumer struct {
 	// Used as a unique ID to identify requests (reqID) and disambiguate the
 	// leader vs joiners for flight outcome classification.
 	nextID uint64
+
+	cacheMu sync.RWMutex
+	cache   map[string]cachedRunningActor
+}
+
+type cachedRunningActor struct {
+	actor     *ateapipb.Actor
+	expiresAt time.Time
 }
 
 // resumerOption configures an ActorResumer.
@@ -147,6 +156,7 @@ func NewActorResumer(apiClient ateapipb.ControlClient, opts ...resumerOption) *A
 	r := &ActorResumer{
 		apiClient: apiClient,
 		flights:   make(map[string]*resumeActorFlight),
+		cache:     make(map[string]cachedRunningActor),
 		budget:    failFastResumeBudget,
 		backoff: resumeBackoff(DefaultParkedRequestRetryInterval,
 			DefaultParkedRequestRetryFactor, DefaultParkedRequestRetryJitter),
@@ -197,6 +207,15 @@ func (r *ActorResumer) ResumeActor(ctx context.Context, actorRef resources.Actor
 	callerSpanCtx := trace.SpanContextFromContext(ctx)
 
 	key := actorRef.String()
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+		r.cacheMu.RLock()
+		if entry, ok := r.cache[key]; ok && time.Now().Before(entry.expiresAt) {
+			r.cacheMu.RUnlock()
+			return entry.actor, ResumeOutcomeNone, nil
+		}
+		r.cacheMu.RUnlock()
+	}
+
 	r.mu.Lock()
 	f, ok := r.flights[key]
 	if !ok {
@@ -206,7 +225,19 @@ func (r *ActorResumer) ResumeActor(ctx context.Context, actorRef resources.Actor
 	}
 	r.mu.Unlock()
 
-	return r.awaitFlight(ctx, f, actorRef, reqID)
+	actor, outcome, err := r.awaitFlight(ctx, f, actorRef, reqID)
+	if err == nil && actor != nil && os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+		r.cacheMu.Lock()
+		if len(r.cache) > 200000 {
+			r.cache = make(map[string]cachedRunningActor, 32768)
+		}
+		r.cache[key] = cachedRunningActor{
+			actor:     actor,
+			expiresAt: time.Now().Add(15 * time.Second),
+		}
+		r.cacheMu.Unlock()
+	}
+	return actor, outcome, err
 }
 
 // runFlight runs one shared resume for actorRef and publishes its outcome to

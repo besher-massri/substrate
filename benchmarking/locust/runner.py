@@ -498,7 +498,10 @@ def upload_to_gcs(local_path: Path, gcs_uri: str) -> None:
     from google.cloud import storage
 
     bucket_name, _, blob_path = gcs_uri[len("gs://"):].partition("/")
-    storage.Client().bucket(bucket_name).blob(blob_path).upload_from_filename(
+    storage.Client(
+        project=os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or "substrate-benchmarking-dev"
+    ).bucket(bucket_name).blob(blob_path).upload_from_filename(
         str(local_path)
     )
 

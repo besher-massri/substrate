@@ -51,10 +51,11 @@ func pidFilePath(actorDirs *ateworkerpb.ActorDirs, containerName string) string 
 // runsc can leave mounts behind in its state directory (its null-netns), which
 // must be detached in this mount namespace before they can be removed.
 func resetRunscStateAndPidFileDirs(actorDirs *ateworkerpb.ActorDirs) error {
-	for _, dir := range []string{runscStateDir(actorDirs), pidFileDir(actorDirs)} {
-		if err := imagecache.UnmountAllUnder(dir); err != nil {
-			return fmt.Errorf("while unmounting under %q: %w", dir, err)
-		}
+	stateDir := runscStateDir(actorDirs)
+	if err := imagecache.UnmountAllUnder(stateDir); err != nil {
+		return fmt.Errorf("while unmounting under %q: %w", stateDir, err)
+	}
+	for _, dir := range []string{stateDir, pidFileDir(actorDirs)} {
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("while clearing %q: %w", dir, err)
 		}

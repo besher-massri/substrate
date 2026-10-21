@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"time"
 
@@ -87,7 +88,11 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	}
 	defer lease.Close()
 
-	actor, actorTemplate, err = w.loadActorForResume(leaseCtx, actorRef)
+	var prefetched *ateapipb.Actor
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actorRef.Atespace != resources.GoldenActorAtespace {
+		prefetched = actor
+	}
+	actor, actorTemplate, err = w.loadActorForResume(leaseCtx, actorRef, prefetched)
 	if err != nil {
 		return nil, false, err
 	}
@@ -116,13 +121,23 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	actor = assigned
 	volumePublishContexts, err := w.ensureVolumesAttached(leaseCtx, actor, worker, actorTemplate)
 	if err != nil {
+		if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+			w.revertFailedResumeAssignment(leaseCtx, actorRef, actorTemplate)
+		}
 		return nil, false, err
 	}
 	if tele, err = w.ensureAteletRestored(leaseCtx, actorRef, actor, actorTemplate, volumePublishContexts); err != nil {
+		if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+			w.revertFailedResumeAssignment(leaseCtx, actorRef, actorTemplate)
+		}
 		return nil, false, err
 	}
 	var running *ateapipb.Actor
-	if running, err = w.finalizeRunning(leaseCtx, actorRef); err != nil {
+	var inMemRunning *ateapipb.Actor
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actorRef.Atespace != resources.GoldenActorAtespace {
+		inMemRunning = actor
+	}
+	if running, err = w.finalizeRunning(leaseCtx, actorRef, inMemRunning); err != nil {
 		return nil, false, err
 	}
 	actor = running
@@ -130,16 +145,21 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 }
 
 // loadActorForResume fetches the current actor record and its template.
-func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, _ *ateapipb.ActorTemplate, err error) {
+func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resources.ActorRef, prefetched ...*ateapipb.Actor) (_ *ateapipb.Actor, _ *ateapipb.ActorTemplate, err error) {
 	ctx, done := stepSpan(ctx, "LoadActorForResume")
 	defer func() { err = done(err) }()
 
-	actor, err := w.store.GetActor(ctx, actorRef)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, nil, apierror.NotFound("Actor %s not found", actorRef)
+	var actor *ateapipb.Actor
+	if len(prefetched) > 0 && prefetched[0] != nil {
+		actor = prefetched[0]
+	} else {
+		actor, err = w.store.GetActor(ctx, actorRef)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, nil, apierror.NotFound("Actor %s not found", actorRef)
+			}
+			return nil, nil, fmt.Errorf("while getting actor from DB: %w", err)
 		}
-		return nil, nil, fmt.Errorf("while getting actor from DB: %w", err)
 	}
 
 	// If the actor is already running, there is no pending restore to prepare
@@ -486,6 +506,14 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 			constraints.RequiredRuntime = hardware.Requirement{}
 			pickedWorker, err = w.scheduler.Schedule(ctx, constraints)
 		}
+		if errors.Is(err, scheduling.ErrNoCapacity) && len(constraints.RequiredNodes) > 0 && os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+			constraints.RequiredNodes = nil
+			pickedWorker, err = w.scheduler.Schedule(ctx, constraints)
+			if errors.Is(err, scheduling.ErrNoCapacity) && relaxable {
+				constraints.RequiredRuntime = hardware.Requirement{}
+				pickedWorker, err = w.scheduler.Schedule(ctx, constraints)
+			}
+		}
 		if err != nil {
 			if errors.Is(err, scheduling.ErrNoCapacity) {
 				outcome = ateattr.SchedulerOutcomeNoCapacity
@@ -496,10 +524,15 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 
 		assignedWorker = pickedWorker
 		slog.InfoContext(ctx, "Picked worker", slog.Any("worker", pickedWorker.String()))
-	} else if relaxable && !snapRuntime.WorkerMatches(assignedWorker.GetStatus()) {
-		// The stale claim only passed the relaxed check, so bind under it:
-		// admit asks the same question again under the row lock.
-		constraints.RequiredRuntime = hardware.Requirement{}
+	} else {
+		if relaxable && !snapRuntime.WorkerMatches(assignedWorker.GetStatus()) {
+			// The stale claim only passed the relaxed check, so bind under it:
+			// admit asks the same question again under the row lock.
+			constraints.RequiredRuntime = hardware.Requirement{}
+		}
+		if len(constraints.RequiredNodes) > 0 && !slices.Contains(constraints.RequiredNodes, assignedWorker.GetNodeName()) && os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+			constraints.RequiredNodes = nil
+		}
 	}
 
 	if assignedWorker.GetNodeName() == "" {
@@ -687,6 +720,9 @@ func canRelaxRuntime(actor *ateapipb.Actor, constraints scheduling.Constraints) 
 func (w *ActorWorkflow) appliesWithFallback(worker *ateapipb.Worker, constraints scheduling.Constraints, relaxable bool) bool {
 	relaxed := constraints
 	relaxed.RequiredRuntime = hardware.Requirement{}
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+		relaxed.RequiredNodes = nil
+	}
 	if !w.scheduler.Applies(worker, relaxed) {
 		return false
 	}
@@ -881,14 +917,53 @@ func (w *ActorWorkflow) egressGateway() *ateletpb.EgressGateway {
 	return &ateletpb.EgressGateway{Address: w.egressGatewayAddress}
 }
 
+// revertFailedResumeAssignment releases a worker claim and reverts an actor back
+// to SUSPENDED when a resume attempt fails after worker assignment (for example,
+// due to a transient atelet connection error or context timeout), preventing
+// leaked RESUMING slots on the worker.
+func (w *ActorWorkflow) revertFailedResumeAssignment(ctx context.Context, actorRef resources.ActorRef, actorTemplate *ateapipb.ActorTemplate) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+
+	latestActor, err := w.store.GetActor(cleanupCtx, actorRef)
+	if err != nil {
+		slog.WarnContext(cleanupCtx, "Failed to read actor for failed-resume cleanup", slog.Any("actor", actorRef), slog.Any("err", err))
+		return
+	}
+	if latestActor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+		return
+	}
+	_ = w.ensureAteletTerminated(cleanupCtx, actorRef, latestActor, actorTemplate, ateattr.OperationResume)
+	_ = w.ensureVolumesDetached(cleanupCtx, latestActor, actorTemplate, "DetachVolumesOnResumeError", ateattr.OperationResume)
+	if latestActor.GetStatus().GetWorkerAssignment() != nil {
+		if _, err := releaseWorker(cleanupCtx, w.store, latestActor); err != nil {
+			slog.WarnContext(cleanupCtx, "Failed to release worker after failed resume", slog.Any("actor", actorRef), slog.Any("err", err))
+			return
+		}
+	}
+	_, err = w.store.UpdateActor(cleanupCtx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
+		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+		toUpdate.Status.WorkerAssignment = nil
+		return nil
+	})
+	if err != nil {
+		slog.WarnContext(cleanupCtx, "Failed to revert actor to SUSPENDED after failed resume", slog.Any("actor", actorRef), slog.Any("err", err))
+	}
+}
+
 // finalizeRunning re-reads the actor for a fresh version and commits RUNNING.
-func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, err error) {
+func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.ActorRef, inMemoryActor ...*ateapipb.Actor) (_ *ateapipb.Actor, err error) {
 	ctx, done := stepSpan(ctx, "FinalizeRunning")
 	defer func() { err = done(err) }()
 
-	latestActor, err := w.store.GetActor(ctx, actorRef)
-	if err != nil {
-		return nil, err
+	var latestActor *ateapipb.Actor
+	if len(inMemoryActor) > 0 && inMemoryActor[0] != nil {
+		latestActor = inMemoryActor[0]
+	} else {
+		latestActor, err = w.store.GetActor(ctx, actorRef)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {

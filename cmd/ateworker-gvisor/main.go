@@ -79,7 +79,7 @@ var (
 	tunnelConfig = atunnel.RegisterFlags(pflag.CommandLine)
 
 	readinessListenAddress = pflag.String("readiness-listen-address", "0.0.0.0:8080", "Address for the HTTP /readyz and /healthz probes")
-	maxActors              = pflag.Int("max-actors", 1000, "How many actors this worker will host at once")
+	maxActors              = pflag.Int("max-actors", 5000, "How many actors this worker will host at once")
 	usageSampleInterval    = pflag.Duration("usage-sample-interval", time.Minute, "How often the ateworker samples the resource usage of its actors. Each sample writes an ate.actor.usage_sampled record per actor, and GetActiveWorkloadStats serves the latest.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
@@ -101,6 +101,7 @@ const minUsageSampleInterval = 50 * time.Second
 const workloadGracePeriod = 30 * time.Minute
 
 func main() {
+	_ = syscall.Setrlimit(8, &syscall.Rlimit{Cur: ^uint64(0), Max: ^uint64(0)})
 	pid1.RunIfPID1()
 	pflag.Parse()
 	if *showVersion {
@@ -817,7 +818,11 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	terminate := func() error {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		err := s.terminateWorkload(cleanupCtx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), containers)
+		var termContainers []*ateworkerpb.Container
+		if fidelity != ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+			termContainers = containers
+		}
+		err := s.terminateWorkload(cleanupCtx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), termContainers)
 		if err != nil {
 			slog.WarnContext(cleanupCtx, "failed to terminate workload after checkpoint",
 				slog.String("actor", attribution.Ref.String()),

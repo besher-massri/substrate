@@ -77,6 +77,24 @@ func unmarshalWorkerEvent(payload []byte) (store.WorkerEvent, error) {
 // update only knows what it wrote once its mutation has run inside the
 // transaction.
 func (p *Persistence) writeAndAppendEvent(ctx context.Context, eventType store.WorkerEventType, fn func(ctx context.Context, tx pgx.Tx) (*ateapipb.Worker, error)) (*ateapipb.Worker, error) {
+	const maxDeadlockRetries = 6
+	for attempt := 0; ; attempt++ {
+		worker, err := p.writeAndAppendEventOnce(ctx, eventType, fn)
+		if err != nil && attempt < maxDeadlockRetries && (pgErrCode(err) == "40P01" || pgErrCode(err) == "40001") {
+			backoff := time.Duration(5*(1<<attempt)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, err
+			case <-time.After(backoff):
+				continue
+			}
+		}
+		return worker, err
+	}
+}
+
+// writeAndAppendEventOnce executes a single transactional attempt of writeAndAppendEvent.
+func (p *Persistence) writeAndAppendEventOnce(ctx context.Context, eventType store.WorkerEventType, fn func(ctx context.Context, tx pgx.Tx) (*ateapipb.Worker, error)) (*ateapipb.Worker, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("beginning transaction: %w", err)
