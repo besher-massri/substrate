@@ -279,9 +279,6 @@ prepopulate_cold_actors() {
   echo "Ensuring benchmark atespace and reference cold actor sb-cold-0..."
   run_kubectl_ate create atespace benchmark >/dev/null 2>&1 \
     || run_kubectl_ate get atespace benchmark >/dev/null
-  kubectl exec -n ate-system postgres-0 -c postgres -- \
-    psql -U postgres -d atepg -c "SET ROLE substrate_owner; DELETE FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0';" >/dev/null 2>&1 || true
-  run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
 
   local existing_actors
   existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
@@ -291,6 +288,9 @@ prepopulate_cold_actors() {
     echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; skipping re-insert."
     return 0
   fi
+  kubectl exec -n ate-system postgres-0 -c postgres -- \
+    psql -U postgres -d atepg -c "SET ROLE substrate_owner; DELETE FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0';" >/dev/null 2>&1 || true
+  run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
   if ((existing_actors >= 99000000)); then
     echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; ensuring 100,000,001 rows and cleaning non-cold actors."
     kubectl exec -n ate-system postgres-0 -c postgres -- \
