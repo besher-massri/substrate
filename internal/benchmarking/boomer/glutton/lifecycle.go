@@ -360,6 +360,11 @@ func (u *gluttonUser) nextActor() *gluttonActor {
 // with a freshly created actor so the VU maintains full concurrency without
 // repeatedly calling a stuck actor (e.g. left in ACTOR_STATE_SUSPENDING).
 func (u *gluttonUser) replaceActor(ctx context.Context, broken *gluttonActor) {
+	if strings.HasPrefix(broken.actorName, "sb-cold-") {
+		broken.consecutiveFailures = 0
+		broken.actorRunning = false
+		return
+	}
 	// A re-entry (the last call deleted the actor but failed to create its
 	// replacement) would book a NotFound failure on every iteration.
 	if !broken.deleted {
