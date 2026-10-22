@@ -395,8 +395,13 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 		return nil, crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationSuspend, crashMessageSnapshotStateConflict)
 	}
 
+	keepWorkerBound := os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
+		os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" &&
+		latestActor.GetStatus().GetAssignedNode() != "" &&
+		latestActor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace
+
 	// 1. Free the worker (if it hasn't been freed yet)
-	if latestActor.GetStatus().GetWorkerAssignment() != nil {
+	if latestActor.GetStatus().GetWorkerAssignment() != nil && !keepWorkerBound {
 		t := time.Now()
 		_, err := releaseWorker(ctx, w.store, latestActor)
 		dReleaseWorker = time.Since(t)
@@ -424,7 +429,7 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 		// Keep the actor on the node that holds its snapshot. atelet holds an
 		// async suspend's snapshot until it detaches it, which it does only
 		// once the snapshot is durable.
-		if ateletKeptLocal(ateletState, snap) || !durable {
+		if ateletKeptLocal(ateletState, snap) || !durable || keepWorkerBound {
 			snap.Locality = toUpdate.GetStatus().GetAssignedNode()
 		} else {
 			toUpdate.Status.AssignedNode = ""

@@ -18,6 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -25,6 +28,96 @@ import (
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/proto"
 )
+
+type createActorReq struct {
+	atespace   string
+	name       string
+	uid        string
+	version    int64
+	protoBytes []byte
+	done       chan error
+}
+
+// batchInsertActors flushes a slice of createActorReq in a single multi-row
+// INSERT statement so high-concurrency actor registration amortizes PostgreSQL
+// round-trip and WAL commit overhead across up to 256 rows.
+func (p *Persistence) batchInsertActors(batch []*createActorReq) {
+	if len(batch) == 0 {
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO actors (atespace, name, uid, version, proto) VALUES ")
+	args := make([]any, 0, len(batch)*5)
+	for i, req := range batch {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		base := i * 5
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5)
+		args = append(args, req.atespace, req.name, req.uid, req.version, req.protoBytes)
+	}
+	sb.WriteString(" ON CONFLICT (atespace, name) DO NOTHING")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, err := p.pool.Exec(ctx, sb.String(), args...)
+	cancel()
+	for _, req := range batch {
+		req.done <- err
+	}
+}
+
+// runCreateActorBatcher collects CreateActor requests from createBatchCh and
+// flushes them in multi-row batches of up to 256 actors or every 2ms.
+func (p *Persistence) runCreateActorBatcher() {
+	const maxBatch = 256
+	const flushInterval = 2 * time.Millisecond
+	batch := make([]*createActorReq, 0, maxBatch)
+	timer := time.NewTimer(flushInterval)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timerActive := false
+
+	flush := func() {
+		if timerActive {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timerActive = false
+		}
+		if len(batch) == 0 {
+			return
+		}
+		p.batchInsertActors(batch)
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case req, ok := <-p.createBatchCh:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, req)
+			if len(batch) >= maxBatch {
+				flush()
+			} else if !timerActive {
+				timer.Reset(flushInterval)
+				timerActive = true
+			}
+		case <-timer.C:
+			timerActive = false
+			flush()
+		}
+	}
+}
 
 func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error) {
 	atespace := actor.GetMetadata().GetAtespace()
@@ -40,6 +133,43 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 	protoBytes, err := proto.Marshal(dbActor)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling actor: %w", err)
+	}
+
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
+		p.createBatchOnce.Do(func() {
+			p.createBatchCh = make(chan *createActorReq, 65536)
+			for i := 0; i < 16; i++ {
+				go p.runCreateActorBatcher()
+			}
+		})
+		req := &createActorReq{
+			atespace:   atespace,
+			name:       name,
+			uid:        dbActor.GetMetadata().GetUid(),
+			version:    dbActor.GetMetadata().GetVersion(),
+			protoBytes: protoBytes,
+			done:       make(chan error, 1),
+		}
+		select {
+		case p.createBatchCh <- req:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		select {
+		case err = <-req.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if err != nil {
+			if isUniqueViolation(err) {
+				return nil, store.ErrAlreadyExists
+			}
+			if isForeignKeyViolation(err) {
+				return nil, store.ErrFailedPrecondition
+			}
+			return nil, fmt.Errorf("inserting actor %s/%s: %w", atespace, name, err)
+		}
+		return dbActor, nil
 	}
 
 	_, err = p.pool.Exec(ctx, `

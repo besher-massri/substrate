@@ -77,8 +77,10 @@ type Persistence struct {
 	stopMaintenance       context.CancelFunc
 	maintenanceDone       chan struct{}
 	// watchMu guards watchers, the live WatchWorkers channels.
-	watchMu  sync.Mutex
-	watchers map[chan store.WorkerEvent]struct{}
+	watchMu         sync.Mutex
+	watchers        map[chan store.WorkerEvent]struct{}
+	createBatchOnce sync.Once
+	createBatchCh   chan *createActorReq
 }
 
 // addWatcher enrolls a WatchWorkers channel to receive locally published events.

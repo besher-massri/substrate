@@ -141,6 +141,14 @@ data:
             regex: ([^:]+)(?::\d+)?;(\d+)
             replacement: $1:$2
             target_label: __address__
+        metric_relabel_configs:
+          # Drop high-cardinality per-endpoint gRPC client histograms and per-node
+          # atelet restore/checkpoint bucket series (~1.4M series across 1,400 nodes).
+          # The runner and verdict read ate_actor_lifecycle_operation_duration_seconds
+          # and sum/count aggregates instead.
+          - source_labels: [__name__]
+            action: drop
+            regex: (rpc_client_call_duration_seconds_.*|ate_actor_restore_duration_seconds_bucket|ate_actor_checkpoint_duration_seconds_bucket)
 
       # Control-plane controllers in ate-system (such as ate-controller and
       # ate-podcert-controller) expose controller-runtime metrics on a named
@@ -291,7 +299,7 @@ data:
           # and per-actor container_oom_events_total.
           - source_labels: [__name__, id]
             action: drop
-            regex: container_((.*pressure.*)|network_(receive|transmit)_bytes_total|fs_(reads|writes)_bytes_total|memory_rss|memory_working_set_bytes|cpu_usage_seconds_total|cpu_cfs_.*|spec_memory_limit_bytes);.*/(sb-[^/]+|cri-containerd-[^/]+\.scope/.+|ate-actors/.+)
+            regex: container_((.*pressure.*)|network_(receive|transmit)_bytes_total|fs_(reads|writes)_bytes_total|memory_rss|memory_working_set_bytes|cpu_usage_seconds_total|cpu_cfs_.*|spec_memory_limit_bytes);.*/(sb-[^/]+|cri-containerd-[^/]+\.scope.*|ate-actors/.+)
           # Drop the series that have an empty container label only for cumulative
           # memory working set and CPU usage. cAdvisor gives a rollup for the whole
           # pod cgroup next to the series for each container; keeping both counts

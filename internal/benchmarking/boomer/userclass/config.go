@@ -28,6 +28,8 @@ import (
 type Config struct {
 	// APIStub is the shared gRPC client to ateapi (one connection, all goroutines).
 	APIStub ateapipb.ControlClient
+	// APIStubs is an optional pool of gRPC clients to ateapi for spreading load across multiple connections.
+	APIStubs []ateapipb.ControlClient
 	// HTTPClient is the shared HTTP client for atenet pings.
 	HTTPClient *http.Client
 	// RouterURL is the base URL of the atenet router (no trailing slash).

@@ -94,7 +94,7 @@ func initPing(cfg *userclass.Config) (taskFn func(), shutdown func(context.Conte
 	rt := &taskRuntime{cfg: cfg}
 	if cfg.ActorsPerUser >= 50 {
 		rt.bgColdCh = make(chan int, 1048576)
-		for wid := 0; wid < 1024; wid++ {
+		for wid := 0; wid < 4096; wid++ {
 			go rt.runBgColdCreator(wid)
 		}
 	}
@@ -108,6 +108,16 @@ type taskRuntime struct {
 	atespaceErr  error
 	bgColdCh     chan int
 	bgColdSeq    atomic.Uint64
+	userSeq      atomic.Uint64
+}
+
+// pickStub selects a ControlClient from cfg.APIStubs in round-robin order by seq,
+// falling back to cfg.APIStub when the pool is unset.
+func (r *taskRuntime) pickStub(seq uint64) ateapipb.ControlClient {
+	if len(r.cfg.APIStubs) > 0 {
+		return r.cfg.APIStubs[seq%uint64(len(r.cfg.APIStubs))]
+	}
+	return r.cfg.APIStub
 }
 
 // runBgColdCreator drains cold actor creation requests in the background when
@@ -115,11 +125,13 @@ type taskRuntime struct {
 // immediately after creating their first actor.
 func (r *taskRuntime) runBgColdCreator(workerID int) {
 	ctx := context.Background()
+	stub := r.pickStub(uint64(workerID))
 	for count := range r.bgColdCh {
 		for i := 0; i < count; i++ {
 			seq := r.bgColdSeq.Add(1)
 			a := &gluttonActor{
 				cfg:         r.cfg,
+				stub:        stub,
 				actorName:   fmt.Sprintf("sb-bg-%d-%d", workerID, seq),
 				firstResume: true,
 			}
@@ -248,6 +260,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	for i := 0; i < syncCreate; i++ {
 		a := &gluttonActor{
 			cfg:         r.cfg,
+			stub:        r.pickStub(r.userSeq.Add(1)),
 			actorName:   "sb-" + uuid.NewString(),
 			firstResume: true,
 		}
@@ -356,6 +369,7 @@ func (u *gluttonUser) replaceActor(ctx context.Context, broken *gluttonActor) {
 	}
 	replacement := &gluttonActor{
 		cfg:         broken.cfg,
+		stub:        broken.stub,
 		actorName:   "sb-" + uuid.NewString(),
 		firstResume: true,
 	}
@@ -377,6 +391,7 @@ func (u *gluttonUser) replaceActor(ctx context.Context, broken *gluttonActor) {
 // call in iterate() targets exactly one of these.
 type gluttonActor struct {
 	cfg          *userclass.Config
+	stub         ateapipb.ControlClient
 	actorName    string
 	firstResume  bool
 	actorRunning bool
@@ -395,6 +410,13 @@ type gluttonActor struct {
 	// consecutiveFailures counts replaceIfPersistent failures since the last
 	// success. See noteFailure.
 	consecutiveFailures int
+}
+
+func (u *gluttonActor) apiStub() ateapipb.ControlClient {
+	if u.stub != nil {
+		return u.stub
+	}
+	return u.cfg.APIStub
 }
 
 // noteFailure records a failed lifecycle RPC against the actor and reports
@@ -433,7 +455,7 @@ func (u *gluttonActor) ref() *ateapipb.ObjectRef {
 // other API call.
 func (u *gluttonActor) ensureAtespace(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateAtespace", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapipb.CreateAtespaceRequest{
+		_, err := u.apiStub().CreateAtespace(callCtx, &ateapipb.CreateAtespaceRequest{
 			Atespace: &ateapipb.Atespace{
 				Metadata: &ateapipb.ResourceMetadata{
 					Name: u.cfg.Atespace,
@@ -453,7 +475,7 @@ func (u *gluttonActor) ensureAtespace(ctx context.Context) error {
 func (u *gluttonActor) create(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateActor", func(callCtx context.Context, tr *metadata.MD) error {
 		return boomerutil.RetryOnConflict(callCtx, func() error {
-			_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
+			_, err := u.apiStub().CreateActor(callCtx, &ateapipb.CreateActorRequest{
 				Actor: &ateapipb.Actor{
 					Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
 					ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: templateName},
@@ -479,7 +501,7 @@ func (u *gluttonActor) resume(ctx context.Context) error {
 		// reported latency spans every attempt and the span carries the
 		// last attempt's server trailer, same as any other single-shot RPC.
 		return boomerutil.RetryOnConflict(callCtx, func() error {
-			_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
+			_, err := u.apiStub().ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
 				Actor: u.ref(),
 			}, grpc.Trailer(tr))
 			return err
@@ -522,7 +544,7 @@ func (u *gluttonActor) hibernate(ctx context.Context) error {
 func (u *gluttonActor) pause(ctx context.Context) error {
 	err := u.tracedCall(ctx, "SuspendActorAsync", func(callCtx context.Context, tr *metadata.MD) error {
 		return boomerutil.RetryOnConflict(callCtx, func() error {
-			_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
+			_, err := u.apiStub().SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
 				Actor:   u.ref(),
 				Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
 			}, grpc.Trailer(tr))
@@ -540,7 +562,7 @@ func (u *gluttonActor) pause(ctx context.Context) error {
 func (u *gluttonActor) suspend(ctx context.Context) error {
 	err := u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
 		return boomerutil.RetryOnConflict(callCtx, func() error {
-			_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
+			_, err := u.apiStub().SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
 				Actor:   u.ref(),
 				Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
 			}, grpc.Trailer(tr))
@@ -557,7 +579,7 @@ func (u *gluttonActor) suspend(ctx context.Context) error {
 
 func (u *gluttonActor) delete(ctx context.Context) {
 	_ = u.tracedCall(ctx, "DeleteActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapipb.DeleteActorRequest{
+		_, err := u.apiStub().DeleteActor(callCtx, &ateapipb.DeleteActorRequest{
 			Actor: u.ref(),
 		}, grpc.Trailer(tr))
 		return err

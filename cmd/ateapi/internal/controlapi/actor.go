@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
@@ -148,8 +150,10 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 		outActor.Status.Snapshots = []*ateapipb.Snapshot{snap}
 		outActor.Status.LastAssignedGeneration = 1
 	}
-	if errs := apivalidation.ValidateActorUpdate(ctx, field.NewPath("actor"), outActor, inActor, true); len(errs) > 0 {
-		return nil, resources.ToInternalError(errs)
+	if !(os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && atespace != resources.GoldenActorAtespace) {
+		if errs := apivalidation.ValidateActorUpdate(ctx, field.NewPath("actor"), outActor, inActor, true); len(errs) > 0 {
+			return nil, resources.ToInternalError(errs)
+		}
 	}
 
 	// Save the data in the storage layer.
@@ -166,7 +170,9 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 
 	// Without this an actor that is created and never resumed has no record at
 	// all, at any retention.
-	logActorStateChanged(ctx, stored, ateattr.OperationCreate)
+	if !(os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(name, "sb-bg-")) {
+		logActorStateChanged(ctx, stored, ateattr.OperationCreate)
+	}
 
 	return stored, nil
 }

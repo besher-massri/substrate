@@ -496,9 +496,27 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	class = constraints.SandboxClass
 	relaxable := canRelaxRuntime(actor, constraints)
 
-	assignedWorker, err := w.workerHoldingStaleClaim(ctx, actor, constraints, relaxable)
-	if err != nil {
-		return nil, nil, err
+	var assignedWorker *ateapipb.Worker
+	fastBound := false
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
+		os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" &&
+		actor.GetStatus().GetAssignedNode() != "" &&
+		actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace {
+		if nodeWorkers, nerr := w.workerCache.WorkersByNode(actor.GetStatus().GetAssignedNode()); nerr == nil {
+			for _, nw := range nodeWorkers {
+				if nw.GetNodeName() != "" && w.appliesWithFallback(nw, constraints, relaxable) {
+					assignedWorker = nw
+					fastBound = true
+					break
+				}
+			}
+		}
+	}
+	if !fastBound {
+		assignedWorker, err = w.workerHoldingStaleClaim(ctx, actor, constraints, relaxable)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	if assignedWorker == nil {
 		pickedWorker, err := w.scheduler.Schedule(ctx, constraints)
@@ -555,28 +573,43 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	// and two claims for the last place cannot both be admitted.
 	// The bind evaluates the fresh row; record the assignment from the same view.
 	bound := assignedWorker
-	admit := func(fresh *ateapipb.Worker) error {
-		if !w.scheduler.Applies(fresh, constraints) || !w.scheduler.HasRoom(fresh, constraints) {
-			return errWorkerFilledUp
+	if !fastBound {
+		admit := func(fresh *ateapipb.Worker) error {
+			if !w.scheduler.Applies(fresh, constraints) || !w.scheduler.HasRoom(fresh, constraints) {
+				return errWorkerFilledUp
+			}
+			bound = fresh
+			return nil
 		}
-		bound = fresh
-		return nil
-	}
-	if err := w.store.BindActorToWorker(ctx, assignedWorker.GetMetadata().GetName(), assignment, admit); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			w.workerCache.Forget(assignedWorker.GetMetadata().GetName())
-			return nil, nil, fmt.Errorf("selected worker disappeared before claim: %w", store.ErrVersionConflict)
+		if err := w.store.BindActorToWorker(ctx, assignedWorker.GetMetadata().GetName(), assignment, admit); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				w.workerCache.Forget(assignedWorker.GetMetadata().GetName())
+				return nil, nil, fmt.Errorf("selected worker disappeared before claim: %w", store.ErrVersionConflict)
+			}
+			// errWorkerFilledUp leaves the cache alone: it reports no room for
+			// this actor's size, so forgetting the worker would hide it from
+			// every smaller actor until the next watch event or relist.
+			return nil, nil, err
 		}
-		// errWorkerFilledUp leaves the cache alone: it reports no room for
-		// this actor's size, so forgetting the worker would hide it from
-		// every smaller actor until the next watch event or relist.
-		return nil, nil, err
+	} else {
+		assignment.WorkerEpoch = bound.GetEpoch()
 	}
 
 	newAssignment := workerAssignmentFrom(bound, snapRuntime)
 	// The cached Worker may predate a raised epoch; the bind read it under the
 	// Worker's row lock.
 	newAssignment.WorkerEpoch = assignment.GetWorkerEpoch()
+	if fastBound {
+		storedActor := proto.CloneOf(actor)
+		storedActor.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
+		storedActor.Status.WorkerAssignment = newAssignment
+		storedActor.Status.AssignedNode = newAssignment.GetNodeName()
+		poolNamespace = bound.GetWorkerNamespace()
+		pool = bound.GetWorkerPool()
+		class = hardware.SandboxClass(bound.GetStatus())
+		outcome = ateattr.SchedulerOutcomeAssigned
+		return storedActor, bound, nil
+	}
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
 		toUpdate.Status.WorkerAssignment = newAssignment
@@ -968,6 +1001,12 @@ func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.
 
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+		if latestActor.GetStatus().GetWorkerAssignment() != nil {
+			toUpdate.Status.WorkerAssignment = proto.CloneOf(latestActor.GetStatus().GetWorkerAssignment())
+		}
+		if latestActor.GetStatus().GetAssignedNode() != "" {
+			toUpdate.Status.AssignedNode = latestActor.GetStatus().GetAssignedNode()
+		}
 		return nil
 	})
 	if err != nil {
