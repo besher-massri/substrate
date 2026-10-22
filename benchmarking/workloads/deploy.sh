@@ -279,7 +279,8 @@ prepopulate_cold_actors() {
   echo "Ensuring benchmark atespace and reference cold actor sb-cold-0..."
   run_kubectl_ate create atespace benchmark >/dev/null 2>&1 \
     || run_kubectl_ate get atespace benchmark >/dev/null
-  run_kubectl_ate delete actor sb-cold-0 -a benchmark >/dev/null 2>&1 || true
+  kubectl exec -n ate-system postgres-0 -c postgres -- \
+    psql -U postgres -d atepg -c "SET ROLE substrate_owner; DELETE FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0';" >/dev/null 2>&1 || true
   run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
 
   local existing_actors
@@ -455,11 +456,12 @@ deploy() {
   # golden actor and snapshot server-side.
   for template in "${TEMPLATES[@]}"; do
     if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
-      local existing_tag
-      existing_tag="$(run_kubectl_ate get actor-template "${template}" -a benchmark-workloads -o json 2>/dev/null \
-        | jq -r '.status.goldenSnapshotStatus.goldenTag.name // empty' || true)"
-      if [[ -n "${existing_tag}" ]]; then
-        echo "Reusing existing actor-template ${template} with goldenTag ${existing_tag}..."
+      local existing_json existing_tag existing_cpu
+      existing_json="$(run_kubectl_ate get actor-template "${template}" -a benchmark-workloads -o json 2>/dev/null || true)"
+      existing_tag="$(jq -r '.status.goldenSnapshotStatus.goldenTag.name // empty' <<<"${existing_json}" 2>/dev/null || true)"
+      existing_cpu="$(jq -r '(.resources.limits.cpuMillicores // empty) | tostring' <<<"${existing_json}" 2>/dev/null || true)"
+      if [[ -n "${existing_tag}" && "${existing_cpu}" == "${ACTOR_CPU_MILLICORES}" ]]; then
+        echo "Reusing existing actor-template ${template} with goldenTag ${existing_tag} (cpuMillicores=${existing_cpu})..."
         continue
       fi
     fi
