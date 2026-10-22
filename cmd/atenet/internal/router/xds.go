@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -227,6 +228,16 @@ const actorConnectCircuitBreakerLimit = 1048576
 
 // tunnelIdleTimeout closes unused tunnels, which hold actor connections.
 const tunnelIdleTimeout = 60 * time.Second
+
+// effectiveTunnelIdleTimeout returns the idle timeout for per-actor CONNECT
+// tunnels, using a 5s window when ATE_SOFT_NODE_AFFINITY=true so high-churn
+// 1M-VU runs release idle per-actor tunnel memory promptly after actors suspend.
+func effectiveTunnelIdleTimeout() time.Duration {
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+		return 5 * time.Second
+	}
+	return tunnelIdleTimeout
+}
 
 // XdsServer implements an aggregated discovery service server for dynamic Envoy router nodes.
 type XdsServer struct {
@@ -963,7 +974,7 @@ func buildActorTunnelCluster(name string, http2 bool) *clusterv3.Cluster {
 		TypedExtensionProtocolOptions: map[string]*anypb.Any{
 			httpProtocolOptionsName: newAny(&httpv3.HttpProtocolOptions{
 				CommonHttpProtocolOptions: &corev3.HttpProtocolOptions{
-					IdleTimeout: durationpb.New(tunnelIdleTimeout),
+					IdleTimeout: durationpb.New(effectiveTunnelIdleTimeout()),
 				},
 				UpstreamProtocolOptions: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_{
 					ExplicitHttpConfig: explicit,
@@ -977,6 +988,20 @@ func buildActorTunnelCluster(name string, http2 bool) *clusterv3.Cluster {
 // actor_connect puts in filter state. HTTP/2 lets a worker's tunnels share a
 // connection.
 func (x *XdsServer) buildActorConnectCluster() *clusterv3.Cluster {
+	httpOpts := &httpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{
+					Http2ProtocolOptions: &corev3.Http2ProtocolOptions{},
+				},
+			},
+		},
+	}
+	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
+		httpOpts.CommonHttpProtocolOptions = &corev3.HttpProtocolOptions{
+			IdleTimeout: durationpb.New(5 * time.Minute),
+		}
+	}
 	return &clusterv3.Cluster{
 		Name:           ActorConnectName,
 		ConnectTimeout: durationpb.New(5 * time.Second),
@@ -999,15 +1024,7 @@ func (x *XdsServer) buildActorConnectCluster() *clusterv3.Cluster {
 			}},
 		},
 		TypedExtensionProtocolOptions: map[string]*anypb.Any{
-			httpProtocolOptionsName: newAny(&httpv3.HttpProtocolOptions{
-				UpstreamProtocolOptions: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_{
-					ExplicitHttpConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig{
-						ProtocolConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{
-							Http2ProtocolOptions: &corev3.Http2ProtocolOptions{},
-						},
-					},
-				},
-			}),
+			httpProtocolOptionsName: newAny(httpOpts),
 		},
 	}
 }

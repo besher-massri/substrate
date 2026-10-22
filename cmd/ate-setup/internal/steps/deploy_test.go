@@ -333,4 +333,22 @@ func TestApplyWorkloadRuntimeAndScaleOverrides(t *testing.T) {
 	if ateletPluginEnv["ATE_STORAGE_BACKEND"] != "gcs" {
 		t.Errorf("atelet objectstore-plugin ATE_STORAGE_BACKEND = %q, want gcs", ateletPluginEnv["ATE_STORAGE_BACKEND"])
 	}
+
+	objs100m, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		t.Fatalf("decode system overlay for highScale100m: %v", err)
+	}
+	applyWorkloadRuntimeAndScaleOverrides(objs100m, true, false, append(environ, "ATE_SOFT_NODE_AFFINITY=true"))
+	router100m := findObject(objs100m, "Deployment", "atenet-router")
+	routerContainers, _, _ := unstructured.NestedSlice(router100m.Object, "spec", "template", "spec", "containers")
+	var envoyCmd []string
+	for _, raw := range routerContainers {
+		c, ok := raw.(map[string]any)
+		if ok && c["name"] == "envoy" {
+			envoyCmd, _, _ = unstructured.NestedStringSlice(c, "command")
+		}
+	}
+	if !slices.Contains(envoyCmd, "--concurrency") || !slices.Contains(envoyCmd, "4") {
+		t.Errorf("highScale100m envoy command = %v, want --concurrency 4", envoyCmd)
+	}
 }

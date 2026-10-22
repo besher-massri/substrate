@@ -121,6 +121,7 @@ func RouterTLSConfig() (*tls.Config, error) {
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{"http/1.1"},
+		ClientSessionCache: tls.NewLRUClientSessionCache(1024),
 		InsecureSkipVerify: true, //nolint:gosec
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			pool, err := loadRootCAs()

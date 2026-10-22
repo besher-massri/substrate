@@ -93,6 +93,7 @@ func initPing(cfg *userclass.Config) (taskFn func(), shutdown func(context.Conte
 	}
 	rt := &taskRuntime{cfg: cfg}
 	if cfg.ActorsPerUser >= 50 {
+		rt.httpSem = make(chan struct{}, 4096)
 		rt.bgColdCh = make(chan int, 1048576)
 		for wid := 0; wid < 4096; wid++ {
 			go rt.runBgColdCreator(wid)
@@ -106,6 +107,7 @@ type taskRuntime struct {
 	users        sync.Map // goroutineID → *gluttonUser
 	atespaceOnce sync.Once
 	atespaceErr  error
+	httpSem      chan struct{}
 	bgColdCh     chan int
 	bgColdSeq    atomic.Uint64
 	userSeq      atomic.Uint64
@@ -263,6 +265,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 		a := &gluttonActor{
 			cfg:         r.cfg,
 			stub:        r.pickStub(r.userSeq.Add(1)),
+			httpSem:     r.httpSem,
 			actorName:   "sb-" + uuid.NewString(),
 			firstResume: true,
 		}
@@ -372,6 +375,7 @@ func (u *gluttonUser) replaceActor(ctx context.Context, broken *gluttonActor) {
 	replacement := &gluttonActor{
 		cfg:         broken.cfg,
 		stub:        broken.stub,
+		httpSem:     broken.httpSem,
 		actorName:   "sb-" + uuid.NewString(),
 		firstResume: true,
 	}
@@ -394,6 +398,7 @@ func (u *gluttonUser) replaceActor(ctx context.Context, broken *gluttonActor) {
 type gluttonActor struct {
 	cfg          *userclass.Config
 	stub         ateapipb.ControlClient
+	httpSem      chan struct{}
 	actorName    string
 	firstResume  bool
 	actorRunning bool
@@ -412,6 +417,7 @@ type gluttonActor struct {
 	// consecutiveFailures counts replaceIfPersistent failures since the last
 	// success. See noteFailure.
 	consecutiveFailures int
+	httpSeq             atomic.Uint64
 }
 
 func (u *gluttonActor) apiStub() ateapipb.ControlClient {
@@ -419,6 +425,48 @@ func (u *gluttonActor) apiStub() ateapipb.ControlClient {
 		return u.stub
 	}
 	return u.cfg.APIStub
+}
+
+// doHTTPPost executes a POST request with body to u.cfg.RouterURL+path through
+// a sharded HTTP client, holding an httpSem permit for the entire request and
+// response-body read so transport wait queues never consume wire timeouts or
+// tear down connections mid-flight.
+func (u *gluttonActor) doHTTPPost(ctx context.Context, path string, body []byte) (*http.Response, []byte, error) {
+	reqCtx := ctx
+	if u.httpSem != nil {
+		u.httpSem <- struct{}{}
+		defer func() { <-u.httpSem }()
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+	}
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u.cfg.RouterURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
+	resp, err := u.httpClient().Do(httpReq)
+	if err != nil {
+		return nil, nil, err
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp, respBody, nil
+}
+
+// httpClient selects an HTTP client from u.cfg.HTTPClients in round-robin order
+// so retries and concurrent VUs spread across independent transport shards.
+func (u *gluttonActor) httpClient() *http.Client {
+	if u.cfg != nil && len(u.cfg.HTTPClients) > 0 {
+		idx := u.httpSeq.Add(1) % uint64(len(u.cfg.HTTPClients))
+		return u.cfg.HTTPClients[idx]
+	}
+	return u.cfg.HTTPClient
 }
 
 // noteFailure records a failed lifecycle RPC against the actor and reports
@@ -662,20 +710,7 @@ func (u *gluttonActor) ping(ctx context.Context) {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
 		}
-		httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+pingPath, bytes.NewReader(body))
-		if reqErr != nil {
-			err = reqErr
-			break
-		}
-		httpReq.Header.Set("Content-Type", "application/x-protobuf")
-		httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
-		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
-		resp, err = u.cfg.HTTPClient.Do(httpReq)
-		if err != nil {
-			continue
-		}
-		respBody, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
+		resp, respBody, err = u.doHTTPPost(ctx, pingPath, body)
 		if err != nil {
 			continue
 		}
@@ -889,19 +924,7 @@ func (u *gluttonActor) postProto(ctx context.Context, path string, req, resp pro
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
 		}
-		httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+path, bytes.NewReader(body))
-		if reqErr != nil {
-			return reqErr
-		}
-		httpReq.Header.Set("Content-Type", "application/x-protobuf")
-		httpReq.Header.Set(atenet.TargetActorHeader, u.cfg.Atespace+"/"+u.actorName)
-		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
-		httpResp, err = u.cfg.HTTPClient.Do(httpReq)
-		if err != nil {
-			continue
-		}
-		respBody, err = io.ReadAll(httpResp.Body)
-		httpResp.Body.Close()
+		httpResp, respBody, err = u.doHTTPPost(ctx, path, body)
 		if err != nil {
 			continue
 		}

@@ -829,12 +829,15 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 			}
 			mutatePodContainers(obj, func(cname string, c map[string]any) {
 				if highScale100m {
-					setContainerResources(c, "2", "4Gi", "8", "8Gi")
+					setContainerResources(c, "2", "4Gi", "8", "16Gi")
 				} else if size100 {
 					setContainerResources(c, "4", "4Gi", "8", "8Gi")
 				}
 				if cname == "atenet-router" {
 					mergeContainerEnv(c, routerEnv)
+				}
+				if cname == "envoy" && highScale100m {
+					setContainerCommandConcurrency(c, "4")
 				}
 			})
 
@@ -929,6 +932,25 @@ func setContainerArgPrefix(c map[string]any, prefix, fullArg string) {
 		args = append(args, fullArg)
 	}
 	_ = unstructured.SetNestedStringSlice(c, args, "args")
+}
+
+// setContainerCommandConcurrency sets or appends --concurrency <workers> on a
+// container's command slice so Envoy worker thread fanout stays bounded on high
+// vCPU nodes.
+func setContainerCommandConcurrency(c map[string]any, workers string) {
+	cmd, _, err := unstructured.NestedStringSlice(c, "command")
+	if err != nil || len(cmd) == 0 {
+		return
+	}
+	for i := 0; i < len(cmd); i++ {
+		if cmd[i] == "--concurrency" && i+1 < len(cmd) {
+			cmd[i+1] = workers
+			_ = unstructured.SetNestedStringSlice(c, cmd, "command")
+			return
+		}
+	}
+	cmd = append(cmd, "--concurrency", workers)
+	_ = unstructured.SetNestedStringSlice(c, cmd, "command")
 }
 
 // mergeContainerEnv merges additions into c's env list in sorted key order,

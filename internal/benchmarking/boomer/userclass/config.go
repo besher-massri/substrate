@@ -32,6 +32,9 @@ type Config struct {
 	APIStubs []ateapipb.ControlClient
 	// HTTPClient is the shared HTTP client for atenet pings.
 	HTTPClient *http.Client
+	// HTTPClients is an optional pool of HTTP clients with independent transports
+	// so high-concurrency VUs do not contend on a single transport lock or queue.
+	HTTPClients []*http.Client
 	// RouterURL is the base URL of the atenet router (no trailing slash).
 	RouterURL string
 	// Atespace every actor this worker creates lives in. Required; caller

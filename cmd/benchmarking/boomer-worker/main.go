@@ -156,22 +156,33 @@ func main() {
 	// ("connect: cannot assign requested address"). The idle timeout must
 	// outlast a VU's gap between requests, which is the wake window plus the
 	// suspend/resume round trip.
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConns = 0 // no total cap; the per-host cap governs
-	transport.MaxIdleConnsPerHost = max(*httpMaxIdleConnsPerHost, 16384)
-	transport.MaxConnsPerHost = 16384
-	transport.IdleConnTimeout = 5 * time.Minute
+	var routerTLS *tls.Config
 	if strings.HasPrefix(*routerURL, "https://") {
-		routerTLS, err := boomerutil.RouterTLSConfig()
+		var err error
+		routerTLS, err = boomerutil.RouterTLSConfig()
 		if err != nil {
 			slog.Error("failed to configure router TLS", slog.String("err", err.Error()))
 			os.Exit(1)
 		}
-		transport.TLSClientConfig = routerTLS
-		transport.ForceAttemptHTTP2 = false
-		transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	}
-	httpClient := &http.Client{Timeout: 15 * time.Second, Transport: transport}
+	const httpPoolSize = 32
+	perShardIdle := max(*httpMaxIdleConnsPerHost/httpPoolSize, 256)
+	httpClients := make([]*http.Client, 0, httpPoolSize)
+	for i := 0; i < httpPoolSize; i++ {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxIdleConns = 0 // no total cap; the per-host cap governs
+		transport.MaxIdleConnsPerHost = perShardIdle
+		transport.MaxConnsPerHost = 256
+		transport.IdleConnTimeout = 5 * time.Minute
+		transport.ResponseHeaderTimeout = 10 * time.Second
+		if routerTLS != nil {
+			transport.TLSClientConfig = routerTLS.Clone()
+			transport.ForceAttemptHTTP2 = false
+			transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+		}
+		httpClients = append(httpClients, &http.Client{Timeout: 15 * time.Second, Transport: transport})
+	}
+	httpClient := httpClients[0]
 
 	if *masterWebPort > 0 {
 		masterHost := flag.Lookup("master-host").Value.String()
@@ -214,6 +225,7 @@ func main() {
 		APIStub:          apiStub,
 		APIStubs:         apiStubs,
 		HTTPClient:       httpClient,
+		HTTPClients:      httpClients,
 		RouterURL:        *routerURL,
 		Atespace:         *atespace,
 		Dyn:              dyn,
