@@ -757,7 +757,7 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	}
 	defer s.locks.Unlock(req.GetActorUid())
 
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
+	if strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
 		if hosted := s.lookupActor(req.GetActorUid()); hosted != nil && hosted.session != nil {
 			attribution := workerstats.ActorAttributionFromRequest(req)
 			s.actorsMu.Lock()
@@ -1043,7 +1043,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	defer s.locks.Unlock(req.GetActorUid())
 
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
+	if strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
 		if hosted := s.lookupActor(req.GetActorUid()); hosted != nil && hosted.session != nil {
 			attribution := workerstats.ActorAttributionFromRequest(req)
 			s.actorsMu.Lock()

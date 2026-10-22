@@ -226,7 +226,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	if n < 1 {
 		n = 1
 	}
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
+	if r.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
 		vuIdx := int(r.userSeq.Add(1)-1) % 1000000
 		stub := r.pickStub(uint64(vuIdx))
 		u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}

@@ -1001,7 +1001,7 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	}
 	defer unlockActor()
 
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
+	if strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
 		if _, ok := s.pooledVUs.Load(actorUID); ok {
 			sandboxRec, err := readSandboxRecord(actorUID)
 			if err == nil {
@@ -1642,7 +1642,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	}
 	defer unlockActor()
 
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
+	if strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
 		if _, ok := s.pooledVUs.Load(actorUID); ok {
 			op.kind = ateattr.SnapshotKindLocal
 			tAssets := time.Now()
@@ -1898,7 +1898,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 			slog.WarnContext(ctx, "failed to prune superseded local checkpoints after remote restore", slog.Any("actor", actorRef), slog.Any("err", err))
 		}
 	}
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
+	if strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
 		s.pooledVUs.Store(actorUID, true)
 	}
 

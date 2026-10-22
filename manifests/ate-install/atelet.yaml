@@ -111,6 +111,10 @@ metadata:
   labels:
     app: atelet
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
   selector:
     matchLabels:
       app: atelet

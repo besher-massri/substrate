@@ -286,6 +286,10 @@ prepopulate_cold_actors() {
   existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -Atc "SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%'" 2>/dev/null || echo 0)"
   echo "Current cold registered actors in benchmark atespace: ${existing_actors}"
+  if ((existing_actors >= 100000000)); then
+    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; skipping re-insert."
+    return 0
+  fi
   if ((existing_actors >= 99000000)); then
     echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; ensuring 100,000,001 rows and cleaning non-cold actors."
     kubectl exec -n ate-system postgres-0 -c postgres -- \
@@ -432,6 +436,10 @@ deploy() {
   else
     kubectl wait --for=create deployment/benchmark-worker \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
+    if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
+      kubectl patch deploy -n benchmark-workloads benchmark-worker \
+        -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":"100%","maxSurge":0}}}}' || true
+    fi
     kubectl rollout status deployment/benchmark-worker \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
   fi
