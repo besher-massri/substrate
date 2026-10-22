@@ -94,10 +94,6 @@ func initPing(cfg *userclass.Config) (taskFn func(), shutdown func(context.Conte
 	rt := &taskRuntime{cfg: cfg}
 	if cfg.ActorsPerUser >= 50 {
 		rt.httpSem = make(chan struct{}, 4096)
-		rt.bgColdCh = make(chan int, 1048576)
-		for wid := 0; wid < 4096; wid++ {
-			go rt.runBgColdCreator(wid)
-		}
 	}
 	return rt.iterate, rt.shutdown
 }
@@ -108,8 +104,6 @@ type taskRuntime struct {
 	atespaceOnce sync.Once
 	atespaceErr  error
 	httpSem      chan struct{}
-	bgColdCh     chan int
-	bgColdSeq    atomic.Uint64
 	userSeq      atomic.Uint64
 }
 
@@ -120,28 +114,6 @@ func (r *taskRuntime) pickStub(seq uint64) ateapipb.ControlClient {
 		return r.cfg.APIStubs[seq%uint64(len(r.cfg.APIStubs))]
 	}
 	return r.cfg.APIStub
-}
-
-// runBgColdCreator drains cold actor creation requests in the background when
-// ActorsPerUser >= 50 so VUs can enter their active ResumeActor rotation
-// immediately after creating their first actor.
-func (r *taskRuntime) runBgColdCreator(workerID int) {
-	ctx := context.Background()
-	stub := r.pickStub(uint64(workerID))
-	for count := range r.bgColdCh {
-		for i := 0; i < count; i++ {
-			seq := r.bgColdSeq.Add(1)
-			a := &gluttonActor{
-				cfg:         r.cfg,
-				stub:        stub,
-				actorName:   fmt.Sprintf("sb-bg-%d-%d", workerID, seq),
-				firstResume: true,
-			}
-			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			_ = a.create(reqCtx)
-			cancel()
-		}
-	}
 }
 
 // iterate is the task function boomer calls in a loop on each VU goroutine.
@@ -255,7 +227,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 		n = 1
 	}
 	syncCreate := n
-	if n >= 50 && r.bgColdCh != nil {
+	if n >= 50 {
 		syncCreate = 1
 	}
 	u := &gluttonUser{actors: make([]*gluttonActor, 0, syncCreate)}
@@ -294,12 +266,6 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	if len(u.actors) == 0 {
 		bmetrics.UpdateUsers(userClass, -1)
 		return nil, fmt.Errorf("no actors created: %w", lastCreateErr)
-	}
-	if n > syncCreate && r.bgColdCh != nil {
-		select {
-		case r.bgColdCh <- (n - syncCreate):
-		default:
-		}
 	}
 	return u, nil
 }

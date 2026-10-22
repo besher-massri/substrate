@@ -267,6 +267,91 @@ wait_templates_ready() {
   done
 }
 
+# prepopulate_cold_actors seeds 99,000,000 cold registered actors in PostgreSQL
+# substrate.actors before the benchmark runner Job starts when
+# ENVELOPE_PHASE1_DB_WORKAROUNDS=true, ensuring 100,000,000 total registered
+# actors exist in PostgreSQL during active rotation without background
+# CreateActor load competing with ResumeActor and SuspendActor.
+prepopulate_cold_actors() {
+  if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" != "true" ]]; then
+    return 0
+  fi
+  echo "Ensuring benchmark atespace and reference cold actor sb-cold-0..."
+  run_kubectl_ate create atespace benchmark >/dev/null 2>&1 \
+    || run_kubectl_ate get atespace benchmark >/dev/null
+  run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
+
+  local existing_actors
+  existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
+    psql -U postgres -d atepg -Atc "SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%'" 2>/dev/null || echo 0)"
+  echo "Current cold registered actors in benchmark atespace: ${existing_actors}"
+  if ((existing_actors >= 99000000)); then
+    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; cleaning previous active actors only."
+    kubectl exec -n ate-system postgres-0 -c postgres -- \
+      psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
+        SET ROLE substrate_owner;
+        SET search_path TO substrate;
+        SET synchronous_commit = off;
+        DELETE FROM actors WHERE atespace = 'benchmark' AND name NOT LIKE 'sb-cold-%';
+      "
+    return 0
+  fi
+
+  echo "Pre-populating 99,000,000 cold registered actors in substrate.actors..."
+  kubectl exec -n ate-system postgres-0 -c postgres -- \
+    psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
+      SET ROLE substrate_owner;
+      SET search_path TO substrate;
+      ALTER TABLE actor_egress_policies DROP CONSTRAINT IF EXISTS actor_egress_policies_atespace_actor_name_fkey;
+      ALTER TABLE actors DROP CONSTRAINT IF EXISTS actors_atespace_fkey;
+      ALTER TABLE actors DROP CONSTRAINT IF EXISTS actors_pkey;
+      ALTER TABLE actor_egress_policies SET UNLOGGED;
+      ALTER TABLE actors SET UNLOGGED;
+      DELETE FROM actors WHERE atespace = 'benchmark' AND name <> 'sb-cold-0';
+    "
+
+  local chunk=6187500
+  local pids=()
+  local w start_i end_i pid
+  for w in $(seq 0 15); do
+    start_i=$((w * chunk + 1))
+    end_i=$(((w + 1) * chunk))
+    kubectl exec -n ate-system postgres-0 -c postgres -- \
+      psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
+        SET ROLE substrate_owner;
+        SET search_path TO substrate;
+        SET synchronous_commit = off;
+        INSERT INTO actors (atespace, name, uid, version, proto)
+        SELECT 'benchmark', 'sb-cold-' || i, p.uid, p.version, p.proto
+        FROM (SELECT uid, version, proto FROM actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0' LIMIT 1) p,
+             generate_series(${start_i}, ${end_i}) AS i;
+      " &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "${pid}"
+  done
+
+  echo "Rebuilding primary key index and foreign keys on substrate.actors (99,000,001 rows)..."
+  kubectl exec -n ate-system postgres-0 -c postgres -- \
+    psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
+      SET ROLE substrate_owner;
+      SET search_path TO substrate;
+      SET maintenance_work_mem = '16GB';
+      SET max_parallel_maintenance_workers = 32;
+      ALTER TABLE actors ADD PRIMARY KEY (atespace, name);
+      ALTER TABLE actors ADD CONSTRAINT actors_atespace_fkey
+        FOREIGN KEY (atespace) REFERENCES atespaces(name) ON DELETE RESTRICT NOT VALID;
+      ALTER TABLE actor_egress_policies ADD CONSTRAINT actor_egress_policies_atespace_actor_name_fkey
+        FOREIGN KEY (atespace, actor_name) REFERENCES actors(atespace, name) ON DELETE CASCADE NOT VALID;
+      ANALYZE actors;
+    "
+
+  existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
+    psql -U postgres -d atepg -Atc "SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark'")"
+  echo "Verified pre-populated cold registered actors in substrate.actors: ${existing_actors}"
+}
+
 # fake_data_plane reports whether substrate was installed with
 # --fake-data-plane, which serves the WorkerPool with fake Workers instead of
 # worker pods.
@@ -375,6 +460,7 @@ deploy() {
   done
 
   wait_templates_ready
+  prepopulate_cold_actors
 }
 
 delete() {

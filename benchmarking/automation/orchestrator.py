@@ -689,7 +689,8 @@ def main() -> None:
             # SandboxConfig CRD that teardown_substrate removes.
             teardown_workloads()
             teardown_microvm_deps()
-            teardown_substrate()
+            if os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true":
+                teardown_substrate()
 
             sandbox_class = test.get("sandboxClass", "gvisor")
             status = "error"
@@ -731,10 +732,13 @@ def main() -> None:
                 # Always tear down, even if deploy or run failed, so the
                 # next test (and the next CronJob fire) starts clean.
                 # microvm-deps must go before substrate for the same reason
-                # as above.
-                teardown_workloads()
-                teardown_microvm_deps()
-                teardown_substrate()
+                # as above. When ENVELOPE_PHASE1_DB_WORKAROUNDS=true, preserve
+                # ate-system and postgres-0 so the 100M registered actors table
+                # and Prometheus target state remain intact after the run.
+                if os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true":
+                    teardown_workloads()
+                    teardown_microvm_deps()
+                    teardown_substrate()
             duration = time.time() - start_time
             results.append((test["name"], status, duration, failure_msg))
         finally:
