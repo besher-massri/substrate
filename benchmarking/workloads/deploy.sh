@@ -267,7 +267,7 @@ wait_templates_ready() {
   done
 }
 
-# prepopulate_cold_actors seeds 99,000,000 cold registered actors in PostgreSQL
+# prepopulate_cold_actors seeds 100,000,000 cold registered actors in PostgreSQL
 # substrate.actors before the benchmark runner Job starts when
 # ENVELOPE_PHASE1_DB_WORKAROUNDS=true, ensuring 100,000,000 total registered
 # actors exist in PostgreSQL during active rotation without background
@@ -279,6 +279,7 @@ prepopulate_cold_actors() {
   echo "Ensuring benchmark atespace and reference cold actor sb-cold-0..."
   run_kubectl_ate create atespace benchmark >/dev/null 2>&1 \
     || run_kubectl_ate get atespace benchmark >/dev/null
+  run_kubectl_ate delete actor sb-cold-0 -a benchmark >/dev/null 2>&1 || true
   run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
 
   local existing_actors
@@ -286,18 +287,23 @@ prepopulate_cold_actors() {
     psql -U postgres -d atepg -Atc "SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%'" 2>/dev/null || echo 0)"
   echo "Current cold registered actors in benchmark atespace: ${existing_actors}"
   if ((existing_actors >= 99000000)); then
-    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; cleaning previous active actors only."
+    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; ensuring 100,000,001 rows and cleaning non-cold actors."
     kubectl exec -n ate-system postgres-0 -c postgres -- \
       psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
         SET ROLE substrate_owner;
         SET search_path TO substrate;
         SET synchronous_commit = off;
         DELETE FROM actors WHERE atespace = 'benchmark' AND name NOT LIKE 'sb-cold-%';
+        INSERT INTO actors (atespace, name, uid, version, proto)
+        SELECT 'benchmark', 'sb-cold-' || i, p.uid, p.version, p.proto
+        FROM (SELECT uid, version, proto FROM actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0' LIMIT 1) p,
+             generate_series(99000001, 100000000) AS i
+        ON CONFLICT (atespace, name) DO NOTHING;
       "
     return 0
   fi
 
-  echo "Pre-populating 99,000,000 cold registered actors in substrate.actors..."
+  echo "Pre-populating 100,000,000 cold registered actors in substrate.actors..."
   kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
       SET ROLE substrate_owner;
@@ -310,7 +316,7 @@ prepopulate_cold_actors() {
       DELETE FROM actors WHERE atespace = 'benchmark' AND name <> 'sb-cold-0';
     "
 
-  local chunk=6187500
+  local chunk=6250000
   local pids=()
   local w start_i end_i pid
   for w in $(seq 0 15); do
@@ -332,7 +338,7 @@ prepopulate_cold_actors() {
     wait "${pid}"
   done
 
-  echo "Rebuilding primary key index and foreign keys on substrate.actors (99,000,001 rows)..."
+  echo "Rebuilding primary key index and foreign keys on substrate.actors (100,000,001 rows)..."
   kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
       SET ROLE substrate_owner;
@@ -440,6 +446,15 @@ deploy() {
   # automation deletes the actors between the tests; it also removes the old
   # golden actor and snapshot server-side.
   for template in "${TEMPLATES[@]}"; do
+    if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
+      local existing_tag
+      existing_tag="$(run_kubectl_ate get actor-template "${template}" -a benchmark-workloads -o json 2>/dev/null \
+        | jq -r '.status.goldenSnapshotStatus.goldenTag.name // empty' || true)"
+      if [[ -n "${existing_tag}" ]]; then
+        echo "Reusing existing actor-template ${template} with goldenTag ${existing_tag}..."
+        continue
+      fi
+    fi
     for _tmpl_try in 1 2 3; do
       run_kubectl_ate delete actor-template "${template}" -a benchmark-workloads \
         >/dev/null 2>&1 || true

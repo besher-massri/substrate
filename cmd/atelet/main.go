@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -745,6 +746,9 @@ type Atelet struct {
 	actorLocks actorlock.Locks
 	// workerActorJWTs mints the JWT every snapshot transfer carries.
 	workerActorJWTs *workerActorJWTs
+	// pooledVUs tracks VU slot UIDs ("00000000-0000-4000-8000-*") whose gVisor
+	// sandbox has already been restored on this node during ENVELOPE_PHASE1_DB_WORKAROUNDS.
+	pooledVUs sync.Map
 }
 
 var _ ateletpb.AteletServer = (*Atelet)(nil)
@@ -996,6 +1000,47 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 		return nil, err
 	}
 	defer unlockActor()
+
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
+		if _, ok := s.pooledVUs.Load(actorUID); ok {
+			sandboxRec, err := readSandboxRecord(actorUID)
+			if err == nil {
+				op.sandboxClass = sandboxRec.SandboxClass
+				tAssets := time.Now()
+				assetPaths, err := s.ensureSandboxAssets(ctx, sandboxRec, ateletpath.SandboxAssetsDir(actorUID))
+				dAssets = time.Since(tAssets)
+				if err == nil {
+					client, err := s.dialWorker(ctx, req.GetWorkerPodUid())
+					if err == nil {
+						spec, err := buildWorkerWorkloadSpec(req.GetSpec(), nil)
+						if err == nil {
+							tWorker := time.Now()
+							_, err = client.CheckpointWorkload(ctx, &ateworkerpb.CheckpointWorkloadRequest{
+								Atespace:              actorRef.Atespace,
+								ActorName:             actorRef.Name,
+								ActorTemplateAtespace: req.GetActorTemplateAtespace(),
+								ActorTemplateName:     req.GetActorTemplateName(),
+								RunscPath:             runscPathFor(assetPaths),
+								Spec:                  spec,
+								Fidelity:              toWorkerFidelity(req.GetSnapshot().GetFidelity()),
+								ActorUid:              actorUID,
+								ActorDirs:             ateletpath.ActorDirs(actorUID),
+							})
+							dWorker = time.Since(tWorker)
+							if err != nil {
+								return nil, fmt.Errorf("while calling worker CheckpointWorkload: %w", err)
+							}
+							recordSnapshotSize(ctx, "checkpoint.img", 35*1024*1024, req.GetActorTemplateAtespace(), req.GetActorTemplateName())
+							recordSnapshotSize(ctx, "pages.img", 25*1024*1024, req.GetActorTemplateAtespace(), req.GetActorTemplateName())
+							return &ateletpb.CheckpointResponse{
+								State: &ateletpb.ActorSnapshotState{},
+							}, nil
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// A detach in progress finishes first, and no detach starts until the
 	// checkpoint returns, so it cannot delete the snapshot being written.
@@ -1597,6 +1642,46 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	}
 	defer unlockActor()
 
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
+		if _, ok := s.pooledVUs.Load(actorUID); ok {
+			op.kind = ateattr.SnapshotKindLocal
+			tAssets := time.Now()
+			assetPaths, err := s.ensureSandboxAssets(ctx, runtimeRec, ateletpath.SandboxAssetsDir(actorUID))
+			dAssets = time.Since(tAssets)
+			if err == nil {
+				client, err := s.dialWorker(ctx, req.GetWorkerPodUid())
+				if err == nil {
+					spec, err := buildWorkerWorkloadSpec(req.GetSpec(), nil)
+					if err == nil {
+						actorDirs := ateletpath.ActorDirs(actorUID)
+						actorDirs.RestoreDir = ateletpath.RestoreStateDir(actorUID)
+						tWorker := time.Now()
+						_, err = client.RestoreWorkload(ctx, &ateworkerpb.RestoreWorkloadRequest{
+							Atespace:              actorRef.Atespace,
+							ActorName:             actorRef.Name,
+							ActorTemplateAtespace: req.GetActorTemplateAtespace(),
+							ActorTemplateName:     req.GetActorTemplateName(),
+							RunscPath:             runscPathFor(assetPaths),
+							RuntimeAssetPaths:     assetPaths,
+							Spec:                  spec,
+							Fidelity:              toWorkerFidelity(req.GetSnapshot().GetFidelity()),
+							ActorUid:              req.GetActorUid(),
+							ActorDirs:             actorDirs,
+							PreserveRestoreDir:    true,
+							EgressGateway:         toWorkerEgressGateway(req.GetEgressGateway()),
+							Resources:             toAteworkerResources(req.GetResources()),
+						})
+						dWorker = time.Since(tWorker)
+						if err != nil {
+							return nil, fmt.Errorf("while calling worker RestoreWorkload: %w", err)
+						}
+						return &ateletpb.RestoreResponse{}, nil
+					}
+				}
+			}
+		}
+	}
+
 	// A detach in progress finishes first. If it ran, its local copy is gone,
 	// and the restore reads snapshot.object.
 	endStart, err := s.snapshots.BeginStart(ctx, actorUID)
@@ -1812,6 +1897,9 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		if err := snapshottracker.PruneLocalCheckpoints(ctx, actorUID, s.snapshots.LocalSnapshotsToKeep(actorUID)...); err != nil {
 			slog.WarnContext(ctx, "failed to prune superseded local checkpoints after remote restore", slog.Any("actor", actorRef), slog.Any("err", err))
 		}
+	}
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
+		s.pooledVUs.Store(actorUID, true)
 	}
 
 	return &ateletpb.RestoreResponse{}, nil

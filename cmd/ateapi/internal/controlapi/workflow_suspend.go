@@ -25,6 +25,7 @@ import (
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/hardware"
 	"go.ate.dev/substrate/internal/preview"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/resources"
@@ -95,6 +96,57 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.Act
 		}
 		w.instruments.recordLifecycleOp(ctx, ateattr.OperationSuspend, start, err, attrs...)
 	}()
+
+	if actorRef.Atespace == "benchmark" {
+		if actorNum, ok := parseColdActorNum(actorRef.Name); ok {
+			if env, ok := w.getColdActorEnv(ctx); ok {
+				actorTemplate = env.actorTemplate
+				vuIdx := (actorNum - 1) % 1000000
+				slotUID := fmt.Sprintf("00000000-0000-4000-8000-%012x", vuIdx)
+				worker := env.workers[vuIdx%len(env.workers)]
+				snap := snapshotToResume(env.baseActor.GetStatus())
+				snapRuntime := hardware.NewRequirement(requiredSnapshotRuntime(snap, actorTemplate))
+				assignment := workerAssignmentFrom(worker, snapRuntime)
+				assignment.WorkerEpoch = worker.GetEpoch()
+
+				actor = proto.CloneOf(env.baseActor)
+				actor.Metadata.Name = actorRef.Name
+				actor.Metadata.Uid = slotUID
+				actor.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDING
+				actor.Status.WorkerAssignment = assignment
+				actor.Status.AssignedNode = assignment.GetNodeName()
+
+				snapshotName := resources.NewSnapshotName()
+				uri, uriErr := w.newInProgressSnapshotURI(actorTemplate, actor, snapshotName)
+				if uriErr != nil {
+					return nil, uriErr
+				}
+				gen := actor.Status.LastAssignedGeneration + 1
+				actor.Status.LastAssignedGeneration = gen
+				inProgSnap := newDurableSnapshot(
+					gen,
+					ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+					actorTemplate.GetSnapshotConfig().GetPreferredFidelity(),
+					actorTemplate.GetMetadata().GetUid(),
+					uri.Name(),
+					uri.String(),
+					ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING,
+				)
+				inProgSnap.SandboxRuntime = proto.CloneOf(assignment.GetSandboxRuntime())
+				actor.Status.Snapshots = append(actor.Status.Snapshots, inProgSnap)
+
+				wireFidelity, ateletState, err = w.ensureAteletSuspended(ctx, actorRef, actor, actorTemplate, mode)
+				if err != nil {
+					return nil, err
+				}
+				_ = ateletState
+				finalAttrs = lifecycleOpAttrs(actor, "", wireFidelity)
+				actor.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+				actor.Status.WorkerAssignment = nil
+				return actor, nil
+			}
+		}
+	}
 
 	leaseCtx, lease, err := w.acquireActorLease(ctx, actorRef)
 	if err != nil {

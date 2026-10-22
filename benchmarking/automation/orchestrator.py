@@ -687,9 +687,9 @@ def main() -> None:
             # this is cheap on a clean cluster. Order matters:
             # microvm-deps deletes a SandboxConfig CR, which requires the
             # SandboxConfig CRD that teardown_substrate removes.
-            teardown_workloads()
-            teardown_microvm_deps()
             if os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true":
+                teardown_workloads()
+                teardown_microvm_deps()
                 teardown_substrate()
 
             sandbox_class = test.get("sandboxClass", "gvisor")
@@ -697,21 +697,22 @@ def main() -> None:
             failure_msg = None
             start_time = time.time()
             try:
-                deploy_substrate(substrate_args(test))
-                TYPES[ttype].pre_test(test)
-                # install-microvm-deps needs the CRDs from deploy_substrate;
-                # deploy_workloads needs the microvm SandboxConfig.
-                if sandbox_class == "microvm":
-                    install_microvm_deps()
-                deploy_workloads(
-                    test.get("workerCount", 1),
-                    sandbox_class,
-                    test.get("actorMemory", ""),
-                    test.get("workerWaitTimeout", ""),
-                    test.get("workerMemory", ""),
-                    isolate_workload_args(test),
-                    test.get("actorCPU", ""),
-                )
+                if i == 0 or os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true":
+                    deploy_substrate(substrate_args(test))
+                    TYPES[ttype].pre_test(test)
+                    # install-microvm-deps needs the CRDs from deploy_substrate;
+                    # deploy_workloads needs the microvm SandboxConfig.
+                    if sandbox_class == "microvm":
+                        install_microvm_deps()
+                    deploy_workloads(
+                        test.get("workerCount", 1),
+                        sandbox_class,
+                        test.get("actorMemory", ""),
+                        test.get("workerWaitTimeout", ""),
+                        test.get("workerMemory", ""),
+                        isolate_workload_args(test),
+                        test.get("actorCPU", ""),
+                    )
                 try:
                     status = run_test(
                         test,

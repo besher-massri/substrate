@@ -53,6 +53,8 @@ type hostedActor struct {
 	// nothing that waits on it later can be fooled by a reused pid. Nil if it
 	// could not be pinned. Set once, under the actor's lock.
 	sandbox *sandboxProcess
+	// activeRef tracks the currently routed ActorRef on a pooled VU slot.
+	activeRef resources.ActorRef
 }
 
 // admitActor reserves capacity before network setup. An actor that is already

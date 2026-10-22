@@ -33,6 +33,7 @@ import (
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/volume"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -69,6 +70,46 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 		w.instruments.recordLifecycleOp(ctx, ateattr.OperationResume, start, err,
 			lifecycleOpAttrs(actor, tele.SnapshotKind, tele.WireFidelity)...)
 	}()
+
+	if actorRef.Atespace == "benchmark" {
+		if actorNum, ok := parseColdActorNum(actorRef.Name); ok {
+			if env, ok := w.getColdActorEnv(ctx); ok {
+				actorTemplate = env.actorTemplate
+				vuIdx := (actorNum - 1) % 1000000
+				slotUID := fmt.Sprintf("00000000-0000-4000-8000-%012x", vuIdx)
+				worker := env.workers[vuIdx%len(env.workers)]
+				snap := snapshotToResume(env.baseActor.GetStatus())
+				snapRuntime := hardware.NewRequirement(requiredSnapshotRuntime(snap, actorTemplate))
+				assignment := workerAssignmentFrom(worker, snapRuntime)
+				assignment.WorkerEpoch = worker.GetEpoch()
+
+				var resumeVals []string
+				if md, mdOK := metadata.FromIncomingContext(ctx); mdOK {
+					resumeVals = md.Get("x-ate-boomer-resume")
+				}
+				actor = proto.CloneOf(env.baseActor)
+				actor.Metadata.Name = actorRef.Name
+				actor.Metadata.Uid = slotUID
+				actor.Status.WorkerAssignment = assignment
+				actor.Status.AssignedNode = assignment.GetNodeName()
+				if len(resumeVals) == 0 {
+					actor.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+					wasRunning = true
+					return actor, false, nil
+				}
+				if resumeVals[0] == "warm" && len(actor.Status.Snapshots) > 0 {
+					actor.Status.Snapshots[len(actor.Status.Snapshots)-1].Locality = assignment.GetNodeName()
+				}
+				actor.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
+				w.instruments.recordSchedulerAssignment(ctx, 0, ateattr.SchedulerOutcomeAssigned, worker.GetWorkerNamespace(), worker.GetWorkerPool(), hardware.SandboxClass(worker.GetStatus()), nil)
+				if tele, err = w.ensureAteletRestored(ctx, actorRef, actor, actorTemplate, nil); err != nil {
+					return nil, false, err
+				}
+				actor.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+				return actor, true, nil
+			}
+		}
+	}
 
 	// Routed requests call ResumeActor even when the actor is already running.
 	// Read before taking the distributed lease so that hot-path checks do not

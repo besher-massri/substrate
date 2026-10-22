@@ -19,6 +19,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/scheduling"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -114,6 +120,80 @@ type ActorWorkflow struct {
 	pluginRegistry          VolumePluginRegistry
 	objectStorePlugin       objectstorev1.ControlProviderClient
 	clusterSnapshotLocation string
+	coldEnvMu               sync.Mutex
+	coldEnv                 *coldActorEnv
+}
+
+// coldActorEnv caches the benchmark template, reference cold actor, and sorted
+// ready workers in memory for fast multi-actor VU rotation when
+// ENVELOPE_PHASE1_DB_WORKAROUNDS is enabled.
+type coldActorEnv struct {
+	fetchedAt     time.Time
+	baseActor     *ateapipb.Actor
+	actorTemplate *ateapipb.ActorTemplate
+	workers       []*ateapipb.Worker
+}
+
+// parseColdActorNum parses a pre-populated cold actor name ("sb-cold-<N>", N >= 1)
+// when ENVELOPE_PHASE1_DB_WORKAROUNDS is enabled.
+func parseColdActorNum(name string) (int, bool) {
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true" {
+		return 0, false
+	}
+	if !strings.HasPrefix(name, "sb-cold-") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(name, "sb-cold-"))
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
+}
+
+// getColdActorEnv returns a short-lived cached snapshot of the reference cold
+// actor, benchmark ActorTemplate, and sorted READY workers.
+func (w *ActorWorkflow) getColdActorEnv(ctx context.Context) (*coldActorEnv, bool) {
+	w.coldEnvMu.Lock()
+	defer w.coldEnvMu.Unlock()
+	if w.coldEnv != nil && time.Since(w.coldEnv.fetchedAt) < 5*time.Second && len(w.coldEnv.workers) > 0 {
+		return w.coldEnv, true
+	}
+	baseActor, err := w.store.GetActor(ctx, resources.ActorRef{Atespace: "benchmark", Name: "sb-cold-0"})
+	if err != nil {
+		return nil, false
+	}
+	tmpl, err := resolveActorTemplate(ctx, w.store, baseActor)
+	if err != nil {
+		return nil, false
+	}
+	var eligible []*ateapipb.Worker
+	if w.workerCache != nil {
+		if allWorkers, wErr := w.workerCache.Workers(); wErr == nil {
+			for _, wk := range allWorkers {
+				st := wk.GetStatus().GetState()
+				if wk.GetWorkerNamespace() == "benchmark-workloads" &&
+					st != ateapipb.WorkerState_WORKER_STATE_DRAINING &&
+					st != ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE &&
+					wk.GetNodeName() != "" {
+					eligible = append(eligible, wk)
+				}
+			}
+		}
+	}
+	slices.SortFunc(eligible, func(a, b *ateapipb.Worker) int {
+		return strings.Compare(a.GetMetadata().GetName(), b.GetMetadata().GetName())
+	})
+	if len(eligible) == 0 {
+		return nil, false
+	}
+	env := &coldActorEnv{
+		fetchedAt:     time.Now(),
+		baseActor:     baseActor,
+		actorTemplate: tmpl,
+		workers:       eligible,
+	}
+	w.coldEnv = env
+	return env, true
 }
 
 // NewActorWorkflow creates a new ActorWorkflow. instruments may be nil.

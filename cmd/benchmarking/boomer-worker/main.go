@@ -137,7 +137,7 @@ func main() {
 		_ = tp.Shutdown(shutdownCtx)
 	}()
 
-	conns, apiStubs, err := boomerutil.DialControlPool(*apiEndpoint, 8)
+	conns, apiStubs, err := boomerutil.DialControlPool(*apiEndpoint, 64)
 	if err != nil {
 		slog.Error("failed to dial ateapi", slog.String("err", err.Error()))
 		os.Exit(1)

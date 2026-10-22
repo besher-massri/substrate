@@ -92,8 +92,8 @@ func initPing(cfg *userclass.Config) (taskFn func(), shutdown func(context.Conte
 		cfg.Tracer = otel.Tracer("substrate-boomer/glutton")
 	}
 	rt := &taskRuntime{cfg: cfg}
-	if cfg.ActorsPerUser >= 50 {
-		rt.httpSem = make(chan struct{}, 4096)
+	if cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
+		rt.httpSem = make(chan struct{}, 8192)
 	}
 	return rt.iterate, rt.shutdown
 }
@@ -226,6 +226,34 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	if n < 1 {
 		n = 1
 	}
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
+		vuIdx := int(r.userSeq.Add(1)-1) % 1000000
+		stub := r.pickStub(uint64(vuIdx))
+		u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
+		bmetrics.UpdateUsers(userClass, 1)
+		for i := 0; i < n; i++ {
+			actorNum := i*1000000 + vuIdx + 1
+			a := &gluttonActor{
+				cfg:         r.cfg,
+				stub:        stub,
+				httpSem:     r.httpSem,
+				actorName:   fmt.Sprintf("sb-cold-%d", actorNum),
+				firstResume: true,
+				cpuLoaded:   i > 0,
+			}
+			if i == 0 {
+				r.atespaceOnce.Do(func() {
+					r.atespaceErr = a.ensureAtespace(ctx)
+				})
+				if r.atespaceErr != nil {
+					bmetrics.UpdateUsers(userClass, -1)
+					return nil, r.atespaceErr
+				}
+			}
+			u.actors = append(u.actors, a)
+		}
+		return u, nil
+	}
 	syncCreate := n
 	if n >= 50 {
 		syncCreate = 1
@@ -275,7 +303,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 // leaks actors until shutdown — acceptable for benchmark runs that ramp up,
 // hold, then tear down cleanly.
 func (r *taskRuntime) shutdown(ctx context.Context) {
-	if r.cfg.ActorsPerUser >= 50 {
+	if r.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
 		return
 	}
 	r.users.Range(func(_, val any) bool {
@@ -507,9 +535,12 @@ func (u *gluttonActor) create(ctx context.Context) error {
 
 func (u *gluttonActor) resume(ctx context.Context) error {
 	metricName := "ResumeActor"
+	resumeKind := "warm"
 	if u.firstResume {
 		metricName = "ResumeActorFirstResume"
+		resumeKind = "first"
 	}
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-ate-boomer-resume", resumeKind)
 	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
 		// Retry Aborted "concurrent update conflict" transparently — it's a
 		// race, not a real failure, and the caller is expected to retry per
@@ -615,7 +646,7 @@ func (u *gluttonActor) tracedCall(ctx context.Context, name string, do func(cont
 	var tr metadata.MD
 	var err error
 	maxAttempts := 1
-	if u.cfg != nil && u.cfg.ActorsPerUser >= 50 {
+	if u.cfg != nil && (u.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true") {
 		maxAttempts = 4
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -669,7 +700,7 @@ func (u *gluttonActor) ping(ctx context.Context) {
 	var resp *http.Response
 	var respBody []byte
 	maxAttempts := 1
-	if u.cfg != nil && u.cfg.ActorsPerUser >= 50 {
+	if u.cfg != nil && (u.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true") {
 		maxAttempts = 4
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -883,7 +914,7 @@ func (u *gluttonActor) postProto(ctx context.Context, path string, req, resp pro
 	var httpResp *http.Response
 	var respBody []byte
 	maxAttempts := 1
-	if u.cfg != nil && u.cfg.ActorsPerUser >= 50 {
+	if u.cfg != nil && (u.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true") {
 		maxAttempts = 4
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {

@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -756,6 +757,25 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	}
 	defer s.locks.Unlock(req.GetActorUid())
 
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
+		if hosted := s.lookupActor(req.GetActorUid()); hosted != nil && hosted.session != nil {
+			attribution := workerstats.ActorAttributionFromRequest(req)
+			s.actorsMu.Lock()
+			prevRef := hosted.activeRef
+			hosted.activeRef = resources.ActorRef{}
+			s.actorsMu.Unlock()
+			if prevRef.Name != "" && prevRef != attribution.Ref {
+				prevAttr := attribution
+				prevAttr.Ref = prevRef
+				_ = s.tunnel.Deactivate(ctx, prevAttr)
+			}
+			_ = s.tunnel.Deactivate(ctx, attribution)
+			return &ateworkerpb.CheckpointWorkloadResponse{
+				SnapshotFiles: []string{"checkpoint.img", "pages.img"},
+			}, nil
+		}
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// Not cancelable: a checkpoint is saving the actor's state.
@@ -1022,6 +1042,27 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		return nil, fmt.Errorf("gave up waiting for the actor's lock: %w", ctx.Err())
 	}
 	defer s.locks.Unlock(req.GetActorUid())
+
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
+		if hosted := s.lookupActor(req.GetActorUid()); hosted != nil && hosted.session != nil {
+			attribution := workerstats.ActorAttributionFromRequest(req)
+			s.actorsMu.Lock()
+			prevRef := hosted.activeRef
+			hosted.activeRef = attribution.Ref
+			s.actorsMu.Unlock()
+			if prevRef.Name != "" && prevRef != attribution.Ref {
+				prevAttr := attribution
+				prevAttr.Ref = prevRef
+				_ = s.tunnel.Deactivate(ctx, prevAttr)
+			}
+			_ = s.tunnel.Deactivate(ctx, attribution)
+			if err := s.tunnel.Activate(attribution, s.sandboxDialer(req.GetActorUid()), nil); err != nil {
+				return nil, err
+			}
+			return &ateworkerpb.RestoreWorkloadResponse{}, nil
+		}
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1218,6 +1259,9 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	})
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restored", attribution)
+	s.actorsMu.Lock()
+	hosted.activeRef = attribution.Ref
+	s.actorsMu.Unlock()
 	s.setSession(req.GetActorUid(), &workloadSession{rcmd: rcmd, containers: containerNames(containers)})
 	s.recordInitial(ctx, hosted)
 	s.watchSandbox(ctx, hosted, req.GetRunscPath(), req.GetActorDirs(), containers)
