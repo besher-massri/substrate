@@ -135,7 +135,9 @@ func (r *taskRuntime) runBgColdCreator(workerID int) {
 				actorName:   fmt.Sprintf("sb-bg-%d-%d", workerID, seq),
 				firstResume: true,
 			}
-			_ = a.create(ctx)
+			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			_ = a.create(reqCtx)
+			cancel()
 		}
 	}
 }

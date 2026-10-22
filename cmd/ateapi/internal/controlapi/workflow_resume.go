@@ -502,9 +502,10 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" &&
 		actor.GetStatus().GetAssignedNode() != "" &&
 		actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace {
+		wName := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName()
 		if nodeWorkers, nerr := w.workerCache.WorkersByNode(actor.GetStatus().GetAssignedNode()); nerr == nil {
 			for _, nw := range nodeWorkers {
-				if nw.GetNodeName() != "" && w.appliesWithFallback(nw, constraints, relaxable) {
+				if (wName == "" || nw.GetMetadata().GetName() == wName) && nw.GetNodeName() != "" && w.appliesWithFallback(nw, constraints, relaxable) {
 					assignedWorker = nw
 					fastBound = true
 					break

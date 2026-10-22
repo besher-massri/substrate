@@ -69,6 +69,9 @@ func (a *Authorizer) Check(ctx context.Context, relation, object string) error {
 		return apierror.Unauthenticated("unauthenticated: missing principal in context")
 	}
 	user := formatUser(p.ID)
+	if ctx.Err() == nil && a.checkContextualFastPath(user, relation, object, p.Kind) {
+		return nil
+	}
 	var grants []*openfgav1.TupleKey
 	if p.Kind == principal.KindMTLS {
 		for _, role := range a.systemPrincipals[user] {
@@ -87,6 +90,96 @@ func (a *Authorizer) Check(ctx context.Context, relation, object string) error {
 		return apierror.PermissionDenied("permission denied: principal %q lacks %q on %q", user, relation, object)
 	}
 	return nil
+}
+
+// checkContextualFastPath evaluates in-memory whether user is guaranteed to hold
+// relation on object purely from server-configured bootstrapOwners or mTLS
+// systemPrincipals contextual tuples under model.fga, avoiding OpenFGA's
+// multi-goroutine union dispatch and database tuple lookups on the hot RPC path.
+func (a *Authorizer) checkContextualFastPath(user, relation, object, kind string) bool {
+	objectType, id, _ := strings.Cut(object, ":")
+	if _, isBootstrapOwner := a.bootstrapOwners[user]; isBootstrapOwner {
+		switch {
+		case object == GlobalRootObject:
+			switch relation {
+			case RelationCanCreateAtespace, RelationCanListAtespaces,
+				RelationCanCreateWorker, RelationCanListWorkers,
+				RelationCanListActors, RelationCanListActorTemplates, RelationCanListTags,
+				RelationCanCreateAccessPolicy, RelationCanGetAccessPolicy, RelationCanUpdateAccessPolicy:
+				return true
+			}
+		case objectType == "atespace" && id != "":
+			switch relation {
+			case RelationCanCreateAccessPolicy, RelationCanGetAccessPolicy,
+				RelationCanUpdateAccessPolicy, RelationCanDeleteAccessPolicy,
+				RelationCanCreateActor, RelationCanCreateActorTemplate,
+				RelationCanListActors, RelationCanListActorTemplates,
+				RelationCanCreateTag, RelationCanListTags,
+				RelationCanGet, RelationCanDelete:
+				return true
+			}
+		case objectType == "worker" && id != "":
+			switch relation {
+			case RelationCanGet, RelationCanListActorAssignments,
+				RelationCanUpdate, RelationCanDelete, RelationCanDrain:
+				return true
+			}
+		case objectType == "actor_template" && strings.Contains(id, "/"):
+			switch relation {
+			case RelationCanGet, RelationCanUseTemplate, RelationCanDelete:
+				return true
+			}
+		case objectType == "tag" && strings.Contains(id, "/"):
+			switch relation {
+			case RelationCanGet, RelationCanUpdate, RelationCanDelete, RelationCanUseTag:
+				return true
+			}
+		case objectType == "actor" && strings.Contains(id, "/"):
+			switch relation {
+			case RelationCanGet, RelationCanUpdate, RelationCanDelete,
+				RelationCanGetEgressPolicy, RelationCanCreateEgressPolicy,
+				RelationCanUpdateEgressPolicy, RelationCanDeleteEgressPolicy,
+				RelationCanResume, RelationCanSuspend, RelationCanRevert:
+				return true
+			}
+		}
+	}
+	if kind == principal.KindMTLS {
+		for _, role := range a.systemPrincipals[user] {
+			switch role {
+			case RoleController:
+				if object == GlobalRootObject && (relation == RelationCanCreateWorker || relation == RelationCanListWorkers) {
+					return true
+				}
+				if objectType == "worker" && id != "" && (relation == RelationCanGet || relation == RelationCanUpdate || relation == RelationCanDelete || relation == RelationCanDrain) {
+					return true
+				}
+			case RoleEgressGateway:
+				if object == GlobalRootObject && relation == RelationCanListActors {
+					return true
+				}
+				if objectType == "actor" && strings.Contains(id, "/") && (relation == RelationCanGet || relation == RelationCanGetEgressPolicy || relation == RelationCanMintActorJWT || relation == RelationCanMintActorCertificate) {
+					return true
+				}
+			case RoleIngressRouter:
+				if object == GlobalRootObject && relation == RelationCanListActors {
+					return true
+				}
+				if objectType == "actor" && strings.Contains(id, "/") && relation == RelationCanResume {
+					return true
+				}
+			case RoleAtelet:
+				if objectType == "actor" && strings.Contains(id, "/") && relation == RelationCanGetEgressPolicy {
+					return true
+				}
+			case RoleAPIServerSidecar:
+				if objectType == "actor" && strings.Contains(id, "/") && relation == RelationCanGet {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // checkRaw reports whether user has relation on object. Besides the stored

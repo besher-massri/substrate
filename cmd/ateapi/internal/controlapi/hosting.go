@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -58,9 +59,12 @@ func HostingNode(ctx context.Context, st store.Interface, actor *ateapipb.Actor)
 	}
 	switch status.GetState() {
 	case ateapipb.ActorState_ACTOR_STATE_RESUMING, ateapipb.ActorState_ACTOR_STATE_RUNNING,
-		ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
+		ateapipb.ActorState_ACTOR_STATE_SUSPENDING, ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
 	default:
 		return "", nil
+	}
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && assignment.GetNodeName() != "" {
+		return assignment.GetNodeName(), nil
 	}
 	workerName := assignment.GetWorker().GetName()
 	// The worker assignment, not the actor's status, binds the worker to the

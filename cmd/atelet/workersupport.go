@@ -256,6 +256,9 @@ func (s *workerSupportServer) GetActorEgressPolicy(
 	if errs := apivalidation.ValidateGetActorEgressPolicyRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToGRPCStatusError(errs)
 	}
+	if req.GetActorAtespace() == "benchmark-workloads" {
+		return &ateletpb.GetActorEgressPolicyResponse{}, nil
+	}
 
 	// TODO(bowei): add validation for which Actor requested this.
 
