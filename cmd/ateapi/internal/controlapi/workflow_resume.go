@@ -867,6 +867,13 @@ func checkVolumesAttachable(volumes []*ateapipb.ExternalVolumeStatus) error {
 // request; once atelet's Restore/Run are idempotent on those keys this step
 // becomes fully reentrant with no changes here.
 func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, volumePublishContexts map[string]map[string]string) (tele restoreTelemetry, err error) {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		for _, k := range []string{"x-ate-test-name", "x-ate-boomer-resume"} {
+			if vals := md.Get(k); len(vals) > 0 {
+				ctx = metadata.AppendToOutgoingContext(ctx, k, vals[0])
+			}
+		}
+	}
 	ctx, done := stepSpan(ctx, "CallAteletRestore")
 	defer func() { err = done(err) }()
 

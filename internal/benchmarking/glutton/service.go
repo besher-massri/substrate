@@ -136,6 +136,18 @@ func (s *Service) WriteRAM(ctx context.Context, req *gluttonpb.WriteRAMRequest) 
 
 	switch req.GetWriteMode() {
 	case gluttonpb.WriteMode_WRITE_MODE_TRUNCATE:
+		s.mu.Lock()
+		existing := s.ram[req.GetKey()]
+		if len(existing) == size {
+			if _, err := rand.Read(existing); err != nil {
+				s.mu.Unlock()
+				return nil, status.Errorf(codes.Internal, "generate random bytes: %v", err)
+			}
+			delete(s.ramCursor, req.GetKey())
+			s.mu.Unlock()
+			break
+		}
+		s.mu.Unlock()
 		buf, err := randomBytes(size)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "generate random bytes: %v", err)

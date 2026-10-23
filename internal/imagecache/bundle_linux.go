@@ -60,16 +60,18 @@ func SetupBundleRootfs(bundlePath string) error {
 	rootfs := filepath.Join(bundlePath, "rootfs")
 	upper := filepath.Join(bundlePath, "upper")
 	work := filepath.Join(bundlePath, "work")
+	// Detach any stale mount left by a previous incarnation of this bundle
+	// path and wipe upper/work before recreating them: kernel overlayfs marks
+	// work/work/incompat/volatile on volatile mounts and rejects remounting
+	// with a non-empty volatile workdir.
+	_ = unix.Unmount(rootfs, unix.MNT_DETACH)
+	_ = os.RemoveAll(upper)
+	_ = os.RemoveAll(work)
 	for _, d := range []string{rootfs, upper, work} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return fmt.Errorf("while creating %q: %w", d, err)
 		}
 	}
-
-	// Detach any stale mount left by a previous incarnation of this bundle
-	// path (e.g. a run that failed between mount and teardown). EINVAL just
-	// means nothing was mounted there.
-	_ = unix.Unmount(rootfs, unix.MNT_DETACH)
 
 	if len(spec.Layers) == 0 {
 		// Degenerate zero-layer image: the empty rootfs dir plus ExtraDirs is

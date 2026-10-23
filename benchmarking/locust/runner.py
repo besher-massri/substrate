@@ -421,12 +421,14 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
         # is the loopback address, where the server above listens.
         boomer_cmd += ["--master-web-port", str(BOOMER_CONFIG_PORT)]
         tee(logs, f"Running: {' '.join(boomer_cmd)}")
+        boomer_env = {**os.environ, "BOOMER_TEST_NAME": str(args.name or "")}
         boomer_proc = subprocess.Popen(
             boomer_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
             text=True,
+            env=boomer_env,
         )
         pumps.append(threading.Thread(
             target=pump_stream,

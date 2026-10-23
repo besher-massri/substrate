@@ -173,7 +173,6 @@ func (w *ActorWorkflow) getColdActorEnv(ctx context.Context) (*coldActorEnv, boo
 				st := wk.GetStatus().GetState()
 				if wk.GetWorkerNamespace() == "benchmark-workloads" &&
 					st != ateapipb.WorkerState_WORKER_STATE_DRAINING &&
-					st != ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE &&
 					wk.GetNodeName() != "" {
 					eligible = append(eligible, wk)
 				}

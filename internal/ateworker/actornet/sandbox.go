@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 
 	"go.ate.dev/substrate/internal/atunnel/dns"
@@ -75,6 +76,172 @@ type SandboxNetworkConfig struct {
 	DNSPolicy dns.PolicySource
 }
 
+// prewarmedVethPair holds a brand-new, never-used pair of runtime and gateway
+// network namespaces with their veth pair, addresses, default route, sysctls,
+// and nftables redirect rules already configured.
+type prewarmedVethPair struct {
+	egressPort uint16
+	runtimeNS  netns.Handle
+	gatewayNS  netns.Handle
+}
+
+const (
+	freshVethPoolCapacity   = 64
+	freshVethPoolWorkers    = 4
+	asyncNetNSCloseCapacity = 512
+	asyncNetNSCloseWorkers  = 4
+)
+
+var (
+	vethPoolOnce      sync.Once
+	vethPoolCh        chan prewarmedVethPair
+	vethReplenishCh   chan uint16
+	asyncNetNSCloseCh chan netns.Handle
+)
+
+// netnsPoolEnabled reports whether the pre-warmed fresh single-use network
+// namespace pool and asynchronous namespace teardown are enabled.
+func netnsPoolEnabled() bool {
+	return os.Getenv("ATEWORKER_NETNS_POOL") == "true"
+}
+
+// initVethPool initializes the background replenisher and asynchronous
+// namespace closer worker goroutines once per process.
+func initVethPool() {
+	vethPoolOnce.Do(func() {
+		vethPoolCh = make(chan prewarmedVethPair, freshVethPoolCapacity)
+		vethReplenishCh = make(chan uint16, freshVethPoolCapacity)
+		asyncNetNSCloseCh = make(chan netns.Handle, asyncNetNSCloseCapacity)
+
+		for range asyncNetNSCloseWorkers {
+			go func() {
+				for h := range asyncNetNSCloseCh {
+					_ = h.Close()
+				}
+			}()
+		}
+
+		for range freshVethPoolWorkers {
+			go func() {
+				var lastPort uint16
+				for port := range vethReplenishCh {
+					if port != 0 {
+						lastPort = port
+					}
+					if lastPort == 0 {
+						continue
+					}
+					for len(vethPoolCh) < cap(vethPoolCh) {
+						pair, err := createPrewarmedVethPair(context.Background(), lastPort)
+						if err != nil {
+							break
+						}
+						select {
+						case vethPoolCh <- pair:
+						default:
+							_ = pair.runtimeNS.Close()
+							_ = pair.gatewayNS.Close()
+						}
+					}
+				}
+			}()
+		}
+	})
+}
+
+// WarmSandboxNetworkPool starts pre-populating the fresh single-use veth
+// network namespace pool in the background for the worker's egressPort when
+// ATEWORKER_NETNS_POOL=true.
+func WarmSandboxNetworkPool(egressPort uint16) {
+	if !netnsPoolEnabled() || egressPort == 0 {
+		return
+	}
+	initVethPool()
+	for range freshVethPoolWorkers {
+		select {
+		case vethReplenishCh <- egressPort:
+		default:
+		}
+	}
+}
+
+// acquirePrewarmedVethPair pops a brand-new, never-used (runtimeNS, gatewayNS)
+// pair from the pre-warmed pool or creates one synchronously if the pool is
+// currently empty, signaling the background replenisher to refill the pool.
+func acquirePrewarmedVethPair(ctx context.Context, egressPort uint16) (prewarmedVethPair, error) {
+	initVethPool()
+	select {
+	case vethReplenishCh <- egressPort:
+	default:
+	}
+	for {
+		select {
+		case pair := <-vethPoolCh:
+			select {
+			case vethReplenishCh <- egressPort:
+			default:
+			}
+			if pair.egressPort == egressPort {
+				return pair, nil
+			}
+			enqueueAsyncNetNSClose(pair.runtimeNS)
+			enqueueAsyncNetNSClose(pair.gatewayNS)
+		default:
+			return createPrewarmedVethPair(ctx, egressPort)
+		}
+	}
+}
+
+// createPrewarmedVethPair constructs a fresh unnamed (runtimeNS, gatewayNS)
+// pair with its veth link, addresses, route, sysctls, and nftables redirect
+// rules configured.
+func createPrewarmedVethPair(ctx context.Context, egressPort uint16) (_ prewarmedVethPair, retErr error) {
+	actorNS, err := netns.CreateAnonymous()
+	if err != nil {
+		return prewarmedVethPair{}, fmt.Errorf("while creating anonymous actor netns: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			_ = actorNS.Close()
+		}
+	}()
+	outer, err := netns.CreateAnonymous()
+	if err != nil {
+		return prewarmedVethPair{}, fmt.Errorf("while creating anonymous gateway netns: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			_ = outer.Close()
+		}
+	}()
+	if err := configureVethPair(ctx, actorNS, outer); err != nil {
+		return prewarmedVethPair{}, err
+	}
+	if err := setupGatewaySide(ctx, outer, egressPort); err != nil {
+		return prewarmedVethPair{}, err
+	}
+	return prewarmedVethPair{
+		egressPort: egressPort,
+		runtimeNS:  actorNS,
+		gatewayNS:  outer,
+	}, nil
+}
+
+// enqueueAsyncNetNSClose queues an open network namespace handle for closing
+// on a background worker goroutine, falling back to synchronous close if the
+// queue is full.
+func enqueueAsyncNetNSClose(h netns.Handle) {
+	if h <= 0 {
+		return
+	}
+	initVethPool()
+	select {
+	case asyncNetNSCloseCh <- h:
+	default:
+		_ = h.Close()
+	}
+}
+
 // SetupSandboxNetwork creates isolated networking with fixed sandbox addresses.
 // gVisor uses a veth pair across runtime and gateway namespaces because it takes
 // over every interface in its namespace. MicroVMs use a tap in one namespace.
@@ -88,6 +255,33 @@ func SetupSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig) (_ *Sand
 	}
 
 	actorNSName := nodepath.ActorNetNSName(actorUID)
+	if cfg.Veth && netnsPoolEnabled() {
+		gatewayNSName := SandboxGatewayNetNSName(actorUID)
+		pair, err := acquirePrewarmedVethPair(ctx, cfg.EgressPort)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if retErr != nil {
+				_ = netns.RemoveNamed(actorNSName)
+				_ = netns.RemoveNamed(gatewayNSName)
+				enqueueAsyncNetNSClose(pair.runtimeNS)
+				enqueueAsyncNetNSClose(pair.gatewayNS)
+			}
+		}()
+		if err := netns.BindNamed(actorNSName, pair.runtimeNS); err != nil {
+			return nil, fmt.Errorf("while binding actor netns %s: %w", actorNSName, err)
+		}
+		if err := netns.BindNamed(gatewayNSName, pair.gatewayNS); err != nil {
+			return nil, fmt.Errorf("while binding gateway netns %s: %w", gatewayNSName, err)
+		}
+		return &SandboxNetwork{
+			ActorUID:     actorUID,
+			RuntimeNetNS: pair.runtimeNS,
+			GatewayNetNS: pair.gatewayNS,
+		}, nil
+	}
+
 	actorNS, err := netns.CreateNamed(actorNSName)
 	if err != nil {
 		return nil, fmt.Errorf("while creating the actor netns %s: %w", actorNSName, err)
@@ -140,6 +334,15 @@ func setupVethPair(ctx context.Context, cfg SandboxNetworkConfig, actorNS netns.
 		}
 	}()
 
+	if err := configureVethPair(ctx, actorNS, outer); err != nil {
+		return 0, err
+	}
+	return outer, nil
+}
+
+// configureVethPair creates the veth pair joining outer (gatewayNS) and
+// actorNS (runtimeNS) and configures addresses, link state, and default route.
+func configureVethPair(ctx context.Context, actorNS, outer netns.Handle) error {
 	// Keep the kernel-owned peer outside gVisor's namespace.
 	if err := netns.Do(ctx, outer, func(context.Context) error {
 		veth := &netlink.Veth{
@@ -166,7 +369,7 @@ func setupVethPair(ctx context.Context, cfg SandboxNetworkConfig, actorNS netns.
 		}
 		return nil
 	}); err != nil {
-		return 0, err
+		return err
 	}
 
 	// gVisor imports these addresses and routes into its network stack.
@@ -194,9 +397,9 @@ func setupVethPair(ctx context.Context, cfg SandboxNetworkConfig, actorNS netns.
 			Gw:        ActorVethGwIP,
 		})
 	}); err != nil {
-		return 0, err
+		return err
 	}
-	return outer, nil
+	return nil
 }
 
 func linkUp(name string) error {
@@ -372,6 +575,24 @@ func CleanupSandboxNetwork(network *SandboxNetwork) error {
 	var errs error
 	// Compare before Close sets the handle to -1; microVMs share one descriptor.
 	separateNS := network.GatewayNetNS != network.RuntimeNetNS
+	if netnsPoolEnabled() {
+		rt := network.RuntimeNetNS
+		gw := network.GatewayNetNS
+		network.RuntimeNetNS = -1
+		network.GatewayNetNS = -1
+		for _, name := range []string{nodepath.ActorNetNSName(network.ActorUID), SandboxGatewayNetNSName(network.ActorUID)} {
+			if err := netns.RemoveNamed(name); err != nil {
+				errs = errors.Join(errs, fmt.Errorf("while deleting netns %s: %w", name, err))
+			}
+		}
+		if rt > 0 {
+			enqueueAsyncNetNSClose(rt)
+		}
+		if separateNS && gw > 0 {
+			enqueueAsyncNetNSClose(gw)
+		}
+		return errs
+	}
 	if network.holdsNetNS() {
 		if err := network.RuntimeNetNS.Close(); err != nil {
 			errs = errors.Join(errs, fmt.Errorf("while closing the sandbox netns: %w", err))

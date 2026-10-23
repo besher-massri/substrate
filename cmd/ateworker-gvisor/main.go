@@ -61,7 +61,9 @@ import (
 	"go.ate.dev/substrate/internal/workerstats"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	grpcmetadata "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -378,6 +380,9 @@ var _ ateworkerpb.WorkerServer = (*AteWorkerService)(nil)
 
 // NewService creates a new AteWorkerService.
 func NewService(tunnel *atunnel.Tunnel, actorLogger *actorlog.ActorLogger, maxActors int, flags *flagStore) *AteWorkerService {
+	if tunnel != nil {
+		actornet.WarmSandboxNetworkPool(tunnel.EgressPort)
+	}
 	return &AteWorkerService{
 		locks:       actorlock.New(),
 		inFlight:    actorlock.NewInFlight(),
@@ -757,25 +762,6 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	}
 	defer s.locks.Unlock(req.GetActorUid())
 
-	if strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
-		if hosted := s.lookupActor(req.GetActorUid()); hosted != nil && hosted.session != nil {
-			attribution := workerstats.ActorAttributionFromRequest(req)
-			s.actorsMu.Lock()
-			prevRef := hosted.activeRef
-			hosted.activeRef = resources.ActorRef{}
-			s.actorsMu.Unlock()
-			if prevRef.Name != "" && prevRef != attribution.Ref {
-				prevAttr := attribution
-				prevAttr.Ref = prevRef
-				_ = s.tunnel.Deactivate(ctx, prevAttr)
-			}
-			_ = s.tunnel.Deactivate(ctx, attribution)
-			return &ateworkerpb.CheckpointWorkloadResponse{
-				SnapshotFiles: []string{"checkpoint.img", "pages.img"},
-			}, nil
-		}
-	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// Not cancelable: a checkpoint is saving the actor's state.
@@ -1043,26 +1029,6 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	defer s.locks.Unlock(req.GetActorUid())
 
-	if strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
-		if hosted := s.lookupActor(req.GetActorUid()); hosted != nil && hosted.session != nil {
-			attribution := workerstats.ActorAttributionFromRequest(req)
-			s.actorsMu.Lock()
-			prevRef := hosted.activeRef
-			hosted.activeRef = attribution.Ref
-			s.actorsMu.Unlock()
-			if prevRef.Name != "" && prevRef != attribution.Ref {
-				prevAttr := attribution
-				prevAttr.Ref = prevRef
-				_ = s.tunnel.Deactivate(ctx, prevAttr)
-			}
-			_ = s.tunnel.Deactivate(ctx, attribution)
-			if err := s.tunnel.Activate(attribution, s.sandboxDialer(req.GetActorUid()), nil); err != nil {
-				return nil, err
-			}
-			return &ateworkerpb.RestoreWorkloadResponse{}, nil
-		}
-	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1105,16 +1071,6 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	//   * The OCI bundles of the application containers are set up.
 	//   * Checkpoint downloaded and placed on disk
 
-	egress, err := s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
-	timing.egressPrepare = lap(&tLast)
-	if err != nil {
-		return nil, err
-	}
-	hosted, err := s.hostActor(ctx, attribution, req.GetActorDirs())
-	timing.netSetup = lap(&tLast)
-	if err != nil {
-		return nil, err
-	}
 	rcmd := &runsc{
 		path:           req.GetRunscPath(),
 		actorUID:       req.GetActorUid(),
@@ -1124,7 +1080,12 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		containers:     req.GetSpec().GetContainers(),
 		flags:          s.flags,
 	}
-	var containersToDelete []string
+	var (
+		egress             *atunnel.ActorEgress
+		hosted             *hostedActor
+		containersToDelete []string
+		appRootfsPrepared  bool
+	)
 	defer func() {
 		if retErr != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -1138,11 +1099,66 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 				slog.WarnContext(ctx, "Failed to unmount bundle rootfs overlays after Restore failure",
 					"actorUID", req.GetActorUid(), "err", err)
 			}
-			if err := s.unhostActor(cleanupCtx, req.GetActorUid()); err != nil {
-				slog.WarnContext(cleanupCtx, "Failed to clean up actor network after Restore failure", slog.Any("err", err))
+			if hosted != nil {
+				if err := s.unhostActor(cleanupCtx, req.GetActorUid()); err != nil {
+					slog.WarnContext(cleanupCtx, "Failed to clean up actor network after Restore failure", slog.Any("err", err))
+				}
 			}
 		}
 	}()
+
+	preboostCgroup := preboostRestoreCgroupEnabled(ctx)
+	if preboostCgroup {
+		s.ensureRestoreCgroupsPreboosted(ctx, req.GetActorUid(), containers)
+	}
+
+	if parallelRestorePrepEnabled(ctx) {
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error {
+			t := time.Now()
+			var prepErr error
+			egress, prepErr = s.tunnel.PrepareEgress(gctx, attribution, req.GetEgressGateway())
+			timing.egressPrepare = time.Since(t)
+			return prepErr
+		})
+		g.Go(func() error {
+			t := time.Now()
+			var hostErr error
+			hosted, hostErr = s.hostActor(gctx, attribution, req.GetActorDirs())
+			timing.netSetup = time.Since(t)
+			return hostErr
+		})
+		g.Go(func() error {
+			return rcmd.writeSpec(ocispec.SandboxID)
+		})
+		for _, ac := range containers {
+			ac := ac
+			g.Go(func() error {
+				if err := setupAppRootfs(req.GetActorDirs(), ac.GetName()); err != nil {
+					return fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
+				}
+				return rcmd.writeSpec(ac.GetName())
+			})
+		}
+		if err := g.Wait(); err != nil {
+			_ = lap(&tLast)
+			return nil, err
+		}
+		appRootfsPrepared = true
+		_ = lap(&tLast)
+	} else {
+		egress, err = s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
+		timing.egressPrepare = lap(&tLast)
+		if err != nil {
+			return nil, err
+		}
+		hosted, err = s.hostActor(ctx, attribution, req.GetActorDirs())
+		timing.netSetup = lap(&tLast)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	checkpointDir := req.GetActorDirs().GetRestoreDir()
 	restoreArgs, err := fsRestoreArgs(checkpointDir, fidelity)
 	if err != nil {
@@ -1198,10 +1214,12 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 			return nil, fmt.Errorf("while starting json log pipe for %q: %w", ac.GetName(), err)
 		}
 		defer pw.Close()
-		err = setupAppRootfs(req.GetActorDirs(), ac.GetName())
-		timing.appRootfs += lap(&tLast)
-		if err != nil {
-			return nil, fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
+		if !appRootfsPrepared {
+			err = setupAppRootfs(req.GetActorDirs(), ac.GetName())
+			timing.appRootfs += lap(&tLast)
+			if err != nil {
+				return nil, fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
+			}
 		}
 		containersToDelete = append(containersToDelete, ac.GetName())
 		err = rcmd.cmdCreate(ctx, pw, ac.GetName(), nil)
@@ -1237,6 +1255,9 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
 	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.DefaultCPUWeight)
+	if preboostCgroup {
+		s.setActorContainersCPUWeight(ctx, req.GetActorUid(), containers, cgroup.DefaultCPUWeight)
+	}
 	err = s.tunnel.Activate(attribution, s.sandboxDialer(req.GetActorUid()), egress)
 	timing.activate = lap(&tLast)
 	if err != nil {
@@ -1369,5 +1390,84 @@ func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID str
 	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, weight); err != nil {
 		slog.WarnContext(ctx, "Could not set cpu.weight on sandbox cgroup",
 			slog.String("actorUID", actorUID), slog.Int("weight", weight), slog.Any("err", err))
+	}
+}
+
+// testStepFromContext extracts the active envelope step identifier (step1,
+// step2, step3) from the x-ate-test-name gRPC metadata header when present.
+func testStepFromContext(ctx context.Context) string {
+	if md, ok := grpcmetadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get("x-ate-test-name"); len(vals) > 0 {
+			name := strings.ToLower(strings.TrimSpace(vals[0]))
+			for _, step := range []string{"step1", "step2", "step3"} {
+				if name == step || strings.HasSuffix(name, "_"+step) || strings.HasSuffix(name, "-"+step) {
+					return step
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// parallelRestorePrepEnabled reports whether parallel host preparation before
+// runsc invocation on RestoreWorkload is enabled for ctx (Step 2 and Step 3,
+// or via ATEWORKER_PARALLEL_RESTORE_PREP=true when no step header is set).
+func parallelRestorePrepEnabled(ctx context.Context) bool {
+	switch testStepFromContext(ctx) {
+	case "step1":
+		return false
+	case "step2", "step3":
+		return true
+	}
+	return os.Getenv("ATEWORKER_PARALLEL_RESTORE_PREP") == "true"
+}
+
+// preboostRestoreCgroupEnabled reports whether pre-creating sandbox and
+// application container cgroups at MaxCPUWeight before runsc create/restore is
+// enabled for ctx (Step 3, or via ATEWORKER_PREBOOST_RESTORE_CGROUP=true when
+// no step header is set).
+func preboostRestoreCgroupEnabled(ctx context.Context) bool {
+	switch testStepFromContext(ctx) {
+	case "step1", "step2":
+		return false
+	case "step3":
+		return true
+	}
+	return os.Getenv("ATEWORKER_PREBOOST_RESTORE_CGROUP") == "true"
+}
+
+// ensureRestoreCgroupsPreboosted pre-creates the sandbox and application
+// container cgroup leaves at MaxCPUWeight before runsc create/restore runs,
+// while leaving cpu.max strictly at the actor's declared limit.
+func (s *AteWorkerService) ensureRestoreCgroupsPreboosted(ctx context.Context, actorUID string, containers []*ateworkerpb.Container) {
+	if !s.cgroupDelegated {
+		return
+	}
+	sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
+	if err := cgroup.EnsureActorLeafCPUWeightUnder(s.cgroupRoot, sandboxLeaf, cgroup.MaxCPUWeight); err != nil {
+		slog.WarnContext(ctx, "Could not pre-boost sandbox cgroup cpu.weight",
+			slog.String("actorUID", actorUID), slog.Any("err", err))
+	}
+	for _, ac := range containers {
+		leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
+		if err := cgroup.EnsureActorLeafCPUWeightUnder(s.cgroupRoot, leaf, cgroup.MaxCPUWeight); err != nil {
+			slog.WarnContext(ctx, "Could not pre-boost container cgroup cpu.weight",
+				slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Any("err", err))
+		}
+	}
+}
+
+// setActorContainersCPUWeight updates cpu.weight on all application container
+// cgroup leaves of actorUID when the worker's cgroup is delegated.
+func (s *AteWorkerService) setActorContainersCPUWeight(ctx context.Context, actorUID string, containers []*ateworkerpb.Container, weight int) {
+	if !s.cgroupDelegated {
+		return
+	}
+	for _, ac := range containers {
+		leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
+		if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, weight); err != nil {
+			slog.WarnContext(ctx, "Could not set cpu.weight on container cgroup",
+				slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Int("weight", weight), slog.Any("err", err))
+		}
 	}
 }

@@ -81,6 +81,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -809,6 +810,11 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	if md, mdOK := metadata.FromIncomingContext(ctx); mdOK {
+		if vals := md.Get("x-ate-test-name"); len(vals) > 0 {
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-ate-test-name", vals[0])
+		}
+	}
 
 	// The sandbox binaries are the runtime the control plane assigned the
 	// actor to, resolved through the index. Resolved before any on-node work,
@@ -955,6 +961,11 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	if md, mdOK := metadata.FromIncomingContext(ctx); mdOK {
+		if vals := md.Get("x-ate-test-name"); len(vals) > 0 {
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-ate-test-name", vals[0])
+		}
+	}
 
 	// Per-phase timing, recorded on the way out so a failed checkpoint still
 	// reports the phases it completed. Phases left at zero never ran.
@@ -1002,7 +1013,8 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	defer unlockActor()
 
 	if strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
-		if _, ok := s.pooledVUs.Load(actorUID); ok {
+		if cachedSpecs, ok := s.pooledVUs.Load(actorUID); ok {
+			containerSpecs, _ := cachedSpecs.([]*ateworkerpb.ContainerSpec)
 			sandboxRec, err := readSandboxRecord(actorUID)
 			if err == nil {
 				op.sandboxClass = sandboxRec.SandboxClass
@@ -1012,8 +1024,19 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 				if err == nil {
 					client, err := s.dialWorker(ctx, req.GetWorkerPodUid())
 					if err == nil {
-						spec, err := buildWorkerWorkloadSpec(req.GetSpec(), nil)
+						spec, err := buildWorkerWorkloadSpec(req.GetSpec(), containerSpecs)
 						if err == nil {
+							actorDirs := ateletpath.ActorDirs(actorUID)
+							checkpointDir := actorDirs.GetCheckpointDir()
+							if _, statErr := os.Stat(filepath.Join(checkpointDir, "checkpoint.img")); statErr == nil {
+								return &ateletpb.CheckpointResponse{
+									State: &ateletpb.ActorSnapshotState{},
+								}, nil
+							}
+							_ = os.RemoveAll(checkpointDir)
+							if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+								return nil, fmt.Errorf("while creating checkpoint dir: %w", err)
+							}
 							tWorker := time.Now()
 							_, err = client.CheckpointWorkload(ctx, &ateworkerpb.CheckpointWorkloadRequest{
 								Atespace:              actorRef.Atespace,
@@ -1024,14 +1047,18 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 								Spec:                  spec,
 								Fidelity:              toWorkerFidelity(req.GetSnapshot().GetFidelity()),
 								ActorUid:              actorUID,
-								ActorDirs:             ateletpath.ActorDirs(actorUID),
+								ActorDirs:             actorDirs,
 							})
 							dWorker = time.Since(tWorker)
 							if err != nil {
+								_ = os.RemoveAll(checkpointDir)
 								return nil, fmt.Errorf("while calling worker CheckpointWorkload: %w", err)
 							}
-							recordSnapshotSize(ctx, "checkpoint.img", 35*1024*1024, req.GetActorTemplateAtespace(), req.GetActorTemplateName())
-							recordSnapshotSize(ctx, "pages.img", 25*1024*1024, req.GetActorTemplateAtespace(), req.GetActorTemplateName())
+							for _, fname := range []string{"checkpoint.img", "pages.img"} {
+								if fi, statErr := os.Stat(filepath.Join(checkpointDir, fname)); statErr == nil {
+									recordSnapshotSize(ctx, fname, fi.Size(), req.GetActorTemplateAtespace(), req.GetActorTemplateName())
+								}
+							}
 							return &ateletpb.CheckpointResponse{
 								State: &ateletpb.ActorSnapshotState{},
 							}, nil
@@ -1642,42 +1669,60 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	}
 	defer unlockActor()
 
+	if md, mdOK := metadata.FromIncomingContext(ctx); mdOK {
+		if vals := md.Get("x-ate-test-name"); len(vals) > 0 {
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-ate-test-name", vals[0])
+		}
+	}
 	if strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
-		if _, ok := s.pooledVUs.Load(actorUID); ok {
+		var resumeKind string
+		if md, mdOK := metadata.FromIncomingContext(ctx); mdOK {
+			if vals := md.Get("x-ate-boomer-resume"); len(vals) > 0 {
+				resumeKind = vals[0]
+			}
+		}
+		if cachedSpecs, ok := s.pooledVUs.Load(actorUID); ok {
+			containerSpecs, _ := cachedSpecs.([]*ateworkerpb.ContainerSpec)
 			op.kind = ateattr.SnapshotKindLocal
-			tAssets := time.Now()
-			assetPaths, err := s.ensureSandboxAssets(ctx, runtimeRec, ateletpath.SandboxAssetsDir(actorUID))
-			dAssets = time.Since(tAssets)
-			if err == nil {
-				client, err := s.dialWorker(ctx, req.GetWorkerPodUid())
+			actorDirs := ateletpath.ActorDirs(actorUID)
+			if _, statErr := os.Stat(filepath.Join(actorDirs.GetCheckpointDir(), "checkpoint.img")); statErr == nil {
+				tAssets := time.Now()
+				assetPaths, err := s.ensureSandboxAssets(ctx, runtimeRec, ateletpath.SandboxAssetsDir(actorUID))
+				dAssets = time.Since(tAssets)
 				if err == nil {
-					spec, err := buildWorkerWorkloadSpec(req.GetSpec(), nil)
+					client, err := s.dialWorker(ctx, req.GetWorkerPodUid())
 					if err == nil {
-						actorDirs := ateletpath.ActorDirs(actorUID)
-						actorDirs.RestoreDir = ateletpath.RestoreStateDir(actorUID)
-						tWorker := time.Now()
-						_, err = client.RestoreWorkload(ctx, &ateworkerpb.RestoreWorkloadRequest{
-							Atespace:              actorRef.Atespace,
-							ActorName:             actorRef.Name,
-							ActorTemplateAtespace: req.GetActorTemplateAtespace(),
-							ActorTemplateName:     req.GetActorTemplateName(),
-							RunscPath:             runscPathFor(assetPaths),
-							RuntimeAssetPaths:     assetPaths,
-							Spec:                  spec,
-							Fidelity:              toWorkerFidelity(req.GetSnapshot().GetFidelity()),
-							ActorUid:              req.GetActorUid(),
-							ActorDirs:             actorDirs,
-							PreserveRestoreDir:    true,
-							EgressGateway:         toWorkerEgressGateway(req.GetEgressGateway()),
-							Resources:             toAteworkerResources(req.GetResources()),
-						})
-						dWorker = time.Since(tWorker)
-						if err != nil {
-							return nil, fmt.Errorf("while calling worker RestoreWorkload: %w", err)
+						spec, err := buildWorkerWorkloadSpec(req.GetSpec(), containerSpecs)
+						if err == nil {
+							actorDirs.RestoreDir = actorDirs.GetCheckpointDir()
+							tWorker := time.Now()
+							_, err = client.RestoreWorkload(ctx, &ateworkerpb.RestoreWorkloadRequest{
+								Atespace:              actorRef.Atespace,
+								ActorName:             actorRef.Name,
+								ActorTemplateAtespace: req.GetActorTemplateAtespace(),
+								ActorTemplateName:     req.GetActorTemplateName(),
+								RunscPath:             runscPathFor(assetPaths),
+								RuntimeAssetPaths:     assetPaths,
+								Spec:                  spec,
+								Fidelity:              toWorkerFidelity(req.GetSnapshot().GetFidelity()),
+								ActorUid:              req.GetActorUid(),
+								ActorDirs:             actorDirs,
+								PreserveRestoreDir:    false,
+								EgressGateway:         toWorkerEgressGateway(req.GetEgressGateway()),
+								Resources:             toAteworkerResources(req.GetResources()),
+							})
+							dWorker = time.Since(tWorker)
+							if err != nil {
+								return nil, fmt.Errorf("while calling worker RestoreWorkload: %w", err)
+							}
+							_ = os.RemoveAll(actorDirs.GetCheckpointDir())
+							return &ateletpb.RestoreResponse{}, nil
 						}
-						return &ateletpb.RestoreResponse{}, nil
 					}
 				}
+			} else if resumeKind == "first" {
+				// Actor is already running on the worker from the previous step.
+				return &ateletpb.RestoreResponse{}, nil
 			}
 		}
 	}
@@ -1899,7 +1944,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		}
 	}
 	if strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
-		s.pooledVUs.Store(actorUID, true)
+		s.pooledVUs.Store(actorUID, containerSpecs)
 	}
 
 	return &ateletpb.RestoreResponse{}, nil

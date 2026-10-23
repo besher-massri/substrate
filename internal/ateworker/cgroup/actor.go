@@ -143,6 +143,20 @@ func SetActorLeafCPUWeightUnder(root, name string, weight int) error {
 	return setCPUWeight(path, weight)
 }
 
+// EnsureActorLeafCPUWeightUnder creates the named cgroup leaf directory under
+// root if it does not already exist and sets its cpu.weight to weight so runsc
+// inherits the pre-boosted CPU weight from the start of container creation.
+func EnsureActorLeafCPUWeightUnder(root, name string, weight int) error {
+	path, err := actorLeafPath(root, name)
+	if err != nil {
+		return err
+	}
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("while creating cgroup %q: %w", path, err)
+	}
+	return setCPUWeight(path, weight)
+}
+
 // setCPUWeight validates weight and writes it to the cpu.weight interface file
 // in cgroupDir when the cpu controller is present.
 func setCPUWeight(cgroupDir string, weight int) error {

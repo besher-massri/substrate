@@ -93,6 +93,55 @@ func CreateNamed(name string) (Handle, error) {
 	return interiorNetNS, nil
 }
 
+// CreateAnonymous creates a new unnamed network namespace and returns its
+// handle without touching /run/netns, restoring the caller's current network
+// namespace before returning.
+func CreateAnonymous() (Handle, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	curNetNS, err := vishnetns.Get()
+	if err != nil {
+		return -1, fmt.Errorf("while getting current netns: %w", err)
+	}
+	defer curNetNS.Close()
+	defer func() {
+		if err := vishnetns.Set(curNetNS); err != nil {
+			panic(fmt.Sprintf("Failed to restore original netns: %v", err))
+		}
+	}()
+
+	anonNetNS, err := vishnetns.New()
+	if err != nil {
+		return -1, fmt.Errorf("while creating anonymous network namespace: %w", err)
+	}
+	return anonNetNS, nil
+}
+
+// BindNamed bind-mounts an open network namespace handle onto /run/netns/<name>
+// so external processes such as runsc can open it by path. Any leftover mount
+// or file at that name is removed first.
+func BindNamed(name string, ns Handle) error {
+	if err := RemoveNamed(name); err != nil {
+		return fmt.Errorf("while removing the leftover netns %s: %w", name, err)
+	}
+	if err := os.MkdirAll("/run/netns", 0o755); err != nil {
+		return fmt.Errorf("while creating /run/netns: %w", err)
+	}
+	dstPath := filepath.Join("/run/netns", name)
+	f, err := os.OpenFile(dstPath, os.O_RDONLY|os.O_CREATE|os.O_EXCL, 0o444)
+	if err != nil {
+		return fmt.Errorf("while creating netns mount target %s: %w", dstPath, err)
+	}
+	_ = f.Close()
+	srcPath := fmt.Sprintf("/proc/self/fd/%d", int(ns))
+	if err := unix.Mount(srcPath, dstPath, "none", unix.MS_BIND, ""); err != nil {
+		_ = os.Remove(dstPath)
+		return fmt.Errorf("while bind-mounting netns %s to %s: %w", srcPath, dstPath, err)
+	}
+	return nil
+}
+
 // RemoveNamed unmounts and unlinks a name under /run/netns, without following
 // it if it is a symlink. A name that is already gone is not an error, and the
 // namespace itself survives for as long as something holds it open.

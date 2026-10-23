@@ -55,6 +55,9 @@ type runsc struct {
 	containers []*ateworkerpb.Container
 	// flags holds the configured flags; must not be nil.
 	flags *flagStore
+	// writtenSpecs tracks container names whose OCI config.json has already been
+	// generated and written for this runsc operation.
+	writtenSpecs sync.Map
 }
 
 // buildArgs constructs the runsc argument vector for command, appending
@@ -126,7 +129,20 @@ func (r *runsc) writeSpec(containerName string) error {
 		DurableVolumes: r.durableVolumes,
 		Size:           r.size,
 	})
-	return ocispec.Save(bundlePath, spec)
+	if err := ocispec.Save(bundlePath, spec); err != nil {
+		return err
+	}
+	r.writtenSpecs.Store(containerName, true)
+	return nil
+}
+
+// ensureSpecWritten writes the container's OCI spec if it has not already been
+// written for this runsc operation.
+func (r *runsc) ensureSpecWritten(containerName string) error {
+	if _, ok := r.writtenSpecs.Load(containerName); ok {
+		return nil
+	}
+	return r.writeSpec(containerName)
 }
 
 // createArgs builds the argv for `runsc create <container>`. Factored out so
@@ -143,7 +159,7 @@ func (r *runsc) createArgs(containerName string, additionalArgs []string) []stri
 func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName string, additionalArgs []string) error {
 	slog.InfoContext(ctx, "About to run runsc create", slog.String("container", containerName))
 
-	if err := r.writeSpec(containerName); err != nil {
+	if err := r.ensureSpecWritten(containerName); err != nil {
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 
@@ -239,7 +255,7 @@ func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
 func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, checkpointPath string) error {
 	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
 
-	if err := r.writeSpec(containerName); err != nil {
+	if err := r.ensureSpecWritten(containerName); err != nil {
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 

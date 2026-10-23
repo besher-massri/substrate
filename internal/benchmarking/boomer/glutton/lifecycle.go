@@ -238,7 +238,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 				stub:        stub,
 				httpSem:     r.httpSem,
 				actorName:   fmt.Sprintf("sb-cold-%d", actorNum),
-				firstResume: true,
+				firstResume: i == 0,
 				cpuLoaded:   i > 0,
 			}
 			if i == 0 {
@@ -644,6 +644,9 @@ func (u *gluttonActor) delete(ctx context.Context) {
 // time from ateinterceptors.ServerUnaryInterceptor's trailer, when present,
 // goes on the span only: it measures the last attempt alone.
 func (u *gluttonActor) tracedCall(ctx context.Context, name string, do func(context.Context, *metadata.MD) error) error {
+	if testName := os.Getenv("BOOMER_TEST_NAME"); testName != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-ate-test-name", testName)
+	}
 	ctx, span := u.cfg.Tracer.Start(ctx, name)
 	defer span.End()
 
