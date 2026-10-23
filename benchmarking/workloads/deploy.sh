@@ -267,11 +267,94 @@ wait_templates_ready() {
   done
 }
 
+# run_cold_actor_seed_job runs an Indexed Kubernetes Job in the benchmarking
+# namespace that invokes boomer-worker to register cold actors via real
+# CreateActor gRPC calls against ate-api-server.
+run_cold_actor_seed_job() {
+  local total_actors="$1"
+  local shard_count="$2"
+  local completions="$3"
+  local start_idx="${4:-0}"
+
+  kubectl create namespace benchmarking --dry-run=client -o yaml | kubectl apply -f -
+  kubectl label namespace benchmarking ate.dev/api-access=true --overwrite
+  kubectl create serviceaccount benchmark-runner --namespace=benchmarking --dry-run=client -o yaml | kubectl apply -f -
+  kubectl delete job seed-cold-actors --namespace=benchmarking --ignore-not-found
+
+  hack/run-tool.sh ko apply -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-cold-actors
+  namespace: benchmarking
+spec:
+  completions: ${completions}
+  parallelism: ${completions}
+  completionMode: Indexed
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: seed-cold-actors
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: benchmark-runner
+      tolerations:
+      - key: ate.dev/benchmarking
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: seeder
+        image: ko://go.ate.dev/substrate/cmd/benchmarking/boomer-worker
+        args:
+        - "--seed-cold-actors=${total_actors}"
+        - "--seed-start=${start_idx}"
+        - "--seed-count=${shard_count}"
+        - "--seed-concurrency=256"
+        - "--seed-atespace=benchmark"
+        - "--seed-template=benchmark-workloads/glutton"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "2Gi"
+        volumeMounts:
+        - name: servicedns-ca
+          mountPath: /run/servicedns-ca
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+          readOnly: true
+      volumes:
+      - name: servicedns-ca
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: ca.crt
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+EOF
+
+  kubectl wait --for=condition=Complete job/seed-cold-actors \
+    --namespace=benchmarking --timeout=3600s
+  kubectl delete job seed-cold-actors --namespace=benchmarking --ignore-not-found
+}
+
 # prepopulate_cold_actors seeds 100,000,000 cold registered actors in PostgreSQL
-# substrate.actors before the benchmark runner Job starts when
-# ENVELOPE_PHASE1_DB_WORKAROUNDS=true, ensuring 100,000,000 total registered
-# actors exist in PostgreSQL during active rotation without background
-# CreateActor load competing with ResumeActor and SuspendActor.
+# substrate.actors via real CreateActor gRPC calls before the benchmark runner
+# Job starts when ENVELOPE_PHASE1_DB_WORKAROUNDS=true, ensuring 100,000,000
+# total registered actors exist in PostgreSQL during active rotation without
+# background CreateActor load competing with ResumeActor and SuspendActor.
 prepopulate_cold_actors() {
   if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" != "true" ]]; then
     return 0
@@ -282,75 +365,57 @@ prepopulate_cold_actors() {
 
   local existing_actors
   existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
-    psql -U postgres -d atepg -Atc "SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%'" 2>/dev/null || echo 0)"
-  echo "Current cold registered actors in benchmark atespace: ${existing_actors}"
+    psql -U postgres -d atepg -Atc "SELECT CASE WHEN (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS DISTINCT FROM (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-2') AND (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS NOT NULL THEN (SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%') ELSE 0 END" 2>/dev/null || echo 0)"
+  echo "Current gRPC-created cold registered actors in benchmark atespace: ${existing_actors}"
   if ((existing_actors >= 100000000)); then
-    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; skipping re-insert."
-    return 0
-  fi
-  kubectl exec -n ate-system postgres-0 -c postgres -- \
-    psql -U postgres -d atepg -c "SET ROLE substrate_owner; DELETE FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0';" >/dev/null 2>&1 || true
-  run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
-  if ((existing_actors >= 99000000)); then
-    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; ensuring 100,000,001 rows and cleaning non-cold actors."
+    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; cleaning non-cold actors."
     kubectl exec -n ate-system postgres-0 -c postgres -- \
       psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
         SET ROLE substrate_owner;
         SET search_path TO substrate;
         SET synchronous_commit = off;
         DELETE FROM actors WHERE atespace = 'benchmark' AND name NOT LIKE 'sb-cold-%';
-        INSERT INTO actors (atespace, name, uid, version, proto)
-        SELECT 'benchmark', 'sb-cold-' || i, p.uid, p.version, p.proto
-        FROM (SELECT uid, version, proto FROM actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0' LIMIT 1) p,
-             generate_series(99000001, 100000000) AS i
-        ON CONFLICT (atespace, name) DO NOTHING;
       "
     return 0
   fi
+  if ((existing_actors >= 99000000)); then
+    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; topping up to 100,000,000 via CreateActor gRPC..."
+    kubectl exec -n ate-system postgres-0 -c postgres -- \
+      psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
+        SET ROLE substrate_owner;
+        SET search_path TO substrate;
+        SET synchronous_commit = off;
+        DELETE FROM actors WHERE atespace = 'benchmark' AND name NOT LIKE 'sb-cold-%';
+      "
+    run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
+    run_cold_actor_seed_job 100000000 1000000 1 99000001
+    return 0
+  fi
 
-  echo "Pre-populating 100,000,000 cold registered actors in substrate.actors..."
+  echo "Pre-populating 100,000,000 cold registered actors via CreateActor gRPC..."
   kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
       SET ROLE substrate_owner;
       SET search_path TO substrate;
       ALTER TABLE actor_egress_policies DROP CONSTRAINT IF EXISTS actor_egress_policies_atespace_actor_name_fkey;
       ALTER TABLE actors DROP CONSTRAINT IF EXISTS actors_atespace_fkey;
-      ALTER TABLE actors DROP CONSTRAINT IF EXISTS actors_pkey;
       ALTER TABLE actor_egress_policies SET UNLOGGED;
       ALTER TABLE actors SET UNLOGGED;
-      DELETE FROM actors WHERE atespace = 'benchmark' AND name <> 'sb-cold-0';
+      CREATE TEMP TABLE keep_actors AS SELECT * FROM actors WHERE atespace <> 'benchmark';
+      CREATE TEMP TABLE keep_egress AS SELECT * FROM actor_egress_policies WHERE atespace <> 'benchmark';
+      TRUNCATE TABLE actor_egress_policies, actors;
+      INSERT INTO actors SELECT * FROM keep_actors;
+      INSERT INTO actor_egress_policies SELECT * FROM keep_egress;
     "
+  run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
 
-  local chunk=6250000
-  local pids=()
-  local w start_i end_i pid
-  for w in $(seq 0 15); do
-    start_i=$((w * chunk + 1))
-    end_i=$(((w + 1) * chunk))
-    kubectl exec -n ate-system postgres-0 -c postgres -- \
-      psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
-        SET ROLE substrate_owner;
-        SET search_path TO substrate;
-        SET synchronous_commit = off;
-        INSERT INTO actors (atespace, name, uid, version, proto)
-        SELECT 'benchmark', 'sb-cold-' || i, p.uid, p.version, p.proto
-        FROM (SELECT uid, version, proto FROM actors WHERE atespace = 'benchmark' AND name = 'sb-cold-0' LIMIT 1) p,
-             generate_series(${start_i}, ${end_i}) AS i;
-      " &
-    pids+=("$!")
-  done
-  for pid in "${pids[@]}"; do
-    wait "${pid}"
-  done
+  run_cold_actor_seed_job 100000000 6250000 16 0
 
-  echo "Rebuilding primary key index and foreign keys on substrate.actors (100,000,001 rows)..."
+  echo "Restoring foreign keys and analyzing substrate.actors (100,000,001 rows)..."
   kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
       SET ROLE substrate_owner;
       SET search_path TO substrate;
-      SET maintenance_work_mem = '16GB';
-      SET max_parallel_maintenance_workers = 32;
-      ALTER TABLE actors ADD PRIMARY KEY (atespace, name);
       ALTER TABLE actors ADD CONSTRAINT actors_atespace_fkey
         FOREIGN KEY (atespace) REFERENCES atespaces(name) ON DELETE RESTRICT NOT VALID;
       ALTER TABLE actor_egress_policies ADD CONSTRAINT actor_egress_policies_atespace_actor_name_fkey

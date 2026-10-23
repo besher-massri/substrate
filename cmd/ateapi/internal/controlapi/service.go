@@ -17,6 +17,7 @@ package controlapi
 import (
 	"context"
 	"sync"
+	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"go.ate.dev/substrate/cmd/ateapi/internal/workercache"
@@ -169,6 +170,16 @@ func (s *RPCService) GetPlugin(ctx context.Context, driverName string) (volume.V
 	return csiPlugin, nil
 }
 
+type cachedTemplateEntry struct {
+	tmpl      *ateapipb.ActorTemplate
+	expiresAt time.Time
+}
+
+type cachedTagEntry struct {
+	tag       *ateapipb.Tag
+	expiresAt time.Time
+}
+
 // ServiceImpl implements store.Interface and provides the "middleware" layer
 // between the RPC and storage layers.  It enforces invariants and validation
 // rules, and may implement additional logic beyond the storage layer.
@@ -184,6 +195,11 @@ type ServiceImpl struct {
 	// clusterSnapshotLocation is ate-api-server's --snapshot-location; see
 	// resolveSnapshotLocation.
 	clusterSnapshotLocation string
+
+	templateCacheMu sync.RWMutex
+	templateCache   map[resources.ActorTemplateRef]cachedTemplateEntry
+	tagCacheMu      sync.RWMutex
+	tagCache        map[resources.TagRef]cachedTagEntry
 }
 
 var _ store.Interface = (*ServiceImpl)(nil)

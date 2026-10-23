@@ -79,13 +79,78 @@ func (s *RPCService) CreateActor(ctx context.Context, req *ateapipb.CreateActorR
 	return stored, err
 }
 
+// resolveActorTemplateCached resolves the ActorTemplate referenced by inActor,
+// consulting a short-lived (2s TTL) in-memory cache when
+// ENVELOPE_PHASE1_DB_WORKAROUNDS=true so high-throughput CreateActor seeding
+// does not issue redundant per-actor PostgreSQL SELECTs for the shared template.
+func (s *ServiceImpl) resolveActorTemplateCached(ctx context.Context, inActor *ateapipb.Actor) (*ateapipb.ActorTemplate, error) {
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true" {
+		return resolveActorTemplate(ctx, s.store, inActor)
+	}
+	ref := resources.ActorTemplateRefFromObjectRef(inActor.GetActorTemplate())
+	now := time.Now()
+	s.templateCacheMu.RLock()
+	if entry, ok := s.templateCache[ref]; ok && now.Before(entry.expiresAt) {
+		s.templateCacheMu.RUnlock()
+		return entry.tmpl, nil
+	}
+	s.templateCacheMu.RUnlock()
+
+	tmpl, err := resolveActorTemplate(ctx, s.store, inActor)
+	if err != nil {
+		return nil, err
+	}
+	s.templateCacheMu.Lock()
+	if s.templateCache == nil {
+		s.templateCache = make(map[resources.ActorTemplateRef]cachedTemplateEntry)
+	}
+	s.templateCache[ref] = cachedTemplateEntry{
+		tmpl:      tmpl,
+		expiresAt: now.Add(2 * time.Second),
+	}
+	s.templateCacheMu.Unlock()
+	return tmpl, nil
+}
+
+// getTagCached fetches a Tag by reference, consulting a short-lived (2s TTL)
+// in-memory cache when ENVELOPE_PHASE1_DB_WORKAROUNDS=true so high-throughput
+// CreateActor seeding does not issue redundant per-actor PostgreSQL SELECTs for
+// the template's golden tag.
+func (s *ServiceImpl) getTagCached(ctx context.Context, ref resources.TagRef) (*ateapipb.Tag, error) {
+	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true" {
+		return s.store.GetTag(ctx, ref)
+	}
+	now := time.Now()
+	s.tagCacheMu.RLock()
+	if entry, ok := s.tagCache[ref]; ok && now.Before(entry.expiresAt) {
+		s.tagCacheMu.RUnlock()
+		return entry.tag, nil
+	}
+	s.tagCacheMu.RUnlock()
+
+	tag, err := s.store.GetTag(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	s.tagCacheMu.Lock()
+	if s.tagCache == nil {
+		s.tagCache = make(map[resources.TagRef]cachedTagEntry)
+	}
+	s.tagCache[ref] = cachedTagEntry{
+		tag:       tag,
+		expiresAt: now.Add(2 * time.Second),
+	}
+	s.tagCacheMu.Unlock()
+	return tag, nil
+}
+
 func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) (*ateapipb.Actor, error) {
 	// Check that the referenced ActorTemplate exists.
 	// FIXME: This is not atomic and it is not a guarantee that the template
 	// will still exist later.  Checking it here produces a nice error UX, but
 	// we still have to handle the template not existing later, which makes the
 	// UX inconsistent, at best.  Is it actually worth checking at all?
-	template, err := resolveActorTemplate(ctx, s.store, inActor)
+	template, err := s.resolveActorTemplateCached(ctx, inActor)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +235,7 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 
 	// Without this an actor that is created and never resumed has no record at
 	// all, at any retention.
-	if !(os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && strings.HasPrefix(name, "sb-bg-")) {
+	if !(os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && (strings.HasPrefix(name, "sb-bg-") || strings.HasPrefix(name, "sb-cold-"))) {
 		logActorStateChanged(ctx, stored, ateattr.OperationCreate)
 	}
 
@@ -181,7 +246,7 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 // and checks that the tag is usable for creating an Actor in actorAtespace
 // from template.
 func (s *ServiceImpl) resolveTagSource(ctx context.Context, actorAtespace string, tagRef *ateapipb.ObjectRef, template *ateapipb.ActorTemplate) (*ateapipb.Tag, error) {
-	tag, err := s.store.GetTag(ctx, resources.TagRefFromObjectRef(tagRef))
+	tag, err := s.getTagCached(ctx, resources.TagRefFromObjectRef(tagRef))
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, apierror.FailedPrecondition("Tag not found")
 	}

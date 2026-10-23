@@ -19,7 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,28 +38,49 @@ type createActorReq struct {
 	done       chan error
 }
 
+// buildBatchInsertActorsSQL constructs a multi-row PostgreSQL INSERT statement
+// for n rows without fmt.Fprintf formatting overhead.
+func buildBatchInsertActorsSQL(n int) string {
+	const prefix = "INSERT INTO actors (atespace, name, uid, version, proto) VALUES "
+	const suffix = " ON CONFLICT (atespace, name) DO NOTHING"
+	buf := make([]byte, 0, len(prefix)+len(suffix)+n*32)
+	buf = append(buf, prefix...)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		base := int64(i * 5)
+		buf = append(buf, "($"...)
+		buf = strconv.AppendInt(buf, base+1, 10)
+		buf = append(buf, ",$"...)
+		buf = strconv.AppendInt(buf, base+2, 10)
+		buf = append(buf, ",$"...)
+		buf = strconv.AppendInt(buf, base+3, 10)
+		buf = append(buf, ",$"...)
+		buf = strconv.AppendInt(buf, base+4, 10)
+		buf = append(buf, ",$"...)
+		buf = strconv.AppendInt(buf, base+5, 10)
+		buf = append(buf, ')')
+	}
+	buf = append(buf, suffix...)
+	return string(buf)
+}
+
 // batchInsertActors flushes a slice of createActorReq in a single multi-row
 // INSERT statement so high-concurrency actor registration amortizes PostgreSQL
-// round-trip and WAL commit overhead across up to 256 rows.
+// round-trip and WAL commit overhead across up to 1024 rows.
 func (p *Persistence) batchInsertActors(batch []*createActorReq) {
 	if len(batch) == 0 {
 		return
 	}
-	var sb strings.Builder
-	sb.WriteString("INSERT INTO actors (atespace, name, uid, version, proto) VALUES ")
+	query := buildBatchInsertActorsSQL(len(batch))
 	args := make([]any, 0, len(batch)*5)
-	for i, req := range batch {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		base := i * 5
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5)
+	for _, req := range batch {
 		args = append(args, req.atespace, req.name, req.uid, req.version, req.protoBytes)
 	}
-	sb.WriteString(" ON CONFLICT (atespace, name) DO NOTHING")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	_, err := p.pool.Exec(ctx, sb.String(), args...)
+	_, err := p.pool.Exec(ctx, query, args...)
 	cancel()
 	for _, req := range batch {
 		req.done <- err
@@ -67,9 +88,9 @@ func (p *Persistence) batchInsertActors(batch []*createActorReq) {
 }
 
 // runCreateActorBatcher collects CreateActor requests from createBatchCh and
-// flushes them in multi-row batches of up to 256 actors or every 2ms.
+// flushes them in multi-row batches of up to 1024 actors or every 2ms.
 func (p *Persistence) runCreateActorBatcher() {
-	const maxBatch = 256
+	const maxBatch = 1024
 	const flushInterval = 2 * time.Millisecond
 	batch := make([]*createActorReq, 0, maxBatch)
 	timer := time.NewTimer(flushInterval)
@@ -138,7 +159,7 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
 		p.createBatchOnce.Do(func() {
 			p.createBatchCh = make(chan *createActorReq, 65536)
-			for i := 0; i < 16; i++ {
+			for i := 0; i < 32; i++ {
 				go p.runCreateActorBatcher()
 			}
 		})

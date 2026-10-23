@@ -26,7 +26,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/myzhan/boomer"
@@ -35,6 +38,9 @@ import (
 	bmetrics "go.ate.dev/substrate/internal/benchmarking/boomer/metrics"
 	btrace "go.ate.dev/substrate/internal/benchmarking/boomer/trace"
 	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	// Register user classes via init():
 	"go.ate.dev/substrate/internal/benchmarking/boomer/agentsession"
@@ -60,6 +66,12 @@ func main() {
 		spawnConcurrency        = flag.Int("spawn-concurrency", 1, "Number of actors created concurrently (spawn benchmark).")
 		actorDeadline           = flag.Float64("actor-deadline", 120, "Per-actor timeout in seconds covering CreateActor + ResumeActor + Ping (spawn benchmark).")
 		httpMaxIdleConnsPerHost = flag.Int("http-max-idle-conns-per-host", 30000, "Idle HTTP connections the router client keeps per host. Set it to at least the number of users this worker runs, so each VU reuses its connection to the router across wakes instead of opening a new one per request.")
+		seedColdTotal           = flag.Int("seed-cold-actors", 0, "If > 0, seed cold actors via CreateActor gRPC and exit.")
+		seedStart               = flag.Int("seed-start", 0, "1-based starting actor index for --seed-cold-actors (or computed from JOB_COMPLETION_INDEX when 0).")
+		seedCount               = flag.Int("seed-count", 0, "Number of cold actors for this shard to create when --seed-cold-actors > 0.")
+		seedConcurrency         = flag.Int("seed-concurrency", 256, "Number of concurrent CreateActor gRPC streams per pod when --seed-cold-actors > 0.")
+		seedAtespace            = flag.String("seed-atespace", "benchmark", "Target atespace for --seed-cold-actors.")
+		seedTemplate            = flag.String("seed-template", "benchmark-workloads/glutton", "Target ActorTemplate (atespace/name) for --seed-cold-actors.")
 	)
 	// boomer.Run will call flag.Parse() if we haven't yet; calling here so
 	// our flag-derived values are usable before that.
@@ -102,6 +114,38 @@ func main() {
 		b := agentsession.Budgets(s.Steps)
 		fmt.Printf("agent-session script %q: %d steps, declares %s RAM + %s disk, min_actor_memory %s\n",
 			s.Name, len(s.Steps), agentsession.FormatSize(b.RAM), agentsession.FormatSize(b.Disk), agentsession.FormatSize(s.MinActorMemory))
+		return
+	}
+
+	if *seedColdTotal > 0 {
+		startIdx := *seedStart
+		count := *seedCount
+		if count <= 0 {
+			count = *seedColdTotal
+		}
+		if startIdx <= 0 {
+			compIdx := 0
+			if idxStr := os.Getenv("JOB_COMPLETION_INDEX"); idxStr != "" {
+				parsed, err := strconv.Atoi(idxStr)
+				if err != nil {
+					slog.Error("invalid JOB_COMPLETION_INDEX", slog.String("val", idxStr), slog.String("err", err.Error()))
+					os.Exit(1)
+				}
+				compIdx = parsed
+			}
+			startIdx = compIdx*count + 1
+			if startIdx+count-1 > *seedColdTotal {
+				count = max(0, *seedColdTotal-startIdx+1)
+			}
+		}
+		if count == 0 {
+			slog.Info("seed-cold-actors shard has 0 actors to create; exiting")
+			return
+		}
+		if err := seedColdActors(context.Background(), *apiEndpoint, *seedAtespace, *seedTemplate, startIdx, count, *seedConcurrency); err != nil {
+			slog.Error("seed-cold-actors failed", slog.String("err", err.Error()))
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -262,4 +306,101 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	shutdownFn(shutdownCtx)
+}
+
+// seedColdActors registers a contiguous range of cold actors (sb-cold-<startIdx>
+// through sb-cold-<startIdx+count-1>) via real CreateActor gRPC calls against
+// ate-api-server using the given concurrency and gRPC connection pool.
+func seedColdActors(ctx context.Context, apiEndpoint, atespace, templateRef string, startIdx, count, concurrency int) error {
+	parts := strings.SplitN(templateRef, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid --seed-template %q: want <atespace>/<name>", templateRef)
+	}
+	tmplAtespace, tmplName := parts[0], parts[1]
+
+	conns, stubs, err := boomerutil.DialControlPool(apiEndpoint, 24)
+	if err != nil {
+		return fmt.Errorf("dialing ateapi (%s): %w", apiEndpoint, err)
+	}
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+
+	_, err = stubs[0].CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{
+		Atespace: &ateapipb.Atespace{
+			Metadata: &ateapipb.ResourceMetadata{Name: atespace},
+		},
+	})
+	if err != nil && status.Code(err) != codes.AlreadyExists {
+		return fmt.Errorf("creating atespace %q: %w", atespace, err)
+	}
+
+	var nextOffset atomic.Int64
+	var completed atomic.Int64
+	var errOnce sync.Once
+	var firstErr error
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	startTime := time.Now()
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		stub := stubs[w%len(stubs)]
+		go func() {
+			defer wg.Done()
+			for {
+				off := int(nextOffset.Add(1) - 1)
+				if off >= count || ctx.Err() != nil {
+					return
+				}
+				actorIdx := startIdx + off
+				actorName := "sb-cold-" + strconv.Itoa(actorIdx)
+				var callErr error
+				for attempt := 0; attempt < 6; attempt++ {
+					callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second)
+					_, callErr = stub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
+						Actor: &ateapipb.Actor{
+							Metadata: &ateapipb.ResourceMetadata{
+								Atespace: atespace,
+								Name:     actorName,
+							},
+							ActorTemplate: &ateapipb.ObjectRef{
+								Atespace: tmplAtespace,
+								Name:     tmplName,
+							},
+						},
+					})
+					callCancel()
+					if callErr == nil || status.Code(callErr) == codes.AlreadyExists {
+						callErr = nil
+						break
+					}
+					time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+				}
+				if callErr != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("CreateActor %s/%s failed: %w", atespace, actorName, callErr)
+						cancel()
+					})
+					return
+				}
+				done := completed.Add(1)
+				if done%100000 == 0 || int(done) == count {
+					elapsed := time.Since(startTime).Seconds()
+					rate := float64(done) / max(elapsed, 0.001)
+					slog.Info("seed-cold-actors progress",
+						slog.Int64("completed", done),
+						slog.Int("total", count),
+						slog.Int("start_idx", startIdx),
+						slog.Float64("rate_per_sec", rate),
+					)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }

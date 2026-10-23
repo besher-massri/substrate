@@ -539,14 +539,15 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 
 	var assignedWorker *ateapipb.Worker
 	fastBound := false
+	wName := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName()
 	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
 		os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" &&
 		actor.GetStatus().GetAssignedNode() != "" &&
+		wName != "" &&
 		actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace {
-		wName := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName()
 		if nodeWorkers, nerr := w.workerCache.WorkersByNode(actor.GetStatus().GetAssignedNode()); nerr == nil {
 			for _, nw := range nodeWorkers {
-				if (wName == "" || nw.GetMetadata().GetName() == wName) && nw.GetNodeName() != "" && w.appliesWithFallback(nw, constraints, relaxable) {
+				if nw.GetMetadata().GetName() == wName && nw.GetNodeName() != "" && w.appliesWithFallback(nw, constraints, relaxable) {
 					assignedWorker = nw
 					fastBound = true
 					break
@@ -1026,6 +1027,9 @@ func (w *ActorWorkflow) revertFailedResumeAssignment(ctx context.Context, actorR
 	_, err = w.store.UpdateActor(cleanupCtx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 		toUpdate.Status.WorkerAssignment = nil
+		if !latestSnapshotIsLocal(toUpdate.GetStatus()) {
+			toUpdate.Status.AssignedNode = ""
+		}
 		return nil
 	})
 	if err != nil {

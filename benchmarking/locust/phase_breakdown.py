@@ -25,6 +25,7 @@ Like the cluster facts this is additive: a failure here must never cost the
 locust measurements. Pass --no-phase-breakdown to runner.py to skip it.
 """
 
+import concurrent.futures
 import csv
 import json
 import sys
@@ -81,6 +82,34 @@ def _read_log(v1: client.CoreV1Api, name: str, namespace: str,
     return resp.data.decode("utf-8", errors="replace")
 
 
+def _read_single_pod(v1: client.CoreV1Api, pod: Any, namespace: str,
+                     since_seconds: int) -> tuple[bool, list[str], list[str]]:
+    """Reads current (and, if restarted, previous) logs for a single pod."""
+    name = pod.metadata.name
+    statuses = pod.status.container_statuses or []
+    restarted = any(getattr(c, "restart_count", 0) for c in statuses)
+    notices: list[str] = []
+    try:
+        text = _read_log(v1, name, namespace, since_seconds)
+    except Exception as e:
+        notices.append(
+            f"Notice: could not read logs of {namespace}/{name}: "
+            f"{getattr(e, 'reason', e)}"
+        )
+        return False, [], notices
+    if restarted:
+        # kubelet may have discarded the previous container's log already;
+        # that loses the records before the restart, not the current log.
+        try:
+            text += "\n" + _read_log(v1, name, namespace, since_seconds, previous=True)
+        except Exception as e:
+            notices.append(
+                f"Notice: no previous log for {namespace}/{name}: "
+                f"{getattr(e, 'reason', e)}"
+            )
+    return True, text.splitlines(), notices
+
+
 def read_pod_logs(v1: client.CoreV1Api, namespace: str, label: str,
                   since_seconds: int, logs: TextIO | None = None) -> PodLogs:
     """The log lines of every pod matching label in namespace, from
@@ -98,27 +127,21 @@ def read_pod_logs(v1: client.CoreV1Api, namespace: str, label: str,
                    f"{getattr(e, 'reason', e)}")
         out.pods_failed += 1
         return out
-    for pod in pods:
-        name = pod.metadata.name
-        statuses = pod.status.container_statuses or []
-        restarted = any(getattr(c, "restart_count", 0) for c in statuses)
-        try:
-            text = _read_log(v1, name, namespace, since_seconds)
-        except Exception as e:
-            _log(logs, f"Notice: could not read logs of {namespace}/{name}: "
-                       f"{getattr(e, 'reason', e)}")
+    if not pods:
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(pods))) as pool:
+        results = list(pool.map(
+            lambda pod: _read_single_pod(v1, pod, namespace, since_seconds),
+            pods,
+        ))
+    for ok, lines, notices in results:
+        for msg in notices:
+            _log(logs, msg)
+        if not ok:
             out.pods_failed += 1
             continue
-        if restarted:
-            # kubelet may have discarded the previous container's log already;
-            # that loses the records before the restart, not the current log.
-            try:
-                text += "\n" + _read_log(v1, name, namespace, since_seconds, previous=True)
-            except Exception as e:
-                _log(logs, f"Notice: no previous log for {namespace}/{name}: "
-                           f"{getattr(e, 'reason', e)}")
         out.pods_read += 1
-        out.lines.extend(text.splitlines())
+        out.lines.extend(lines)
     return out
 
 

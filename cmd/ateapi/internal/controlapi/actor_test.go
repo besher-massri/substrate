@@ -23,7 +23,9 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1148,4 +1150,159 @@ func TestMintActorCertificate(t *testing.T) {
 	if diff := cmp.Diff(wantIdentity, identity); diff != "" {
 		t.Errorf("ActorIdentity mismatch (-want +got):\n%s", diff)
 	}
+}
+
+type countingCreateStore struct {
+	store.Interface
+	templateReads atomic.Int64
+	tagReads      atomic.Int64
+	actorCreates  atomic.Int64
+	tmpl          *ateapipb.ActorTemplate
+	tag           *ateapipb.Tag
+}
+
+func (c *countingCreateStore) GetActorTemplate(_ context.Context, _ resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error) {
+	c.templateReads.Add(1)
+	return c.tmpl, nil
+}
+
+func (c *countingCreateStore) GetTag(_ context.Context, _ resources.TagRef) (*ateapipb.Tag, error) {
+	c.tagReads.Add(1)
+	return c.tag, nil
+}
+
+func (c *countingCreateStore) CreateActor(_ context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error) {
+	c.actorCreates.Add(1)
+	out := proto.CloneOf(actor)
+	if out.Metadata == nil {
+		out.Metadata = &ateapipb.ResourceMetadata{}
+	}
+	out.Metadata.Uid = "11111111-2222-4333-8444-555555555555"
+	out.Metadata.Version = 1
+	return out, nil
+}
+
+func TestCreateActor_TemplateAndTagCacheUnderPhase1Workarounds(t *testing.T) {
+	t.Setenv("ENVELOPE_PHASE1_DB_WORKAROUNDS", "true")
+	ctx := context.Background()
+
+	tmplUID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	cs := &countingCreateStore{
+		tmpl: &ateapipb.ActorTemplate{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "benchmark-workloads",
+				Name:     "glutton",
+				Uid:      tmplUID,
+			},
+			Containers: []*ateapipb.Container{{Name: "glutton", Image: "gcr.io/test/glutton:latest"}},
+			Status: &ateapipb.ActorTemplateStatus{
+				GoldenSnapshotStatus: &ateapipb.GoldenSnapshotStatus{
+					GoldenTag: &ateapipb.ObjectRef{
+						Atespace: "benchmark-workloads",
+						Name:     "golden-tag-1",
+					},
+				},
+			},
+		},
+		tag: &ateapipb.Tag{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "benchmark-workloads",
+				Name:     "golden-tag-1",
+			},
+			Scope: ateapipb.TagScope_TAG_SCOPE_PUBLISHED,
+			Status: &ateapipb.TagStatus{
+				ActorTemplateUid: tmplUID,
+				Snapshot:         newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmplUID, "22222222-3333-4444-8555-666666666666", "gs://test-bucket/atespaces/benchmark-workloads/tags/golden-tag-1", ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
+			},
+		},
+	}
+
+	svc := &RPCService{impl: newServiceImpl(cs, nil)}
+	for i := 1; i <= 100; i++ {
+		_, err := svc.CreateActor(ctx, &ateapipb.CreateActorRequest{
+			Actor: &ateapipb.Actor{
+				Metadata: &ateapipb.ResourceMetadata{
+					Atespace: "benchmark",
+					Name:     "sb-cold-" + strconv.Itoa(i),
+				},
+				ActorTemplate: &ateapipb.ObjectRef{
+					Atespace: "benchmark-workloads",
+					Name:     "glutton",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateActor(%d) failed: %v", i, err)
+		}
+	}
+
+	if got := cs.actorCreates.Load(); got != 100 {
+		t.Errorf("actorCreates = %d, want 100", got)
+	}
+	if got := cs.templateReads.Load(); got != 1 {
+		t.Errorf("templateReads = %d, want 1 (cached across 100 CreateActor calls)", got)
+	}
+	if got := cs.tagReads.Load(); got != 1 {
+		t.Errorf("tagReads = %d, want 1 (cached across 100 CreateActor calls)", got)
+	}
+}
+
+func BenchmarkCreateActorCached(b *testing.B) {
+	b.Setenv("ENVELOPE_PHASE1_DB_WORKAROUNDS", "true")
+	ctx := context.Background()
+
+	tmplUID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	cs := &countingCreateStore{
+		tmpl: &ateapipb.ActorTemplate{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "benchmark-workloads",
+				Name:     "glutton",
+				Uid:      tmplUID,
+			},
+			Containers: []*ateapipb.Container{{Name: "glutton", Image: "gcr.io/test/glutton:latest"}},
+			Status: &ateapipb.ActorTemplateStatus{
+				GoldenSnapshotStatus: &ateapipb.GoldenSnapshotStatus{
+					GoldenTag: &ateapipb.ObjectRef{
+						Atespace: "benchmark-workloads",
+						Name:     "golden-tag-1",
+					},
+				},
+			},
+		},
+		tag: &ateapipb.Tag{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace: "benchmark-workloads",
+				Name:     "golden-tag-1",
+			},
+			Scope: ateapipb.TagScope_TAG_SCOPE_PUBLISHED,
+			Status: &ateapipb.TagStatus{
+				ActorTemplateUid: tmplUID,
+				Snapshot:         newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, tmplUID, "22222222-3333-4444-8555-666666666666", "gs://test-bucket/atespaces/benchmark-workloads/tags/golden-tag-1", ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
+			},
+		},
+	}
+
+	svc := &RPCService{impl: newServiceImpl(cs, nil)}
+	var seq atomic.Int64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := seq.Add(1)
+			_, err := svc.CreateActor(ctx, &ateapipb.CreateActorRequest{
+				Actor: &ateapipb.Actor{
+					Metadata: &ateapipb.ResourceMetadata{
+						Atespace: "benchmark",
+						Name:     "sb-cold-" + strconv.FormatInt(n, 10),
+					},
+					ActorTemplate: &ateapipb.ObjectRef{
+						Atespace: "benchmark-workloads",
+						Name:     "glutton",
+					},
+				},
+			})
+			if err != nil {
+				b.Fatalf("CreateActor failed: %v", err)
+			}
+		}
+	})
 }

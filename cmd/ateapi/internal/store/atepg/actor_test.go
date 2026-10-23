@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -141,5 +142,27 @@ func TestListActors_CrossScopePageToken(t *testing.T) {
 		if _, err := s.ListAtespaces(ctx, store.ListOptions{PageSize: 1, PageToken: workerPage.NextPageToken}); err == nil {
 			t.Errorf("ListAtespaces with a worker page token = nil error, want an error")
 		}
+	}
+}
+
+func TestBuildBatchInsertActorsSQL(t *testing.T) {
+	got2 := buildBatchInsertActorsSQL(2)
+	want2 := "INSERT INTO actors (atespace, name, uid, version, proto) VALUES ($1,$2,$3,$4,$5),($6,$7,$8,$9,$10) ON CONFLICT (atespace, name) DO NOTHING"
+	if got2 != want2 {
+		t.Errorf("buildBatchInsertActorsSQL(2) = %q, want %q", got2, want2)
+	}
+
+	got1024 := buildBatchInsertActorsSQL(1024)
+	if !strings.HasPrefix(got1024, "INSERT INTO actors (atespace, name, uid, version, proto) VALUES ($1,$2,$3,$4,$5),") {
+		t.Errorf("unexpected prefix in buildBatchInsertActorsSQL(1024)")
+	}
+	if !strings.HasSuffix(got1024, ",($5116,$5117,$5118,$5119,$5120) ON CONFLICT (atespace, name) DO NOTHING") {
+		t.Errorf("unexpected suffix in buildBatchInsertActorsSQL(1024): %q", got1024[len(got1024)-80:])
+	}
+}
+
+func BenchmarkBuildBatchInsertActorsSQL(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_ = buildBatchInsertActorsSQL(1024)
 	}
 }
