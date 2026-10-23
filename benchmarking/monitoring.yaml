@@ -295,11 +295,11 @@ data:
             action: keep
             regex: (container_((.*pressure.*)|network_(receive|transmit)_bytes_total|fs_(reads|writes)_bytes_total|memory_rss|memory_working_set_bytes|cpu_usage_seconds_total|cpu_cfs_.*|spec_memory_limit_bytes|oom_events_total)|machine_(cpu_cores|memory_bytes))
           # Drop per-actor sandbox sub-cgroups (which otherwise create >10M
-          # series at 100k running actors) while keeping worker pod rollups
-          # and per-actor container_oom_events_total.
+          # series at 100k-1M running actors) while keeping worker/atelet
+          # container and pod rollups.
           - source_labels: [__name__, id]
             action: drop
-            regex: container_((.*pressure.*)|network_(receive|transmit)_bytes_total|fs_(reads|writes)_bytes_total|memory_rss|memory_working_set_bytes|cpu_usage_seconds_total|cpu_cfs_.*|spec_memory_limit_bytes);.*/(sb-[^/]+|cri-containerd-[^/]+\.scope.*|ate-actors/.+)
+            regex: container_((.*pressure.*)|network_(receive|transmit)_bytes_total|fs_(reads|writes)_bytes_total|memory_rss|memory_working_set_bytes|cpu_usage_seconds_total|cpu_cfs_.*|spec_memory_limit_bytes);.*/(sb-[^/]+|cri-containerd-[^/]+\.scope/.+|ate-actors/.+)
           # Drop the series that have an empty container label only for cumulative
           # memory working set and CPU usage. cAdvisor gives a rollup for the whole
           # pod cgroup next to the series for each container; keeping both counts

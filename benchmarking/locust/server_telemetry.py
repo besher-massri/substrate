@@ -157,8 +157,6 @@ def get_steady_state_window(
 
     steady = [ts for ts, users in samples if users >= peak * 0.9]
     steady_ts, last_ts = steady[0], steady[-1]
-    if last_ts - steady_ts >= 1200:
-        steady_ts = last_ts - min(1400, last_ts - steady_ts - 600)
 
     if start_ts <= steady_ts <= end_ts:
         return steady_ts, min(max(last_ts, steady_ts), end_ts)
