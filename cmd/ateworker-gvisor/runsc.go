@@ -55,9 +55,9 @@ type runsc struct {
 	containers []*ateworkerpb.Container
 	// flags holds the configured flags; must not be nil.
 	flags *flagStore
-	// writtenSpecs tracks container names whose OCI config.json has already been
-	// generated and written for this runsc operation.
-	writtenSpecs sync.Map
+
+	specMu       sync.Mutex
+	specsWritten map[string]bool
 }
 
 // buildArgs constructs the runsc argument vector for command, appending
@@ -129,20 +129,30 @@ func (r *runsc) writeSpec(containerName string) error {
 		DurableVolumes: r.durableVolumes,
 		Size:           r.size,
 	})
-	if err := ocispec.Save(bundlePath, spec); err != nil {
-		return err
-	}
-	r.writtenSpecs.Store(containerName, true)
-	return nil
+	return ocispec.Save(bundlePath, spec)
 }
 
-// ensureSpecWritten writes the container's OCI spec if it has not already been
-// written for this runsc operation.
-func (r *runsc) ensureSpecWritten(containerName string) error {
-	if _, ok := r.writtenSpecs.Load(containerName); ok {
+// ensureSpec writes the container's OCI spec into its bundle directory once
+// per runsc instance, skipping redundant spec generation and disk writes when
+// the spec was already pre-staged during parallel startup or restore
+// preparation or written by an earlier cmdCreate before cmdRestore.
+func (r *runsc) ensureSpec(containerName string) error {
+	r.specMu.Lock()
+	if r.specsWritten[containerName] {
+		r.specMu.Unlock()
 		return nil
 	}
-	return r.writeSpec(containerName)
+	r.specMu.Unlock()
+	if err := r.writeSpec(containerName); err != nil {
+		return err
+	}
+	r.specMu.Lock()
+	if r.specsWritten == nil {
+		r.specsWritten = make(map[string]bool)
+	}
+	r.specsWritten[containerName] = true
+	r.specMu.Unlock()
+	return nil
 }
 
 // createArgs builds the argv for `runsc create <container>`. Factored out so
@@ -159,7 +169,7 @@ func (r *runsc) createArgs(containerName string, additionalArgs []string) []stri
 func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName string, additionalArgs []string) error {
 	slog.InfoContext(ctx, "About to run runsc create", slog.String("container", containerName))
 
-	if err := r.ensureSpecWritten(containerName); err != nil {
+	if err := r.ensureSpec(containerName); err != nil {
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 
@@ -255,7 +265,7 @@ func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
 func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, checkpointPath string) error {
 	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
 
-	if err := r.ensureSpecWritten(containerName); err != nil {
+	if err := r.ensureSpec(containerName); err != nil {
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 

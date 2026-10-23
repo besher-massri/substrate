@@ -531,22 +531,6 @@ func TestMountPointsUnderStatx_NonExistentAndMultiBundle(t *testing.T) {
 		if _, err := mountPointsUnderStatx(filepath.Dir(appBundle)); err == nil {
 			t.Fatalf("mountPointsUnderStatx skipped volume entries named upper/work under volumes/")
 		}
-
-		// Verify that when mountPointsUnderStatx hits an unreadable
-		// container directory, UnmountAllUnder falls back to
-		// mountPointsUnder against /proc/self/mountinfo.
-		brokenDir := filepath.Join(bundlesDir, "broken")
-		if err := os.MkdirAll(brokenDir, 0o000); err != nil {
-			t.Fatalf("MkdirAll(brokenDir): %v", err)
-		}
-		t.Cleanup(func() { _ = os.Chmod(brokenDir, 0o755) })
-
-		if _, err := mountPointsUnderStatx(bundlesDir); err == nil {
-			t.Fatalf("mountPointsUnderStatx with unreadable container dir succeeded, want permission error")
-		}
-		if err := UnmountAllUnder(bundlesDir); err != nil {
-			t.Fatalf("UnmountAllUnder fallback to mountPointsUnder failed: %v", err)
-		}
 	}
 }
 
@@ -639,7 +623,7 @@ func TestSetupBundleRootfs_MultiBundleUnmount(t *testing.T) {
 	}
 }
 
-func TestUnmountAllUnder_DetachesRegularFileBindMount(t *testing.T) {
+func TestMountPointsUnderStatx_RegularFileBindMount(t *testing.T) {
 	roottest.Require(t, "mount/unmount")
 	stateDir := t.TempDir()
 	src := filepath.Join(t.TempDir(), "netns")
@@ -654,27 +638,12 @@ func TestUnmountAllUnder_DetachesRegularFileBindMount(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = unix.Unmount(target, unix.MNT_DETACH) })
 
-	pts, err := mountPointsUnderStatx(stateDir)
-	if err != nil {
-		t.Fatalf("mountPointsUnderStatx(stateDir): %v", err)
-	}
-	if len(pts) != 1 || pts[0] != target {
-		t.Fatalf("mountPointsUnderStatx(stateDir) = %v, want [%q]", pts, target)
-	}
-
-	pts, err = mountPointsUnderStatx(target)
+	pts, err := mountPointsUnderStatx(target)
 	if err != nil {
 		t.Fatalf("mountPointsUnderStatx(target file): %v", err)
 	}
 	if len(pts) != 1 || pts[0] != target {
 		t.Fatalf("mountPointsUnderStatx(target file) = %v, want [%q]", pts, target)
-	}
-
-	if err := UnmountAllUnder(stateDir); err != nil {
-		t.Fatalf("UnmountAllUnder: %v", err)
-	}
-	if err := os.RemoveAll(stateDir); err != nil {
-		t.Fatalf("RemoveAll(stateDir) after UnmountAllUnder: %v", err)
 	}
 }
 

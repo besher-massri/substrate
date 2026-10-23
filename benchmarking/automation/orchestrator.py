@@ -563,7 +563,7 @@ def run_test(
             flush=True,
         )
         time.sleep(_delay)
-    timeout = parse_duration_seconds(test["duration"]) + 1800
+    timeout = parse_duration_seconds(test["duration"]) + 3600
     result = wait_for_job(job, timeout)
     print(f"Job {job} result: {result}", flush=True)
     run_no_check(

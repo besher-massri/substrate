@@ -107,7 +107,12 @@ def _read_single_pod(v1: client.CoreV1Api, pod: Any, namespace: str,
                 f"Notice: no previous log for {namespace}/{name}: "
                 f"{getattr(e, 'reason', e)}"
             )
-    return True, text.splitlines(), notices
+    return True, [line for line in text.splitlines() if "timing breakdown" in line], notices
+
+
+# Maximum pods read per namespace so 5,000-node scale runs do not block
+# post-run completion for 20+ minutes downloading 10,000 pod logs.
+MAX_PHASE_BREAKDOWN_PODS_PER_NAMESPACE = 256
 
 
 def read_pod_logs(v1: client.CoreV1Api, namespace: str, label: str,
@@ -129,6 +134,8 @@ def read_pod_logs(v1: client.CoreV1Api, namespace: str, label: str,
         return out
     if not pods:
         return out
+    if len(pods) > MAX_PHASE_BREAKDOWN_PODS_PER_NAMESPACE:
+        pods = pods[:MAX_PHASE_BREAKDOWN_PODS_PER_NAMESPACE]
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(pods))) as pool:
         results = list(pool.map(
             lambda pod: _read_single_pod(v1, pod, namespace, since_seconds),

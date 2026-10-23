@@ -677,30 +677,6 @@ def main() -> None:
         except Exception as e:
             tee(logs, f"Warning: Failed to summarize ladder steps: {e}")
 
-        # Upload the core trial artifacts before running phase_breakdown so that
-        # reading thousands of pod logs on large clusters can never prevent
-        # stats.csv, stats.jsonl, and server_summary.json from reaching GCS.
-        status_path.write_text(
-            json.dumps(
-                {"locust_exit_code": exit_code, "stats_generated": stats_generated}
-            )
-        )
-        early_files: list[tuple[Path, str]] = [
-            (status_path, "status.json"),
-            (jsonl_path, "stats.jsonl"),
-            (stats_csv, "stats.csv"),
-            (work_dir / f"{args.name}_exceptions.csv", "exceptions.csv"),
-            (work_dir / f"{args.name}_failures.csv", "failures.csv"),
-            (work_dir / f"{args.name}_stats_history.csv", "stats_history.csv"),
-            (server_summary_json, "server_summary.json"),
-            (jsonl_path, f"{args.name}.jsonl"),
-        ]
-        for src, basename in early_files:
-            if not src.exists():
-                continue
-            dest = f"{prefix}/{basename}"
-            upload(src, dest)
-
         # The phase breakdown is additive too. It reads the node logs now,
         # while the pods still exist: the orchestrator deletes them as soon
         # as this process exits. The window reaches back to this run's start

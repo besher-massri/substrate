@@ -100,9 +100,10 @@ var (
 )
 
 // netnsPoolEnabled reports whether the pre-warmed fresh single-use network
-// namespace pool and asynchronous namespace teardown are enabled.
+// namespace pool and asynchronous namespace teardown are enabled (enabled by
+// default unless ATEWORKER_NETNS_POOL=false).
 func netnsPoolEnabled() bool {
-	return os.Getenv("ATEWORKER_NETNS_POOL") == "true"
+	return os.Getenv("ATEWORKER_NETNS_POOL") != "false"
 }
 
 // initVethPool initializes the background replenisher and asynchronous
