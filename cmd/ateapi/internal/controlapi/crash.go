@@ -88,9 +88,6 @@ func ateletErrorCrashesActor(ctx context.Context, isTerminateRPC bool, err error
 // It crashes the actor if ateletErrorCrashesActor says so, and otherwise
 // returns the error for the operation to be retried.
 func handleAteletError(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, rpc string, isTerminateRPC bool, err error) error {
-	if actorRef.Atespace == "benchmark" && strings.HasPrefix(actorRef.Name, "sb-cold-") {
-		return apierror.Unavailable("while calling atelet %s: %w", rpc, err)
-	}
 	if ateletErrorCrashesActor(ctx, isTerminateRPC, err) {
 		slog.LogAttrs(ctx, slog.LevelError, "Setting Actor to crashed due to Atelet error",
 			append(ateattr.ActorRefLogAttrs(actorRef), slog.Any("err", err))...)

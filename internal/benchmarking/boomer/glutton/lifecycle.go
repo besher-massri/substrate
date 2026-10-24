@@ -226,7 +226,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	if n < 1 {
 		n = 1
 	}
-	if r.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
+	if r.cfg.ActorsPerUser >= 5 {
 		vuIdx := int(r.userSeq.Add(1)-1) % 1000000
 		stub := r.pickStub(uint64(vuIdx))
 		u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
@@ -238,8 +238,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 				stub:        stub,
 				httpSem:     r.httpSem,
 				actorName:   fmt.Sprintf("sb-cold-%d", actorNum),
-				firstResume: i == 0,
-				cpuLoaded:   i > 0,
+				firstResume: true,
 			}
 			if i == 0 {
 				r.atespaceOnce.Do(func() {
@@ -303,7 +302,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 // leaks actors until shutdown — acceptable for benchmark runs that ramp up,
 // hold, then tear down cleanly.
 func (r *taskRuntime) shutdown(ctx context.Context) {
-	if r.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
+	if r.cfg.ActorsPerUser >= 5 {
 		return
 	}
 	r.users.Range(func(_, val any) bool {
@@ -360,11 +359,6 @@ func (u *gluttonUser) nextActor() *gluttonActor {
 // with a freshly created actor so the VU maintains full concurrency without
 // repeatedly calling a stuck actor (e.g. left in ACTOR_STATE_SUSPENDING).
 func (u *gluttonUser) replaceActor(ctx context.Context, broken *gluttonActor) {
-	if strings.HasPrefix(broken.actorName, "sb-cold-") {
-		broken.consecutiveFailures = 0
-		broken.actorRunning = false
-		return
-	}
 	// A re-entry (the last call deleted the actor but failed to create its
 	// replacement) would book a NotFound failure on every iteration.
 	if !broken.deleted {
@@ -540,12 +534,9 @@ func (u *gluttonActor) create(ctx context.Context) error {
 
 func (u *gluttonActor) resume(ctx context.Context) error {
 	metricName := "ResumeActor"
-	resumeKind := "warm"
 	if u.firstResume {
 		metricName = "ResumeActorFirstResume"
-		resumeKind = "first"
 	}
-	ctx = metadata.AppendToOutgoingContext(ctx, "x-ate-boomer-resume", resumeKind)
 	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
 		// Retry Aborted "concurrent update conflict" transparently — it's a
 		// race, not a real failure, and the caller is expected to retry per
@@ -652,33 +643,7 @@ func (u *gluttonActor) tracedCall(ctx context.Context, name string, do func(cont
 
 	start := time.Now()
 	var tr metadata.MD
-	var err error
-	maxAttempts := 1
-	if u.cfg != nil && (u.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true") {
-		maxAttempts = 4
-	}
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
-		}
-		tr = nil
-		err = do(ctx, &tr)
-		if err == nil {
-			break
-		}
-		s, ok := status.FromError(err)
-		if !ok {
-			break
-		}
-		switch s.Code() {
-		case codes.Aborted, codes.Unavailable, codes.ResourceExhausted, codes.Internal, codes.DeadlineExceeded:
-			if boomerutil.IsCrashed(err) {
-				attempt = maxAttempts
-			}
-		default:
-			attempt = maxAttempts
-		}
-	}
+	err := do(ctx, &tr)
 	latency := time.Since(start)
 
 	if serverLatency, source := boomerutil.ElapsedFromMD(tr, ateinterceptors.ServerElapsedTrailer, 0); source == boomerutil.SourceServer {
@@ -705,25 +670,7 @@ func (u *gluttonActor) ping(ctx context.Context) {
 	}
 
 	start := time.Now()
-	var resp *http.Response
-	var respBody []byte
-	maxAttempts := 1
-	if u.cfg != nil && (u.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true") {
-		maxAttempts = 4
-	}
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
-		}
-		resp, respBody, err = u.doHTTPPost(ctx, pingPath, body)
-		if err != nil {
-			continue
-		}
-		if resp.StatusCode >= 500 && attempt < maxAttempts-1 {
-			continue
-		}
-		break
-	}
+	resp, respBody, err := u.doHTTPPost(ctx, pingPath, body)
 	clientLatency := time.Since(start)
 	if err != nil {
 		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, err.Error())
@@ -919,25 +866,7 @@ func (u *gluttonActor) postProto(ctx context.Context, path string, req, resp pro
 	if err != nil {
 		return err
 	}
-	var httpResp *http.Response
-	var respBody []byte
-	maxAttempts := 1
-	if u.cfg != nil && (u.cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true") {
-		maxAttempts = 4
-	}
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt*50) * time.Millisecond)
-		}
-		httpResp, respBody, err = u.doHTTPPost(ctx, path, body)
-		if err != nil {
-			continue
-		}
-		if httpResp.StatusCode >= 500 && attempt < maxAttempts-1 {
-			continue
-		}
-		break
-	}
+	httpResp, respBody, err := u.doHTTPPost(ctx, path, body)
 	if err != nil {
 		return err
 	}

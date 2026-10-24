@@ -667,16 +667,14 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		egressDone <- err
 	}()
 
-	sandboxSpecDone := make(chan error, 1)
-	sandboxSpecJoined := false
+	prepDone := make(chan error, 1)
+	prepJoined := false
 	go func() {
-		sandboxSpecDone <- rcmd.ensureSpec(ocispec.SandboxID)
-	}()
-
-	appPrepDone := make(chan error, 1)
-	appPrepJoined := false
-	go func() {
-		appPrepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
+		if err := rcmd.ensureSpec(ocispec.SandboxID); err != nil {
+			prepDone <- fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
+			return
+		}
+		prepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
 	}()
 
 	var hosted *hostedActor
@@ -687,11 +685,8 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 			if !egressJoined {
 				<-egressDone
 			}
-			if !sandboxSpecJoined {
-				<-sandboxSpecDone
-			}
-			if !appPrepJoined {
-				<-appPrepDone
+			if !prepJoined {
+				<-prepDone
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
@@ -721,10 +716,10 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 	if err != nil {
 		return nil, err
 	}
-	err = <-sandboxSpecDone
-	sandboxSpecJoined = true
+	err = <-prepDone
+	prepJoined = true
 	if err != nil {
-		return nil, fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
+		return nil, err
 	}
 	containersToDelete = append(containersToDelete, ocispec.SandboxID)
 	// Attribute the sandbox's runsc CLI output to the actor.
@@ -740,6 +735,7 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 	if err := rcmd.cmdStart(ctx, pw, ocispec.SandboxID); err != nil {
 		return nil, fmt.Errorf("while starting the sandbox: %w", err)
 	}
+	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 
 	// Create and start each application container, each with its own log pipe so
 	// every line is tagged with the originating container (ate.actor.container.name).
@@ -747,11 +743,6 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 	// cached image layers plus the bundle's private upper. atelet runs with no
 	// capabilities, so ateworker mounts it, and runsc's gofer resolves the
 	// mount in this pod's mount namespace.
-	err = <-appPrepDone
-	appPrepJoined = true
-	if err != nil {
-		return nil, err
-	}
 	for _, ac := range containers {
 		pw, err := s.actorLogger.StartJSONLogPipe(attribution, ac.GetName())
 		if err != nil {
@@ -766,7 +757,6 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 			return nil, fmt.Errorf("while starting %q application container: %w", ac.GetName(), err)
 		}
 	}
-	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 
 	// Block until every wakeup-probe-enabled container reports 200. If probes
 	// are still pending after wakeupLivenessCheckDelay, watch for early container
@@ -789,7 +779,7 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor started", attribution)
 	s.setSession(req.GetActorUid(), &workloadSession{rcmd: rcmd, containers: containerNames(containers)})
-	s.recordInitial(ctx, hosted)
+	go s.recordInitial(hosted.ctx, hosted)
 	s.watchSandbox(ctx, hosted, req.GetRunscPath(), req.GetActorDirs(), containers)
 
 	return &ateworkerpb.RunWorkloadResponse{}, nil
@@ -1182,28 +1172,30 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		egressDone <- err
 	}()
 
-	sandboxSpecDone := make(chan error, 1)
-	sandboxSpecJoined := false
+	prepDone := make(chan error, 1)
+	prepJoined := false
 	go func() {
 		if err := resetRunscStateAndPidFileDirs(req.GetActorDirs()); err != nil {
-			sandboxSpecDone <- err
+			prepDone <- fmt.Errorf("while preparing sandbox state for %q: %w", ocispec.SandboxID, err)
 			return
 		}
-		sandboxSpecDone <- rcmd.ensureSpec(ocispec.SandboxID)
-	}()
-
-	appPrepDone := make(chan error, 1)
-	appPrepJoined := false
-	go func() {
-		appPrepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
+		if err := rcmd.ensureSpec(ocispec.SandboxID); err != nil {
+			prepDone <- fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
+			return
+		}
+		prepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
 	}()
 
 	readaheadDone := make(chan struct{})
 	readaheadJoined := false
-	go func() {
-		defer close(readaheadDone)
-		readaheadCheckpointDir(bgCtx, checkpointDir)
-	}()
+	if !req.GetPreserveRestoreDir() || os.Getenv("ATEWORKER_EVICT_PRESERVED_RESTORE_CACHE") == "true" {
+		go func() {
+			defer close(readaheadDone)
+			readaheadCheckpointDir(bgCtx, checkpointDir)
+		}()
+	} else {
+		close(readaheadDone)
+	}
 
 	var hosted *hostedActor
 	var containersToDelete []string
@@ -1213,11 +1205,8 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 			if !egressJoined {
 				<-egressDone
 			}
-			if !sandboxSpecJoined {
-				<-sandboxSpecDone
-			}
-			if !appPrepJoined {
-				<-appPrepDone
+			if !prepJoined {
+				<-prepDone
 			}
 			if !readaheadJoined {
 				<-readaheadDone
@@ -1258,10 +1247,11 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	defer pw.Close()
 
-	err = <-sandboxSpecDone
-	sandboxSpecJoined = true
+	err = <-prepDone
+	prepJoined = true
+	timing.appRootfs = lap(&tLast)
 	if err != nil {
-		return nil, fmt.Errorf("while preparing sandbox state and OCI spec for %q: %w", ocispec.SandboxID, err)
+		return nil, err
 	}
 
 	switch fidelity {
@@ -1290,16 +1280,11 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		}
 		s.pinSandbox(ctx, hosted, req.GetActorDirs())
 	}
+	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 
 	// Create and restore each application container, each with its own log pipe so
 	// every line is tagged with the originating container (ate.actor.container.name).
 	// app_create includes starting that pipe.
-	err = <-appPrepDone
-	appPrepJoined = true
-	timing.appRootfs = lap(&tLast)
-	if err != nil {
-		return nil, err
-	}
 	for _, ac := range containers {
 		pw, err := s.actorLogger.StartJSONLogPipe(attribution, ac.GetName())
 		timing.appCreate += lap(&tLast)
@@ -1328,7 +1313,6 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 			}
 		}
 	}
-	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 
 	// Block until every wakeup-probe-enabled container reports 200. If probes
 	// are still pending after wakeupLivenessCheckDelay, watch for early container
@@ -1377,7 +1361,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restored", attribution)
 	s.setSession(req.GetActorUid(), &workloadSession{rcmd: rcmd, containers: containerNames(containers)})
-	s.recordInitial(ctx, hosted)
+	go s.recordInitial(hosted.ctx, hosted)
 	s.watchSandbox(ctx, hosted, req.GetRunscPath(), req.GetActorDirs(), containers)
 
 	return &ateworkerpb.RestoreWorkloadResponse{}, nil

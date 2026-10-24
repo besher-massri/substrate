@@ -17,7 +17,6 @@ package workerservice
 import (
 	"context"
 	"log/slog"
-	"strings"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
 	"go.ate.dev/substrate/cmd/ateapi/internal/ateletauth"
@@ -35,10 +34,6 @@ func (s *Server) ReportActorCrashed(ctx context.Context, req *ateapipb.ReportAct
 	}
 	if errs := apivalidation.ValidateReportActorCrashedRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
-	}
-	if (req.GetActor().GetAtespace() == "benchmark" && strings.HasPrefix(req.GetActor().GetName(), "sb-cold-")) ||
-		strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-") {
-		return &ateapipb.ReportActorCrashedResponse{}, nil
 	}
 
 	workerName := req.GetWorker().GetName()

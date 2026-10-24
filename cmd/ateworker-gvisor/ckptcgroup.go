@@ -236,10 +236,9 @@ func isCheckpointDataFile(name string) bool {
 }
 
 // readaheadCheckpointDir issues asynchronous kernel readahead (FADV_WILLNEED)
-// in 128 KiB chunks across all checkpoint data files (.img and .tar) under
-// checkpointDir (including its fs/ and rootfs/ subdirectories) so snapshot
-// pages warm into the host page cache while the actor's network namespace is
-// being set up.
+// across all checkpoint data files (.img and .tar) under checkpointDir
+// (including its fs/ and rootfs/ subdirectories) so snapshot pages warm into
+// the host page cache while the actor's network namespace is being set up.
 func readaheadCheckpointDir(ctx context.Context, checkpointDir string) {
 	for _, f := range snapshotcache.FindFiles(checkpointDir, isCheckpointDataFile) {
 		if ctx.Err() != nil {
@@ -249,10 +248,10 @@ func readaheadCheckpointDir(ctx context.Context, checkpointDir string) {
 	}
 }
 
-// readaheadFile issues asynchronous kernel readahead (FADV_WILLNEED) in 128 KiB
-// chunks across path up to size bytes, stopping early if ctx is canceled.
+// readaheadFile issues asynchronous kernel readahead (FADV_WILLNEED) across
+// path up to size bytes in a single syscall if ctx is not canceled.
 func readaheadFile(ctx context.Context, path string, size int64) {
-	if size <= 0 {
+	if size <= 0 || ctx.Err() != nil {
 		return
 	}
 	f, err := os.Open(path)
@@ -260,11 +259,7 @@ func readaheadFile(ctx context.Context, path string, size int64) {
 		return
 	}
 	defer f.Close()
-	fd := int(f.Fd())
-	const chunk = 128 * 1024
-	for pos := int64(0); pos < size && ctx.Err() == nil; pos += chunk {
-		_ = unix.Fadvise(fd, pos, min(int64(chunk), size-pos), unix.FADV_WILLNEED)
-	}
+	_ = unix.Fadvise(int(f.Fd()), 0, size, unix.FADV_WILLNEED)
 }
 
 // evictCheckpointCache is a var so tests can observe eviction.

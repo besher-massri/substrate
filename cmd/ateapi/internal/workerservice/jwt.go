@@ -20,8 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"strings"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
@@ -48,37 +46,6 @@ func (s *Server) MintWorkerActorJwt(ctx context.Context, req *ateapipb.MintWorke
 	caller, err := ateletauth.Authenticate(ctx, s.ateletSPIFFEID)
 	if err != nil {
 		return nil, err
-	}
-
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
-		req.GetActor().GetAtespace() == "benchmark" &&
-		strings.HasPrefix(req.GetActor().GetName(), "sb-cold-") {
-		now := time.Now().Truncate(time.Second)
-		expiresAt := now.Add(workerActorJWTLifetime)
-		claims := &actoridjwt.Claims{
-			Kind:       actoridjwt.KindWorkerForActor,
-			Issuer:     s.actorJWTIssuer,
-			Subject:    fmt.Sprintf("%s/%s/%s", actoridjwt.KindWorkerForActor.SubjectPrefix(), req.GetActor().GetAtespace(), req.GetActor().GetName()),
-			Audiences:  req.GetAudiences(),
-			Expiration: expiresAt,
-			NotBefore:  now.Add(-5 * time.Minute),
-			IssuedAt:   now,
-			JTI:        rand.Text(),
-			Substrate: actoridjwt.SubstrateClaims{
-				Atespace:  req.GetActor().GetAtespace(),
-				ActorName: req.GetActor().GetName(),
-				ActorUID:  req.GetActorUid(),
-				Node:      caller.NodeName,
-			},
-		}
-		token, err := s.actorIDJWTPool.SignJWT(claims)
-		if err != nil {
-			return nil, fmt.Errorf("while signing worker-for-actor JWT: %w", err)
-		}
-		return &ateapipb.MintWorkerActorJwtResponse{
-			ActorJwt:   token,
-			ExpireTime: timestamppb.New(expiresAt),
-		}, nil
 	}
 
 	// The actor doesn't need to be running: tokens are needed to fetch a

@@ -105,8 +105,10 @@ func noRootContainerArgs(containerName string) []string {
 }
 
 // runscCmdEnv returns the environment variables for runsc subprocesses,
-// bounding GOMAXPROCS to 2 unless already set in the environment so short-lived
-// runsc CLI processes do not initialize 180 Go P structs on high-core hosts.
+// bounding GOMAXPROCS to 1 unless already set in the environment so short-lived
+// runsc CLI processes do not initialize multiple Go P structs and OS threads on
+// high-core hosts (runsc strips GOMAXPROCS when spawning runsc-sandbox and
+// runsc-gofer, which size their GOMAXPROCS from the sandbox cgroup's cpu.max).
 func runscCmdEnv() []string {
 	env := os.Environ()
 	for _, kv := range env {
@@ -114,7 +116,7 @@ func runscCmdEnv() []string {
 			return env
 		}
 	}
-	return append(env, "GOMAXPROCS=2")
+	return append(env, "GOMAXPROCS=1")
 }
 
 // execRunsc constructs an exec.Cmd for r.path with runscCmdEnv configured.

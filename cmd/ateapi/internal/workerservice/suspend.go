@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
 	"go.ate.dev/substrate/cmd/ateapi/internal/ateletauth"
@@ -42,11 +41,8 @@ func (s *Server) RequestActorSuspend(ctx context.Context, req *ateapipb.RequestA
 
 	workerName := req.GetWorker().GetName()
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
-	if !((actorRef.Atespace == "benchmark" && strings.HasPrefix(actorRef.Name, "sb-cold-")) ||
-		strings.HasPrefix(req.GetActorUid(), "00000000-0000-4000-8000-")) {
-		if err := s.authorizeHostedActor(ctx, caller, workerName, actorRef, req.GetActorUid()); err != nil {
-			return nil, err
-		}
+	if err := s.authorizeHostedActor(ctx, caller, workerName, actorRef, req.GetActorUid()); err != nil {
+		return nil, err
 	}
 
 	// From here it is an ordinary suspend. Running the same workflow Control

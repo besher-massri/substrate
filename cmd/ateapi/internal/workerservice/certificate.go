@@ -21,9 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"os"
 	"path"
-	"strings"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
@@ -51,45 +49,38 @@ func (s *Server) MintWorkerActorCertificate(ctx context.Context, req *ateapipb.M
 	// TODO(authz): The egress gateway may also need certificates for actors
 	// (via a cluster-level grant?).
 
-	atespace := req.GetActor().GetAtespace()
-	actorName := req.GetActor().GetName()
-	actorUID := req.GetActorUid()
-	if !(os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
-		((atespace == "benchmark" && strings.HasPrefix(actorName, "sb-cold-")) ||
-			strings.HasPrefix(actorUID, "00000000-0000-4000-8000-"))) {
-		dbActor, err := s.store.GetActor(ctx, resources.ActorRefFromObjectRef(req.GetActor()))
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, apierror.NotFound("actor not found")
-		} else if err != nil {
-			return nil, fmt.Errorf("while retrieving actor: %w", err)
-		}
-		// Only the assigned worker may mint, via its node's atelet, checked before the
-		// UID so other callers get NotFound. Unlike MintWorkerActorJwt, a SUSPENDED
-		// actor gets NotFound too: it has no worker to bind the certificate to.
-		if err := s.checkActorOnNode(ctx, dbActor, caller.NodeName, "certificate"); err != nil {
-			return nil, err
-		}
-		// The status must name the requesting worker. When it names one,
-		// checkActorOnNode has confirmed in the store's worker assignments that
-		// this worker holds the actor. When it names none (a SUSPENDED actor on
-		// assigned_node, or a resume that has bound a worker but not yet recorded
-		// it), checkActorOnNode read assigned_node alone, and no worker runs the
-		// actor yet.
-		if assigned := dbActor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); assigned == "" || assigned != req.GetWorker().GetName() {
-			slog.WarnContext(ctx, "Refusing a worker-for-actor certificate for an actor not assigned to the calling worker",
-				slog.String("actor", resources.ActorRefFromActor(dbActor).String()),
-				slog.String("assigned_worker", assigned),
-				slog.String("caller_worker", req.GetWorker().GetName()),
-				slog.String("caller_node", caller.NodeName))
-			return nil, apierror.NotFound("actor not found")
-		}
-		if dbActor.GetMetadata().GetUid() != req.GetActorUid() {
-			return nil, apierror.Aborted("conflict; actor has been deleted and recreated")
-		}
-		atespace = dbActor.GetMetadata().GetAtespace()
-		actorName = dbActor.GetMetadata().GetName()
-		actorUID = dbActor.GetMetadata().GetUid()
+	dbActor, err := s.store.GetActor(ctx, resources.ActorRefFromObjectRef(req.GetActor()))
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, apierror.NotFound("actor not found")
+	} else if err != nil {
+		return nil, fmt.Errorf("while retrieving actor: %w", err)
 	}
+	// Only the assigned worker may mint, via its node's atelet, checked before the
+	// UID so other callers get NotFound. Unlike MintWorkerActorJwt, a SUSPENDED
+	// actor gets NotFound too: it has no worker to bind the certificate to.
+	if err := s.checkActorOnNode(ctx, dbActor, caller.NodeName, "certificate"); err != nil {
+		return nil, err
+	}
+	// The status must name the requesting worker. When it names one,
+	// checkActorOnNode has confirmed in the store's worker assignments that
+	// this worker holds the actor. When it names none (a SUSPENDED actor on
+	// assigned_node, or a resume that has bound a worker but not yet recorded
+	// it), checkActorOnNode read assigned_node alone, and no worker runs the
+	// actor yet.
+	if assigned := dbActor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); assigned == "" || assigned != req.GetWorker().GetName() {
+		slog.WarnContext(ctx, "Refusing a worker-for-actor certificate for an actor not assigned to the calling worker",
+			slog.String("actor", resources.ActorRefFromActor(dbActor).String()),
+			slog.String("assigned_worker", assigned),
+			slog.String("caller_worker", req.GetWorker().GetName()),
+			slog.String("caller_node", caller.NodeName))
+		return nil, apierror.NotFound("actor not found")
+	}
+	if dbActor.GetMetadata().GetUid() != req.GetActorUid() {
+		return nil, apierror.Aborted("conflict; actor has been deleted and recreated")
+	}
+	atespace := dbActor.GetMetadata().GetAtespace()
+	actorName := dbActor.GetMetadata().GetName()
+	actorUID := dbActor.GetMetadata().GetUid()
 
 	// Parse the CSR.
 	csr, err := x509.ParseCertificateRequest(req.GetCertificateSigningRequest())
