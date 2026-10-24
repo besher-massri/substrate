@@ -111,8 +111,9 @@ def _read_single_pod(v1: client.CoreV1Api, pod: Any, namespace: str,
 
 
 # Maximum pods read per namespace so 5,000-node scale runs do not block
-# post-run completion for 20+ minutes downloading 10,000 pod logs.
-MAX_PHASE_BREAKDOWN_PODS_PER_NAMESPACE = 256
+# post-run completion for 20+ minutes downloading 10,000 pod logs or trigger
+# KCP APF HTTP 429 throttling.
+MAX_PHASE_BREAKDOWN_PODS_PER_NAMESPACE = 32
 
 
 def read_pod_logs(v1: client.CoreV1Api, namespace: str, label: str,
@@ -136,7 +137,7 @@ def read_pod_logs(v1: client.CoreV1Api, namespace: str, label: str,
         return out
     if len(pods) > MAX_PHASE_BREAKDOWN_PODS_PER_NAMESPACE:
         pods = pods[:MAX_PHASE_BREAKDOWN_PODS_PER_NAMESPACE]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(pods))) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pods))) as pool:
         results = list(pool.map(
             lambda pod: _read_single_pod(v1, pod, namespace, since_seconds),
             pods,

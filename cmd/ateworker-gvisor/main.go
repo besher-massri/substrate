@@ -1513,6 +1513,9 @@ func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resou
 	if err := imagecache.UnmountAllUnder(actorDirs.GetOciBundleDir()); err != nil {
 		errs = append(errs, fmt.Errorf("while unmounting bundle rootfs overlays: %w", err))
 	}
+	for _, ac := range containers {
+		_ = os.RemoveAll(filepath.Join(ociBundlePath(actorDirs, ac.GetName()), "upper"))
+	}
 
 	if err := s.unhostActor(ctx, actorUID); err != nil {
 		errs = append(errs, fmt.Errorf("while cleaning up actor network: %w", err))
@@ -1551,6 +1554,9 @@ func (s *AteWorkerService) terminateExitedSandbox(ctx context.Context, actorRef 
 	}
 	if err := imagecache.UnmountAllUnder(actorDirs.GetOciBundleDir()); err != nil {
 		errs = append(errs, fmt.Errorf("while unmounting bundle rootfs overlays: %w", err))
+	}
+	for _, ac := range containers {
+		_ = os.RemoveAll(filepath.Join(ociBundlePath(actorDirs, ac.GetName()), "upper"))
 	}
 	if err := s.unhostActor(ctx, actorUID); err != nil {
 		errs = append(errs, fmt.Errorf("while cleaning up actor network: %w", err))

@@ -509,12 +509,36 @@ deploy() {
     kubectl wait --for=create deployment/benchmark-worker \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
     if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
+      for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
+        kubectl rollout restart --namespace=ate-system "${ds}" || true
+      done
       kubectl patch deploy -n benchmark-workloads benchmark-worker \
         -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":"100%","maxSurge":0}}}}' || true
       kubectl rollout restart deployment/benchmark-worker --namespace=benchmark-workloads || true
+      (
+        for _ in $(seq 1 30); do
+          sleep 3
+          term_pods="$(kubectl get pods -n benchmark-workloads -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+          if [[ -n "${term_pods}" ]]; then
+            echo "${term_pods}" | xargs -r -n 50 kubectl delete pod -n benchmark-workloads --grace-period=0 --force >/dev/null 2>&1 || true
+          fi
+        done
+      ) &
+      reaper_pid=$!
+      kubectl rollout status deployment/benchmark-worker \
+        --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
+      kill "${reaper_pid}" >/dev/null 2>&1 || true
+      for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
+        kubectl rollout status --namespace=ate-system "${ds}" --timeout="${WAIT_TIMEOUT_SECS}s" || true
+      done
+      if ((WORKER_COUNT > 0)); then
+        kubectl wait --for=jsonpath='{.status.readyReplicas}'="${WORKER_COUNT}" workerpool/benchmark-worker \
+          --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s" || true
+      fi
+    else
+      kubectl rollout status deployment/benchmark-worker \
+        --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
     fi
-    kubectl rollout status deployment/benchmark-worker \
-      --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
   fi
 
   # The store enforces that a template's atespace exists at create time.

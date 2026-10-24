@@ -1675,12 +1675,6 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		}
 	}
 	if strings.HasPrefix(actorUID, "00000000-0000-4000-8000-") {
-		var resumeKind string
-		if md, mdOK := metadata.FromIncomingContext(ctx); mdOK {
-			if vals := md.Get("x-ate-boomer-resume"); len(vals) > 0 {
-				resumeKind = vals[0]
-			}
-		}
 		if cachedSpecs, ok := s.pooledVUs.Load(actorUID); ok {
 			containerSpecs, _ := cachedSpecs.([]*ateworkerpb.ContainerSpec)
 			op.kind = ateattr.SnapshotKindLocal
@@ -1707,7 +1701,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 								Fidelity:              toWorkerFidelity(req.GetSnapshot().GetFidelity()),
 								ActorUid:              req.GetActorUid(),
 								ActorDirs:             actorDirs,
-								PreserveRestoreDir:    false,
+								PreserveRestoreDir:    true,
 								EgressGateway:         toWorkerEgressGateway(req.GetEgressGateway()),
 								Resources:             toAteworkerResources(req.GetResources()),
 							})
@@ -1720,8 +1714,8 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 						}
 					}
 				}
-			} else if resumeKind == "first" {
-				// Actor is already running on the worker from the previous step.
+			} else if _, hostErr := os.Stat(filepath.Join(actorDirs.GetOciBundleDir(), "glutton", "upper", "etc", "hosts")); hostErr == nil {
+				// Actor is already running on the worker (from an idempotent retry or the previous step).
 				return &ateletpb.RestoreResponse{}, nil
 			}
 		}
