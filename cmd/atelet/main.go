@@ -1028,10 +1028,12 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 						if err == nil {
 							actorDirs := ateletpath.ActorDirs(actorUID)
 							checkpointDir := actorDirs.GetCheckpointDir()
-							if _, statErr := os.Stat(filepath.Join(checkpointDir, "checkpoint.img")); statErr == nil {
-								return &ateletpb.CheckpointResponse{
-									State: &ateletpb.ActorSnapshotState{},
-								}, nil
+							if _, hostErr := os.Stat(filepath.Join(actorDirs.GetOciBundleDir(), "glutton", "upper", "etc", "hosts")); hostErr != nil {
+								if _, statErr := os.Stat(filepath.Join(checkpointDir, "checkpoint.img")); statErr == nil {
+									return &ateletpb.CheckpointResponse{
+										State: &ateletpb.ActorSnapshotState{},
+									}, nil
+								}
 							}
 							_ = os.RemoveAll(checkpointDir)
 							if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
@@ -1709,14 +1711,25 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 							if err != nil {
 								return nil, fmt.Errorf("while calling worker RestoreWorkload: %w", err)
 							}
-							_ = os.Remove(filepath.Join(actorDirs.GetCheckpointDir(), "checkpoint.img"))
 							return &ateletpb.RestoreResponse{}, nil
 						}
 					}
 				}
 			} else if _, hostErr := os.Stat(filepath.Join(actorDirs.GetOciBundleDir(), "glutton", "upper", "etc", "hosts")); hostErr == nil {
-				// Actor is already running on the worker (from an idempotent retry or the previous step).
-				return &ateletpb.RestoreResponse{}, nil
+				if assetPaths, err := s.ensureSandboxAssets(ctx, runtimeRec, ateletpath.SandboxAssetsDir(actorUID)); err == nil {
+					if client, err := s.dialWorker(ctx, req.GetWorkerPodUid()); err == nil {
+						if spec, err := buildWorkerWorkloadSpec(req.GetSpec(), containerSpecs); err == nil {
+							_, _ = client.TerminateWorkload(ctx, &ateworkerpb.TerminateWorkloadRequest{
+								Atespace:  actorRef.Atespace,
+								ActorName: actorRef.Name,
+								RunscPath: runscPathFor(assetPaths),
+								Spec:      spec,
+								ActorUid:  req.GetActorUid(),
+								ActorDirs: actorDirs,
+							})
+						}
+					}
+				}
 			}
 		}
 	}

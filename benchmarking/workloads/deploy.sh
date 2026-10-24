@@ -516,7 +516,7 @@ deploy() {
         -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":"100%","maxSurge":0}}}}' || true
       kubectl rollout restart deployment/benchmark-worker --namespace=benchmark-workloads || true
       (
-        for _ in $(seq 1 30); do
+        for _ in $(seq 1 180); do
           sleep 3
           term_pods="$(kubectl get pods -n benchmark-workloads -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
           if [[ -n "${term_pods}" ]]; then

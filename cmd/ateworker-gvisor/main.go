@@ -1155,6 +1155,21 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	defer release()
 
+	if prevHosted := s.lookupActor(req.GetActorUid()); prevHosted != nil {
+		s.actorsMu.Lock()
+		prevRef := prevHosted.activeRef
+		s.actorsMu.Unlock()
+		if prevRef == attribution.Ref {
+			return &ateworkerpb.RestoreWorkloadResponse{}, nil
+		}
+		if prevRef.Name == "" {
+			prevRef = prevHosted.attribution.Ref
+		}
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		_ = s.terminateExitedSandbox(cleanupCtx, prevRef, req.GetActorUid(), req.GetActorDirs(), containers)
+		cancelCleanup()
+	}
+
 	checkpointDir := req.GetActorDirs().GetRestoreDir()
 	restoreArgs, err := fsRestoreArgs(checkpointDir, fidelity)
 	if err != nil {
@@ -1462,11 +1477,18 @@ func (s *AteWorkerService) TerminateWorkload(ctx context.Context, req *ateworker
 
 func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resources.ActorRef, actorUID, runscPath string, actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) error {
 	hosted := s.lookupActor(actorUID)
+	var prevRef resources.ActorRef
 	if hosted != nil {
 		hosted.stopping.Store(true)
+		s.actorsMu.Lock()
+		prevRef = hosted.activeRef
+		s.actorsMu.Unlock()
 	}
 	s.setSandboxCPUWeight(ctx, actorUID, cgroup.MaxCPUWeight)
 	var errs []error
+	if prevRef.Name != "" && prevRef != actorRef {
+		_ = s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: prevRef, UID: actorUID})
+	}
 	if err := s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: actorRef, UID: actorUID}); err != nil {
 		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
 	}
@@ -1530,10 +1552,19 @@ func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resou
 // cgroup leaves, runsc state directories, overlay mounts, and network tunnel.
 func (s *AteWorkerService) terminateExitedSandbox(ctx context.Context, actorRef resources.ActorRef, actorUID string, actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) error {
 	hosted := s.lookupActor(actorUID)
+	var sandbox *sandboxProcess
+	var prevRef resources.ActorRef
 	if hosted != nil {
 		hosted.stopping.Store(true)
+		sandbox = hosted.sandbox
+		s.actorsMu.Lock()
+		prevRef = hosted.activeRef
+		s.actorsMu.Unlock()
 	}
 	var errs []error
+	if prevRef.Name != "" && prevRef != actorRef {
+		_ = s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: prevRef, UID: actorUID})
+	}
 	if err := s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: actorRef, UID: actorUID}); err != nil {
 		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
 	}
@@ -1541,10 +1572,16 @@ func (s *AteWorkerService) terminateExitedSandbox(ctx context.Context, actorRef 
 		for _, ac := range containers {
 			leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
 			_ = cgroup.KillLeafUnder(ctx, s.cgroupRoot, leaf)
-			_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, leaf)
 		}
 		sandboxLeaf := s.sandboxCgroupLeaf(actorUID)
 		_ = cgroup.KillLeafUnder(ctx, s.cgroupRoot, sandboxLeaf)
+		if sandbox != nil {
+			_ = sandbox.waitGone(sandboxExitTimeout)
+		}
+		for _, ac := range containers {
+			leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
+			_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, leaf)
+		}
 		_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, sandboxLeaf)
 	}
 	if hosted == nil || hosted.slotDir == "" {

@@ -86,7 +86,7 @@ func (s *AteWorkerService) admitActor(attribution resources.ActorAttribution) (*
 	// The sandbox cgroup is new with every activation, so its counters start
 	// at zero.
 	ctx, cancel := context.WithCancel(context.Background())
-	hosted := &hostedActor{attribution: attribution, usage: workerstats.NewActivation(time.Now(), false), ctx: ctx, cancel: cancel}
+	hosted := &hostedActor{attribution: attribution, activeRef: attribution.Ref, usage: workerstats.NewActivation(time.Now(), false), ctx: ctx, cancel: cancel}
 	s.actors[attribution.UID] = hosted
 	return hosted, stale, nil
 }
