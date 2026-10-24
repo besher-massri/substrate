@@ -4,7 +4,8 @@
     "json",
     "--alsologtostderr",
     "--allow-suid",
-    "--host-settings=ignore"
+    "--host-settings=ignore",
+    "--shared-root=/var/lib/ate/runsc-shared-root"
   ],
   "commands": {
     "create": {

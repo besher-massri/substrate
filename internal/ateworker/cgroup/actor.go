@@ -144,8 +144,9 @@ func SetActorLeafCPUWeightUnder(root, name string, weight int) error {
 }
 
 // EnsureActorLeafCPUWeightUnder creates the named cgroup leaf directory under
-// root if it does not already exist and sets its cpu.weight to weight so runsc
-// inherits the pre-boosted CPU weight from the start of container creation.
+// root if it does not already exist, uncaps its cpu.max for the transition,
+// and sets its cpu.weight to weight so runsc inherits the pre-boosted CPU
+// priority from the start of container creation.
 func EnsureActorLeafCPUWeightUnder(root, name string, weight int) error {
 	path, err := actorLeafPath(root, name)
 	if err != nil {
@@ -154,7 +155,34 @@ func EnsureActorLeafCPUWeightUnder(root, name string, weight int) error {
 	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("while creating cgroup %q: %w", path, err)
 	}
+	if err := setCPUMax(path, 0); err != nil {
+		return err
+	}
 	return setCPUWeight(path, weight)
+}
+
+// SetActorLeafCPUMaxUnder sets cpu.max on the named actor leaf under root,
+// without opening it. Passing milliCPU <= 0 writes "max 100000" (unlimited).
+// A missing leaf or missing cpu.max is a no-op.
+func SetActorLeafCPUMaxUnder(root, name string, milliCPU int64) error {
+	if root == "" {
+		return nil
+	}
+	path, err := actorLeafPath(root, name)
+	if err != nil {
+		return err
+	}
+	return setCPUMax(path, milliCPU)
+}
+
+// setCPUMax writes cpuMax(milliCPU) to the cpu.max interface file in cgroupDir
+// when the cpu controller is present.
+func setCPUMax(cgroupDir string, milliCPU int64) error {
+	path := filepath.Join(cgroupDir, "cpu.max")
+	if err := writeExisting(path, cpuMax(milliCPU)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("while setting cpu.max on %q: %w", cgroupDir, err)
+	}
+	return nil
 }
 
 // setCPUWeight validates weight and writes it to the cpu.weight interface file
@@ -210,6 +238,14 @@ func KillLeafUnder(ctx context.Context, root, name string) error {
 // RemoveActorLeaf deletes the actor's leaf. Its processes must have exited.
 func RemoveActorLeaf(actorUID string) error {
 	return removeActorLeaf(Root, actorUID)
+}
+
+// RemoveActorLeafUnder is RemoveActorLeaf for a leaf under root rather than Root.
+func RemoveActorLeafUnder(root, name string) error {
+	if root == "" {
+		return nil
+	}
+	return removeActorLeaf(root, name)
 }
 
 func removeActorLeaf(root, actorUID string) error {

@@ -202,6 +202,9 @@ func do(ctx context.Context) error {
 	if err := os.MkdirAll(ateworkerDir, 0o700); err != nil {
 		return fmt.Errorf("in os.MkdirAll(%q): %w", ateworkerDir, err)
 	}
+	// Shared pivot-root directory for runsc (--shared-root) so each container
+	// restore does not allocate and mount a temporary null-netns directory.
+	_ = os.MkdirAll("/var/lib/ate/runsc-shared-root", 0o700)
 
 	// Prepare the pod cgroup so runsc can create per-actor-container leaves under
 	// it with real accounting.
@@ -649,6 +652,10 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		flags:          s.flags,
 	}
 
+	if preboostRestoreCgroupEnabled() {
+		s.ensureRestoreCgroupsPreboosted(ctx, req.GetActorUid(), containers)
+	}
+
 	bgCtx, cancelBg := context.WithCancel(ctx)
 	defer cancelBg()
 
@@ -770,7 +777,7 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 	}); err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
-	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.DefaultCPUWeight)
+	s.enforceSteadyActorCPULimits(ctx, req.GetActorUid(), rcmd.size.MilliCPU, containers)
 	err = <-egressDone
 	egressJoined = true
 	if err != nil {
@@ -880,18 +887,25 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 
 	containers := req.GetSpec().GetContainers()
 	durablePaths := durableFSCheckpointPaths(containers)
+	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 
 	// Cleanup the containers after checkpointing. This also unhosts the actor,
 	// before the snapshot listing below can fail.
 	// This is best-effort cleanup for actor containers that may have been left behind after checkpointing.
+	var sandboxGone bool
 	terminate := func() error {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		var termContainers []*ateworkerpb.Container
-		if fidelity != ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
-			termContainers = containers
+		var err error
+		if sandboxGone {
+			err = s.terminateExitedSandbox(cleanupCtx, attribution.Ref, attribution.UID, req.GetActorDirs(), containers)
+		} else {
+			var termContainers []*ateworkerpb.Container
+			if fidelity != ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+				termContainers = containers
+			}
+			err = s.terminateWorkload(cleanupCtx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), termContainers)
 		}
-		err := s.terminateWorkload(cleanupCtx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), termContainers)
 		if err != nil {
 			slog.WarnContext(cleanupCtx, "failed to terminate workload after checkpoint",
 				slog.String("actor", attribution.Ref.String()),
@@ -961,6 +975,8 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 			if sandbox != nil {
 				if err := sandbox.waitGone(sandboxExitTimeout); err != nil {
 					slog.WarnContext(ctx, "Sandbox did not go away after checkpoint", slog.Any("err", err))
+				} else {
+					sandboxGone = true
 				}
 			}
 			timing.checkpoint = lap(&tLast)
@@ -1321,10 +1337,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	if err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
-	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.DefaultCPUWeight)
-	if preboostCgroup {
-		s.setActorContainersCPUWeight(ctx, req.GetActorUid(), containers, cgroup.DefaultCPUWeight)
-	}
+	s.enforceSteadyActorCPULimits(ctx, req.GetActorUid(), rcmd.size.MilliCPU, containers)
 	err = <-egressDone
 	egressJoined = true
 	timing.egressPrepare = lap(&tLast)
@@ -1338,21 +1351,23 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	<-readaheadDone
 	readaheadJoined = true
-	dropActorCheckpointCacheAsync(hosted.ctx, req.GetActorUid(), checkpointDir, req.GetPreserveRestoreDir(), func(waitCtx context.Context) error {
-		if fidelity == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
-			if err := rcmd.cmdWaitRestore(waitCtx, ocispec.SandboxID); err != nil {
-				return err
-			}
-		}
-		if len(restoreArgs) > 0 {
-			for _, ctr := range fsRestoreContainers(fidelity, containers) {
-				if err := rcmd.cmdWaitFSRestore(waitCtx, ctr); err != nil {
+	if !req.GetPreserveRestoreDir() || os.Getenv("ATEWORKER_EVICT_PRESERVED_RESTORE_CACHE") == "true" {
+		dropActorCheckpointCacheAsync(hosted.ctx, req.GetActorUid(), checkpointDir, req.GetPreserveRestoreDir(), func(waitCtx context.Context) error {
+			if fidelity == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+				if err := rcmd.cmdWaitRestore(waitCtx, ocispec.SandboxID); err != nil {
 					return err
 				}
 			}
-		}
-		return nil
-	})
+			if len(restoreArgs) > 0 {
+				for _, ctr := range fsRestoreContainers(fidelity, containers) {
+					if err := rcmd.cmdWaitFSRestore(waitCtx, ctr); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restored", attribution)
 	s.actorsMu.Lock()
@@ -1446,6 +1461,40 @@ func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resou
 	return errors.Join(errs...)
 }
 
+// terminateExitedSandbox tears down an actor whose gVisor sentry has already
+// exited and been reaped after a MEMORY checkpoint, skipping redundant runsc
+// state and runsc delete CLI subprocesses and directly cleaning up the actor's
+// cgroup leaves, runsc state directories, overlay mounts, and network tunnel.
+func (s *AteWorkerService) terminateExitedSandbox(ctx context.Context, actorRef resources.ActorRef, actorUID string, actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) error {
+	if hosted := s.lookupActor(actorUID); hosted != nil {
+		hosted.stopping.Store(true)
+	}
+	var errs []error
+	if err := s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: actorRef, UID: actorUID}); err != nil {
+		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
+	}
+	if s.cgroupDelegated && s.cgroupRoot != "" {
+		for _, ac := range containers {
+			leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
+			_ = cgroup.KillLeafUnder(ctx, s.cgroupRoot, leaf)
+			_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, leaf)
+		}
+		sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
+		_ = cgroup.KillLeafUnder(ctx, s.cgroupRoot, sandboxLeaf)
+		_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, sandboxLeaf)
+	}
+	if err := resetRunscStateAndPidFileDirs(actorDirs); err != nil {
+		errs = append(errs, fmt.Errorf("while resetting runsc state and pid file dirs: %w", err))
+	}
+	if err := imagecache.UnmountAllUnder(actorDirs.GetOciBundleDir()); err != nil {
+		errs = append(errs, fmt.Errorf("while unmounting bundle rootfs overlays: %w", err))
+	}
+	if err := s.unhostActor(ctx, actorUID); err != nil {
+		errs = append(errs, fmt.Errorf("while cleaning up actor network: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
 func deleteContainers(ctx context.Context, rcmd *runsc, containers []string, operation string) {
 	for _, container := range slices.Backward(containers) {
 		if err := rcmd.cmdDelete(ctx, container); err != nil {
@@ -1456,15 +1505,57 @@ func deleteContainers(ctx context.Context, rcmd *runsc, containers []string, ope
 }
 
 // setSandboxCPUWeight sets cpu.weight on the actor's sandbox cgroup leaf when
-// the worker's cgroup is delegated.
+// the worker's cgroup is delegated. When raising to MaxCPUWeight for a
+// lifecycle transition, it also uncaps cpu.max so the transition is not
+// throttled by the steady-state CFS quota.
 func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID string, weight int) {
 	if !s.cgroupDelegated {
 		return
 	}
 	leaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
+	if weight == cgroup.MaxCPUWeight {
+		if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, 0); err != nil {
+			slog.WarnContext(ctx, "Could not uncap cpu.max on sandbox cgroup for transition",
+				slog.String("actorUID", actorUID), slog.Any("err", err))
+		}
+	}
 	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, weight); err != nil {
 		slog.WarnContext(ctx, "Could not set cpu.weight on sandbox cgroup",
 			slog.String("actorUID", actorUID), slog.Int("weight", weight), slog.Any("err", err))
+	}
+}
+
+// enforceSteadyActorCPULimits lowers cpu.weight to DefaultCPUWeight (100) and
+// enforces the actor's declared steady-state cpu.max quota on both the sandbox
+// cgroup leaf and all application container cgroup leaves once startup or
+// restore wakeup probes complete.
+func (s *AteWorkerService) enforceSteadyActorCPULimits(ctx context.Context, actorUID string, milliCPU int64, containers []*ateworkerpb.Container) {
+	if !s.cgroupDelegated {
+		return
+	}
+	sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
+	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, sandboxLeaf, cgroup.DefaultCPUWeight); err != nil {
+		slog.WarnContext(ctx, "Could not set steady cpu.weight on sandbox cgroup",
+			slog.String("actorUID", actorUID), slog.Any("err", err))
+	}
+	if milliCPU > 0 {
+		if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, sandboxLeaf, milliCPU); err != nil {
+			slog.WarnContext(ctx, "Could not set steady cpu.max on sandbox cgroup",
+				slog.String("actorUID", actorUID), slog.Int64("milliCPU", milliCPU), slog.Any("err", err))
+		}
+	}
+	for _, ac := range containers {
+		leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
+		if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, cgroup.DefaultCPUWeight); err != nil {
+			slog.WarnContext(ctx, "Could not set steady cpu.weight on container cgroup",
+				slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Any("err", err))
+		}
+		if milliCPU > 0 {
+			if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, milliCPU); err != nil {
+				slog.WarnContext(ctx, "Could not set steady cpu.max on container cgroup",
+					slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Int64("milliCPU", milliCPU), slog.Any("err", err))
+			}
+		}
 	}
 }
 

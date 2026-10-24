@@ -179,6 +179,42 @@ func TestActorLeafSetCPUWeight(t *testing.T) {
 	}
 }
 
+func TestSetActorLeafCPUMaxUnder(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "uid-a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	maxPath := filepath.Join(root, "uid-a", "cpu.max")
+	if err := os.WriteFile(maxPath, []byte("100000 100000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SetActorLeafCPUMaxUnder(root, "uid-a", 0); err != nil {
+		t.Fatalf("SetActorLeafCPUMaxUnder(0): %v", err)
+	}
+	if got, _ := os.ReadFile(maxPath); string(got) != "max 100000" {
+		t.Errorf("after SetActorLeafCPUMaxUnder(0), cpu.max = %q, want \"max 100000\"", got)
+	}
+
+	if err := SetActorLeafCPUMaxUnder(root, "uid-a", 248); err != nil {
+		t.Fatalf("SetActorLeafCPUMaxUnder(248): %v", err)
+	}
+	if got, _ := os.ReadFile(maxPath); string(got) != "24800 100000" {
+		t.Errorf("after SetActorLeafCPUMaxUnder(248), cpu.max = %q, want \"24800 100000\"", got)
+	}
+
+	// Missing leaf or empty root is a no-op.
+	if err := SetActorLeafCPUMaxUnder("", "uid-a", 248); err != nil {
+		t.Errorf("SetActorLeafCPUMaxUnder empty root: %v", err)
+	}
+	if err := SetActorLeafCPUMaxUnder(root, "no-such-actor", 248); err != nil {
+		t.Errorf("SetActorLeafCPUMaxUnder missing leaf: %v", err)
+	}
+	if err := SetActorLeafCPUMaxUnder(root, "../escape", 248); err == nil {
+		t.Error("SetActorLeafCPUMaxUnder(../escape) succeeded, want error")
+	}
+}
+
 func BenchmarkActorLeafCPUWeightTransition(b *testing.B) {
 	root := b.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "uid-bench"), 0o755); err != nil {

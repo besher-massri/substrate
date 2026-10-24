@@ -104,8 +104,33 @@ func noRootContainerArgs(containerName string) []string {
 	return nil
 }
 
+// runscCmdEnv returns the environment variables for runsc subprocesses,
+// bounding GOMAXPROCS to 4 unless already set in the environment so short-lived
+// runsc CLI, gofer, and sentry processes do not initialize 180 Go P structs on
+// high-core hosts.
+func runscCmdEnv() []string {
+	env := os.Environ()
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GOMAXPROCS=") {
+			return env
+		}
+	}
+	return append(env, "GOMAXPROCS=4")
+}
+
+// execRunsc constructs an exec.Cmd for r.path with runscCmdEnv configured.
+func (r *runsc) execRunsc(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, r.path, args...)
+	cmd.Env = runscCmdEnv()
+	return cmd
+}
+
 // writeSpec builds the container's OCI spec, shapes it for gVisor, and saves it
-// into the container's bundle.
+// into the container's bundle. During creation and restore, the CPU quota floor
+// is raised to at least DefaultBurstFloorMilliCPU (1000m) so runsc create never
+// throttles the restoring sentry at sub-vCPU quotas while --cpu-num-from-quota
+// still resolves to 1 vCPU; steady-state cpu.max is enforced after wakeup
+// probes complete.
 func (r *runsc) writeSpec(containerName string) error {
 	bundlePath := ociBundlePath(r.actorDirs, containerName)
 	var spec *specs.Spec
@@ -129,6 +154,7 @@ func (r *runsc) writeSpec(containerName string) error {
 		DurableVolumes: r.durableVolumes,
 		Size:           r.size,
 	})
+	r.size.ApplyToOCISpecWithFloor(spec, sizing.DefaultBurstFloorMilliCPU)
 	return ocispec.Save(bundlePath, spec)
 }
 
@@ -173,7 +199,7 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 
-	cmd := exec.CommandContext(ctx, r.path, r.createArgs(containerName, additionalArgs)...)
+	cmd := r.execRunsc(ctx, r.createArgs(containerName, additionalArgs)...)
 	cmd.Stdout = out
 	cmd.Stderr = out
 
@@ -188,7 +214,7 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName string) error {
 	slog.InfoContext(ctx, "About to run runsc start", slog.String("container", containerName))
 
-	cmd := exec.CommandContext(ctx, r.path, r.buildArgs("start", containerName)...)
+	cmd := r.execRunsc(ctx, r.buildArgs("start", containerName)...)
 	cmd.Stdout = out
 	cmd.Stderr = out
 
@@ -214,7 +240,7 @@ func (r *runsc) checkpointArgs(containerName, checkpointPath string, fsCheckpoin
 func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath string, fsCheckpointPaths []string) error {
 	slog.InfoContext(ctx, "About to run runsc checkpoint", slog.String("container", containerName))
 
-	cmd := exec.CommandContext(ctx, r.path, r.checkpointArgs(containerName, checkpointPath, fsCheckpointPaths)...)
+	cmd := r.execRunsc(ctx, r.checkpointArgs(containerName, checkpointPath, fsCheckpointPaths)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
@@ -239,7 +265,7 @@ func (r *runsc) fsCheckpointArgs(containerName, checkpointPath string, fsCheckpo
 func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, fsCheckpointPaths []string) error {
 	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
 
-	cmd := exec.CommandContext(ctx, r.path, r.fsCheckpointArgs(containerName, checkpointPath, fsCheckpointPaths)...)
+	cmd := r.execRunsc(ctx, r.fsCheckpointArgs(containerName, checkpointPath, fsCheckpointPaths)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
@@ -269,7 +295,7 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 
-	cmd := exec.CommandContext(ctx, r.path, r.restoreArgs(containerName, checkpointPath)...)
+	cmd := r.execRunsc(ctx, r.restoreArgs(containerName, checkpointPath)...)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	if err := cmd.Run(); err != nil {
@@ -279,9 +305,8 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 }
 
 func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
-	cmd := exec.CommandContext(
+	cmd := r.execRunsc(
 		ctx,
-		r.path,
 		r.buildArgs("delete", containerName)...,
 	)
 	cmd.Stdout = os.Stdout
@@ -294,9 +319,8 @@ func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
 }
 
 func (r *runsc) cmdState(ctx context.Context, containerName string) error {
-	cmd := exec.CommandContext(
+	cmd := r.execRunsc(
 		ctx,
-		r.path,
 		r.buildArgs("state", containerName)...,
 	)
 	cmd.Stdout = os.Stdout
@@ -309,9 +333,8 @@ func (r *runsc) cmdState(ctx context.Context, containerName string) error {
 
 // cmdList returns the container IDs runsc has a record of.
 func (r *runsc) cmdList(ctx context.Context) ([]string, error) {
-	cmd := exec.CommandContext(
+	cmd := r.execRunsc(
 		ctx,
-		r.path,
 		r.buildArgs("list", "")...,
 	)
 	var out bytes.Buffer
@@ -328,7 +351,7 @@ func (r *runsc) cmdList(ctx context.Context) ([]string, error) {
 func (r *runsc) cmdKill(ctx context.Context, containerName, signal string) error {
 	slog.InfoContext(ctx, "About to run runsc kill", slog.String("container", containerName), slog.String("signal", signal))
 
-	cmd := exec.CommandContext(ctx, r.path, r.buildArgs("kill", "", containerName, signal)...)
+	cmd := r.execRunsc(ctx, r.buildArgs("kill", "", containerName, signal)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -340,7 +363,7 @@ func (r *runsc) cmdKill(ctx context.Context, containerName, signal string) error
 // runWait runs `runsc wait [extraArgs...] <container>` and blocks until the
 // waited-on condition completes.
 func (r *runsc) runWait(ctx context.Context, containerName string, extraArgs ...string) error {
-	cmd := exec.CommandContext(ctx, r.path, r.buildArgs("wait", containerName, extraArgs...)...)
+	cmd := r.execRunsc(ctx, r.buildArgs("wait", containerName, extraArgs...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
