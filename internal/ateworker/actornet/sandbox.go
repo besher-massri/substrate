@@ -76,13 +76,13 @@ type SandboxNetworkConfig struct {
 	DNSPolicy dns.PolicySource
 }
 
-// prewarmedVethPair holds a brand-new, never-used pair of runtime and gateway
+// PrewarmedVethPair holds a brand-new, never-used pair of runtime and gateway
 // network namespaces with their veth pair, addresses, default route, sysctls,
 // and nftables redirect rules already configured.
-type prewarmedVethPair struct {
-	egressPort uint16
-	runtimeNS  netns.Handle
-	gatewayNS  netns.Handle
+type PrewarmedVethPair struct {
+	EgressPort uint16
+	RuntimeNS  netns.Handle
+	GatewayNS  netns.Handle
 }
 
 const (
@@ -94,7 +94,7 @@ const (
 
 var (
 	vethPoolOnce      sync.Once
-	vethPoolCh        chan prewarmedVethPair
+	vethPoolCh        chan PrewarmedVethPair
 	vethReplenishCh   chan uint16
 	asyncNetNSCloseCh chan netns.Handle
 )
@@ -110,7 +110,7 @@ func netnsPoolEnabled() bool {
 // namespace closer worker goroutines once per process.
 func initVethPool() {
 	vethPoolOnce.Do(func() {
-		vethPoolCh = make(chan prewarmedVethPair, freshVethPoolCapacity)
+		vethPoolCh = make(chan PrewarmedVethPair, freshVethPoolCapacity)
 		vethReplenishCh = make(chan uint16, freshVethPoolCapacity)
 		asyncNetNSCloseCh = make(chan netns.Handle, asyncNetNSCloseCapacity)
 
@@ -140,8 +140,8 @@ func initVethPool() {
 						select {
 						case vethPoolCh <- pair:
 						default:
-							_ = pair.runtimeNS.Close()
-							_ = pair.gatewayNS.Close()
+							_ = pair.RuntimeNS.Close()
+							_ = pair.GatewayNS.Close()
 						}
 					}
 				}
@@ -166,10 +166,10 @@ func WarmSandboxNetworkPool(egressPort uint16) {
 	}
 }
 
-// acquirePrewarmedVethPair pops a brand-new, never-used (runtimeNS, gatewayNS)
+// AcquirePrewarmedVethPair pops a brand-new, never-used (RuntimeNS, GatewayNS)
 // pair from the pre-warmed pool or creates one synchronously if the pool is
 // currently empty, signaling the background replenisher to refill the pool.
-func acquirePrewarmedVethPair(ctx context.Context, egressPort uint16) (prewarmedVethPair, error) {
+func AcquirePrewarmedVethPair(ctx context.Context, egressPort uint16) (PrewarmedVethPair, error) {
 	initVethPool()
 	select {
 	case vethReplenishCh <- egressPort:
@@ -182,24 +182,31 @@ func acquirePrewarmedVethPair(ctx context.Context, egressPort uint16) (prewarmed
 			case vethReplenishCh <- egressPort:
 			default:
 			}
-			if pair.egressPort == egressPort {
+			if pair.EgressPort == egressPort {
 				return pair, nil
 			}
-			enqueueAsyncNetNSClose(pair.runtimeNS)
-			enqueueAsyncNetNSClose(pair.gatewayNS)
+			enqueueAsyncNetNSClose(pair.RuntimeNS)
+			enqueueAsyncNetNSClose(pair.GatewayNS)
 		default:
 			return createPrewarmedVethPair(ctx, egressPort)
 		}
 	}
 }
 
-// createPrewarmedVethPair constructs a fresh unnamed (runtimeNS, gatewayNS)
+// ReleasePrewarmedVethPair asynchronously closes both network namespace handles
+// of a pre-warmed veth pair that was not adopted by an actor session.
+func ReleasePrewarmedVethPair(pair PrewarmedVethPair) {
+	enqueueAsyncNetNSClose(pair.RuntimeNS)
+	enqueueAsyncNetNSClose(pair.GatewayNS)
+}
+
+// createPrewarmedVethPair constructs a fresh unnamed (RuntimeNS, GatewayNS)
 // pair with its veth link, addresses, route, sysctls, and nftables redirect
 // rules configured.
-func createPrewarmedVethPair(ctx context.Context, egressPort uint16) (_ prewarmedVethPair, retErr error) {
+func createPrewarmedVethPair(ctx context.Context, egressPort uint16) (_ PrewarmedVethPair, retErr error) {
 	actorNS, err := netns.CreateAnonymous()
 	if err != nil {
-		return prewarmedVethPair{}, fmt.Errorf("while creating anonymous actor netns: %w", err)
+		return PrewarmedVethPair{}, fmt.Errorf("while creating anonymous actor netns: %w", err)
 	}
 	defer func() {
 		if retErr != nil {
@@ -208,7 +215,7 @@ func createPrewarmedVethPair(ctx context.Context, egressPort uint16) (_ prewarme
 	}()
 	outer, err := netns.CreateAnonymous()
 	if err != nil {
-		return prewarmedVethPair{}, fmt.Errorf("while creating anonymous gateway netns: %w", err)
+		return PrewarmedVethPair{}, fmt.Errorf("while creating anonymous gateway netns: %w", err)
 	}
 	defer func() {
 		if retErr != nil {
@@ -216,15 +223,15 @@ func createPrewarmedVethPair(ctx context.Context, egressPort uint16) (_ prewarme
 		}
 	}()
 	if err := configureVethPair(ctx, actorNS, outer); err != nil {
-		return prewarmedVethPair{}, err
+		return PrewarmedVethPair{}, err
 	}
 	if err := setupGatewaySide(ctx, outer, egressPort); err != nil {
-		return prewarmedVethPair{}, err
+		return PrewarmedVethPair{}, err
 	}
-	return prewarmedVethPair{
-		egressPort: egressPort,
-		runtimeNS:  actorNS,
-		gatewayNS:  outer,
+	return PrewarmedVethPair{
+		EgressPort: egressPort,
+		RuntimeNS:  actorNS,
+		GatewayNS:  outer,
 	}, nil
 }
 
@@ -243,6 +250,36 @@ func enqueueAsyncNetNSClose(h netns.Handle) {
 	}
 }
 
+// SetupSandboxNetworkWithPair binds an already-created PrewarmedVethPair to
+// the actor's named runtime and gateway network namespaces.
+func SetupSandboxNetworkWithPair(cfg SandboxNetworkConfig, pair PrewarmedVethPair) (_ *SandboxNetwork, retErr error) {
+	actorUID := cfg.ActorUID
+	if actorUID == "" {
+		ReleasePrewarmedVethPair(pair)
+		return nil, fmt.Errorf("actornet: actor UID is required")
+	}
+	actorNSName := nodepath.ActorNetNSName(actorUID)
+	gatewayNSName := SandboxGatewayNetNSName(actorUID)
+	defer func() {
+		if retErr != nil {
+			_ = netns.RemoveNamed(actorNSName)
+			_ = netns.RemoveNamed(gatewayNSName)
+			ReleasePrewarmedVethPair(pair)
+		}
+	}()
+	if err := netns.BindNamed(actorNSName, pair.RuntimeNS); err != nil {
+		return nil, fmt.Errorf("while binding actor netns %s: %w", actorNSName, err)
+	}
+	if err := netns.BindNamed(gatewayNSName, pair.GatewayNS); err != nil {
+		return nil, fmt.Errorf("while binding gateway netns %s: %w", gatewayNSName, err)
+	}
+	return &SandboxNetwork{
+		ActorUID:     actorUID,
+		RuntimeNetNS: pair.RuntimeNS,
+		GatewayNetNS: pair.GatewayNS,
+	}, nil
+}
+
 // SetupSandboxNetwork creates isolated networking with fixed sandbox addresses.
 // gVisor uses a veth pair across runtime and gateway namespaces because it takes
 // over every interface in its namespace. MicroVMs use a tap in one namespace.
@@ -257,30 +294,11 @@ func SetupSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig) (_ *Sand
 
 	actorNSName := nodepath.ActorNetNSName(actorUID)
 	if cfg.Veth && netnsPoolEnabled() {
-		gatewayNSName := SandboxGatewayNetNSName(actorUID)
-		pair, err := acquirePrewarmedVethPair(ctx, cfg.EgressPort)
+		pair, err := AcquirePrewarmedVethPair(ctx, cfg.EgressPort)
 		if err != nil {
 			return nil, err
 		}
-		defer func() {
-			if retErr != nil {
-				_ = netns.RemoveNamed(actorNSName)
-				_ = netns.RemoveNamed(gatewayNSName)
-				enqueueAsyncNetNSClose(pair.runtimeNS)
-				enqueueAsyncNetNSClose(pair.gatewayNS)
-			}
-		}()
-		if err := netns.BindNamed(actorNSName, pair.runtimeNS); err != nil {
-			return nil, fmt.Errorf("while binding actor netns %s: %w", actorNSName, err)
-		}
-		if err := netns.BindNamed(gatewayNSName, pair.gatewayNS); err != nil {
-			return nil, fmt.Errorf("while binding gateway netns %s: %w", gatewayNSName, err)
-		}
-		return &SandboxNetwork{
-			ActorUID:     actorUID,
-			RuntimeNetNS: pair.runtimeNS,
-			GatewayNetNS: pair.gatewayNS,
-		}, nil
+		return SetupSandboxNetworkWithPair(cfg, pair)
 	}
 
 	actorNS, err := netns.CreateNamed(actorNSName)
@@ -662,6 +680,17 @@ type SandboxSession struct {
 	serving sync.WaitGroup
 }
 
+// ServePrewarmedSandbox binds an already-created PrewarmedVethPair to the
+// actor's named runtime and gateway network namespaces and serves egress and
+// DNS from its gateway namespace.
+func ServePrewarmedSandbox(ctx context.Context, cfg SandboxNetworkConfig, pair PrewarmedVethPair, egress egressServer, resolver *dns.Relay) (_ *SandboxSession, retErr error) {
+	network, err := SetupSandboxNetworkWithPair(cfg, pair)
+	if err != nil {
+		return nil, err
+	}
+	return serveSandboxNetwork(ctx, cfg, network, egress, resolver)
+}
+
 // ServeSandbox builds a sandbox's network and serves egress and DNS from its
 // gateway namespace. A nil server leaves that unserved, which fails closed.
 // DNS queries are checked against the policy cfg.DNSPolicy supplies.
@@ -670,6 +699,12 @@ func ServeSandbox(ctx context.Context, cfg SandboxNetworkConfig, egress egressSe
 	if err != nil {
 		return nil, err
 	}
+	return serveSandboxNetwork(ctx, cfg, network, egress, resolver)
+}
+
+// serveSandboxNetwork attaches DNS and egress serving goroutines to an
+// established SandboxNetwork.
+func serveSandboxNetwork(ctx context.Context, cfg SandboxNetworkConfig, network *SandboxNetwork, egress egressServer, resolver *dns.Relay) (_ *SandboxSession, retErr error) {
 	session := &SandboxSession{Network: network}
 	defer func() {
 		if retErr != nil {

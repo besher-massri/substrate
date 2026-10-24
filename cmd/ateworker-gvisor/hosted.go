@@ -27,6 +27,8 @@ import (
 	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/ateworker/actornet"
 	"go.ate.dev/substrate/internal/atunnel/ingress"
+	"go.ate.dev/substrate/internal/netns"
+	"go.ate.dev/substrate/internal/ocispec"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/workerstats"
@@ -55,6 +57,12 @@ type hostedActor struct {
 	sandbox *sandboxProcess
 	// activeRef tracks the currently routed ActorRef on a pooled VU slot.
 	activeRef resources.ActorRef
+	// Pre-warmed sandbox slot overrides when restored from sandboxPool.
+	sandboxCgroupLeaf string
+	slotDir           string
+	stateDir          string
+	pidDir            string
+	sandboxBundleDir  string
 }
 
 // admitActor reserves capacity before network setup. An actor that is already
@@ -122,6 +130,76 @@ func (s *AteWorkerService) hostActor(ctx context.Context, attribution resources.
 	return hosted, nil
 }
 
+// hostActorPrewarmed admits the actor and binds a pre-warmed sandbox's network
+// namespace and state directories to it.
+func (s *AteWorkerService) hostActorPrewarmed(ctx context.Context, attribution resources.ActorAttribution, psb *prewarmedSandbox) (*hostedActor, error) {
+	uid := attribution.UID
+
+	hosted, stale, err := s.admitActor(attribution)
+	if err != nil {
+		s.sandboxPool.destroyPrewarmed(ctx, psb)
+		return nil, err
+	}
+	evict := func() {
+		hosted.cancel()
+		s.actorsMu.Lock()
+		delete(s.actors, uid)
+		s.actorsMu.Unlock()
+		s.sandboxPool.destroyPrewarmed(ctx, psb)
+	}
+	if stale != nil {
+		if err := stale.Close(ctx); err != nil {
+			evict()
+			return nil, fmt.Errorf("while clearing stale state for actor %s: %w", uid, err)
+		}
+	}
+
+	session, err := actornet.ServePrewarmedSandbox(ctx, actornet.SandboxNetworkConfig{
+		ActorUID:   uid,
+		Veth:       true,
+		EgressPort: s.tunnel.EgressPort,
+		DNSPolicy:  s.tunnel.ActorEgressPolicy(attribution),
+	}, psb.vethPair, s.tunnel.Egress, s.tunnel.DNSRelay)
+	if err != nil {
+		psb.hasVethPair = false
+		evict()
+		return nil, fmt.Errorf("while setting up prewarmed sandbox network: %w", err)
+	}
+	psb.hasVethPair = false
+	if psb.tempNSName != "" {
+		_ = netns.RemoveNamed(psb.tempNSName)
+		psb.tempNSName = ""
+	}
+
+	s.actorsMu.Lock()
+	hosted.network = session
+	hosted.sandbox = psb.sandbox
+	psb.sandbox = nil
+	hosted.sandboxCgroupLeaf = psb.cgroupLeaf
+	hosted.slotDir = psb.slotDir
+	hosted.stateDir = psb.stateDir
+	hosted.pidDir = psb.pidDir
+	hosted.sandboxBundleDir = psb.sandboxBundleDir
+	s.actorsMu.Unlock()
+	return hosted, nil
+}
+
+// sandboxCgroupLeaf returns the cgroup leaf name for actorUID's sandbox,
+// returning the pre-warmed sandbox leaf when the actor was restored from
+// sandboxPool.
+func (s *AteWorkerService) sandboxCgroupLeaf(actorUID string) string {
+	s.actorsMu.RLock()
+	var leaf string
+	if hosted := s.actors[actorUID]; hosted != nil {
+		leaf = hosted.sandboxCgroupLeaf
+	}
+	s.actorsMu.RUnlock()
+	if leaf != "" {
+		return leaf
+	}
+	return ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
+}
+
 // unhostActor removes an actor and its network. Repeated calls are safe.
 func (s *AteWorkerService) unhostActor(ctx context.Context, actorUID string) error {
 	s.actorsMu.Lock()
@@ -147,7 +225,9 @@ func (s *AteWorkerService) unhostActor(ctx context.Context, actorUID string) err
 		hosted.sandbox.Close()
 		hosted.sandbox = nil
 	}
+	slotDir := hosted.slotDir
 	s.actorsMu.Unlock()
+	defer cleanupPrewarmedSlotDir(slotDir)
 	if hosted.network == nil {
 		return nil
 	}

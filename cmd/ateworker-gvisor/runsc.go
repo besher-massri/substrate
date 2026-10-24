@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -56,8 +57,50 @@ type runsc struct {
 	// flags holds the configured flags; must not be nil.
 	flags *flagStore
 
+	stateDirOverride      string
+	pidDirOverride        string
+	sandboxBundleOverride string
+
 	specMu       sync.Mutex
 	specsWritten map[string]bool
+}
+
+// stateDir returns the runsc --root state directory for this workload, using
+// stateDirOverride when present.
+func (r *runsc) stateDir() string {
+	if r.stateDirOverride != "" {
+		return r.stateDirOverride
+	}
+	return runscStateDir(r.actorDirs)
+}
+
+// pidFile returns the PID file path for containerName, using pidDirOverride
+// when present.
+func (r *runsc) pidFile(containerName string) string {
+	if r.pidDirOverride != "" {
+		return filepath.Join(r.pidDirOverride, containerName+".pid")
+	}
+	return pidFilePath(r.actorDirs, containerName)
+}
+
+// bundlePath returns the OCI bundle path for containerName, using
+// sandboxBundleOverride for the sandbox container when present.
+func (r *runsc) bundlePath(containerName string) string {
+	if containerName == ocispec.SandboxID && r.sandboxBundleOverride != "" {
+		return r.sandboxBundleOverride
+	}
+	return ociBundlePath(r.actorDirs, containerName)
+}
+
+// markSpecWritten records that containerName's OCI config.json has already been
+// written into its bundle directory.
+func (r *runsc) markSpecWritten(containerName string) {
+	r.specMu.Lock()
+	if r.specsWritten == nil {
+		r.specsWritten = make(map[string]bool)
+	}
+	r.specsWritten[containerName] = true
+	r.specMu.Unlock()
 }
 
 // buildArgs constructs the runsc argument vector for command, appending
@@ -72,7 +115,7 @@ func (r *runsc) buildArgs(command, containerName string, extraArgs ...string) []
 	args := make([]string, 0,
 		len(globalFlags)+2+1+len(subcommandFlags)+len(extraArgs)+1)
 	args = append(args, globalFlags...)
-	args = append(args, "-root", runscStateDir(r.actorDirs))
+	args = append(args, "-root", r.stateDir())
 	args = append(args, command)
 	args = append(args, subcommandFlags...)
 	args = append(args, extraArgs...)
@@ -166,7 +209,7 @@ func applyTransitionCPUShares(spec *specs.Spec) {
 // GOMAXPROCS=2; steady-state cpu.max and cpu.weight are enforced after wakeup
 // probes complete.
 func (r *runsc) writeSpec(containerName string) error {
-	bundlePath := ociBundlePath(r.actorDirs, containerName)
+	bundlePath := r.bundlePath(containerName)
 	var spec *specs.Spec
 	if containerName == ocispec.SandboxID {
 		// atelet makes only the application containers' bundles.
@@ -220,8 +263,8 @@ func (r *runsc) ensureSpec(containerName string) error {
 // the argument construction can be unit-tested without executing runsc.
 func (r *runsc) createArgs(containerName string, additionalArgs []string) []string {
 	args := append(noRootContainerArgs(containerName),
-		"-bundle", ociBundlePath(r.actorDirs, containerName),
-		"-pid-file", pidFilePath(r.actorDirs, containerName),
+		"-bundle", r.bundlePath(containerName),
+		"-pid-file", r.pidFile(containerName),
 	)
 	args = append(args, additionalArgs...)
 	return r.buildArgs("create", containerName, args...)
@@ -314,9 +357,9 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 // the argument construction can be unit-tested without executing runsc.
 func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
 	args := append(noRootContainerArgs(containerName),
-		"-bundle", ociBundlePath(r.actorDirs, containerName),
+		"-bundle", r.bundlePath(containerName),
 		"-image-path", checkpointPath,
-		"-pid-file", pidFilePath(r.actorDirs, containerName),
+		"-pid-file", r.pidFile(containerName),
 	)
 	return r.buildArgs("restore", containerName, args...)
 }

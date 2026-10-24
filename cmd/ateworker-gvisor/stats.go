@@ -270,7 +270,7 @@ func (s *AteWorkerService) sampleSandbox(active *resources.ActorAttribution) (*a
 		read = cgroupstats.Read
 	}
 	observedAt := time.Now()
-	sample, err := read(filepath.Join(s.cgroupRoot, ocispec.GVisorCgroupLeaf(active.UID, sandboxCgroupContainer)))
+	sample, err := read(filepath.Join(s.cgroupRoot, s.sandboxCgroupLeaf(active.UID)))
 	if err != nil {
 		return nil, cgroupstats.Sample{}, err
 	}
