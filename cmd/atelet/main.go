@@ -1715,7 +1715,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 							if err != nil {
 								return nil, fmt.Errorf("while calling worker RestoreWorkload: %w", err)
 							}
-							_ = os.RemoveAll(actorDirs.GetCheckpointDir())
+							_ = os.Remove(filepath.Join(actorDirs.GetCheckpointDir(), "checkpoint.img"))
 							return &ateletpb.RestoreResponse{}, nil
 						}
 					}

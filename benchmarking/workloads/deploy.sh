@@ -367,6 +367,10 @@ prepopulate_cold_actors() {
   existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -Atc "SELECT CASE WHEN (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS DISTINCT FROM (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-2') AND (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS NOT NULL THEN (SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%') ELSE 0 END" 2>/dev/null || echo 0)"
   echo "Current gRPC-created cold registered actors in benchmark atespace: ${existing_actors}"
+  if [[ "${ENVELOPE_FORCE_RESEED_COLD_ACTORS:-}" == "true" ]]; then
+    echo "ENVELOPE_FORCE_RESEED_COLD_ACTORS=true: forcing full 100,000,000 cold actor re-seeding via CreateActor gRPC..."
+    existing_actors=0
+  fi
   if ((existing_actors >= 100000000)); then
     echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; cleaning non-cold actors."
     kubectl exec -n ate-system postgres-0 -c postgres -- \
@@ -407,6 +411,8 @@ prepopulate_cold_actors() {
       INSERT INTO actors SELECT * FROM keep_actors;
       INSERT INTO actor_egress_policies SELECT * FROM keep_egress;
     "
+  kubectl rollout restart deployment/ate-api-server --namespace=ate-system || true
+  kubectl rollout status deployment/ate-api-server --namespace=ate-system --timeout=300s || true
   run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
 
   run_cold_actor_seed_job 100000000 6250000 16 0
@@ -505,6 +511,7 @@ deploy() {
     if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
       kubectl patch deploy -n benchmark-workloads benchmark-worker \
         -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":"100%","maxSurge":0}}}}' || true
+      kubectl rollout restart deployment/benchmark-worker --namespace=benchmark-workloads || true
     fi
     kubectl rollout status deployment/benchmark-worker \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
