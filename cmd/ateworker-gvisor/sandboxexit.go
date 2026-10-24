@@ -45,19 +45,9 @@ type sandboxProcess struct {
 // openSandboxProcess pins the sandbox before it can exit, so a reused pid is
 // never mistaken for it.
 func openSandboxProcess(actorDirs *ateworkerpb.ActorDirs) (*sandboxProcess, error) {
-	return openSandboxProcessAt(pidFilePath(actorDirs, ocispec.SandboxID))
-}
-
-// openSandboxProcessAt pins the sandbox process whose PID is recorded in
-// pidFile before it can exit, so a reused pid is never mistaken for it.
-func openSandboxProcessAt(pidFile string) (*sandboxProcess, error) {
-	b, err := os.ReadFile(pidFile)
+	pid, err := sandboxPid(actorDirs)
 	if err != nil {
 		return nil, err
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		return nil, fmt.Errorf("parsing sandbox pid %q: %w", b, err)
 	}
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {

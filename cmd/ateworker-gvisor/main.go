@@ -245,9 +245,6 @@ func do(ctx context.Context) error {
 	}
 	ateworkerService := NewService(tunnel, actorLogger, *maxActors, flags)
 	ateworkerService.cgroupDelegated = cgroupDelegated
-	if tunnel != nil {
-		ateworkerService.sandboxPool = newSandboxPool(ateworkerService.cgroupRoot, cgroupDelegated, tunnel.EgressPort, flags)
-	}
 	// The controller sets both from the downward API.
 	pool := workerstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -378,9 +375,6 @@ type AteWorkerService struct {
 
 	// flags holds the watched JSON flag configuration.
 	flags *flagStore
-
-	// sandboxPool holds pre-warmed gVisor _sandbox instances for fast restore.
-	sandboxPool *sandboxPool
 }
 
 var _ ateworkerpb.WorkerServer = (*AteWorkerService)(nil)
@@ -433,7 +427,6 @@ func cancelStartups(ctx context.Context, inFlight *actorlock.InFlight) {
 // containers to exit.
 func (s *AteWorkerService) gracefulShutdown(ctx context.Context) {
 	s.shuttingDown.Store(true)
-	s.sandboxPool.Close(ctx)
 	// If there is an active run or restore RPC, try to cancel it. This is considered
 	// less disruptive than waiting for it to complete and then immediately sending
 	// a SIGTERM.
@@ -770,6 +763,7 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		if err := rcmd.cmdCreate(ctx, pw, ac.GetName(), nil); err != nil {
 			return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
 		}
+		s.boostContainerCgroupForTransition(ctx, req.GetActorUid(), ac.GetName())
 		if err := rcmd.cmdStart(ctx, pw, ac.GetName()); err != nil {
 			return nil, fmt.Errorf("while starting %q application container: %w", ac.GetName(), err)
 		}
@@ -884,11 +878,6 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 		actorDirs: req.GetActorDirs(),
 		flags:     s.flags,
 	}
-	if hosted != nil {
-		rcmd.stateDirOverride = hosted.stateDir
-		rcmd.pidDirOverride = hosted.pidDir
-		rcmd.sandboxBundleOverride = hosted.sandboxBundleDir
-	}
 
 	checkpointPath := req.GetActorDirs().GetCheckpointDir()
 	// Clear any partial files from a previous failed attempt.
@@ -1001,7 +990,8 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	default:
 		return nil, fmt.Errorf("unsupported snapshot fidelity: %v", fidelity)
 	}
-	if err := checkpointIsolatedWithLeaf(ctx, s.cgroupDelegated, s.cgroupRoot, s.sandboxCgroupLeaf(req.GetActorUid()), rcmd.pidFile(ocispec.SandboxID), req.GetActorUid(), checkpointFn, terminate); err != nil {
+	if err := checkpointIsolated(ctx, s.cgroupDelegated, s.cgroupRoot, req.GetActorUid(), req.GetActorDirs(), checkpointFn, terminate); err != nil {
+		s.enforceSteadyActorCPULimits(ctx, req.GetActorUid(), actorSize.MilliCPU, containers)
 		return nil, err
 	}
 
@@ -1013,12 +1003,6 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 		return nil, fmt.Errorf("while listing checkpoint files: %w", err)
 	}
 	durableFiles := durableSnapshotFiles(snapshotFiles)
-
-	if s.sandboxPool != nil && (actorSize.MilliCPU > 0 || actorSize.MemoryBytes > 0) {
-		if sig, ok := rootfsSignature(checkpointPath, fidelity, durableVolumeNames(req.GetSpec())); ok {
-			_ = s.sandboxPool.ensureConfigured(req.GetRunscPath(), checkpointPath, sig, actorSize)
-		}
-	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 
@@ -1155,45 +1139,15 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	defer release()
 
-	if prevHosted := s.lookupActor(req.GetActorUid()); prevHosted != nil {
-		s.actorsMu.Lock()
-		prevRef := prevHosted.activeRef
-		s.actorsMu.Unlock()
-		if prevRef == attribution.Ref {
-			return &ateworkerpb.RestoreWorkloadResponse{}, nil
-		}
-		if prevRef.Name == "" {
-			prevRef = prevHosted.attribution.Ref
-		}
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		_ = s.terminateExitedSandbox(cleanupCtx, prevRef, req.GetActorUid(), req.GetActorDirs(), containers)
-		cancelCleanup()
-	}
-
 	checkpointDir := req.GetActorDirs().GetRestoreDir()
 	restoreArgs, err := fsRestoreArgs(checkpointDir, fidelity)
 	if err != nil {
 		return nil, err
 	}
 
-	durableVolumes := durableVolumeNames(req.GetSpec())
-	size := sizing.FromLimits(req.GetResources().GetLimits())
-	var prewarmed *prewarmedSandbox
-	if sig, ok := rootfsSignature(checkpointDir, fidelity, durableVolumes); ok {
-		prewarmed = s.sandboxPool.tryAcquire(req.GetRunscPath(), checkpointDir, sig, size)
-	}
-	if prewarmed == nil {
-		if err := resetRunscStateAndPidFileDirs(req.GetActorDirs()); err != nil {
-			return nil, err
-		}
-	}
-
 	err = s.tunnel.Deactivate(ctx, attribution)
 	timing.prep = lap(&tLast)
 	if err != nil {
-		if prewarmed != nil {
-			s.sandboxPool.destroyPrewarmed(ctx, prewarmed)
-		}
 		return nil, err
 	}
 
@@ -1209,16 +1163,10 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		path:           req.GetRunscPath(),
 		actorUID:       req.GetActorUid(),
 		actorDirs:      req.GetActorDirs(),
-		size:           size,
-		durableVolumes: durableVolumes,
+		size:           sizing.FromLimits(req.GetResources().GetLimits()),
+		durableVolumes: durableVolumeNames(req.GetSpec()),
 		containers:     containers,
 		flags:          s.flags,
-	}
-	if prewarmed != nil {
-		rcmd.stateDirOverride = prewarmed.stateDir
-		rcmd.pidDirOverride = prewarmed.pidDir
-		rcmd.sandboxBundleOverride = prewarmed.sandboxBundleDir
-		rcmd.markSpecWritten(ocispec.SandboxID)
 	}
 
 	s.removeStaleActorCgroups(ctx, req.GetActorUid(), containers)
@@ -1238,6 +1186,10 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	sandboxSpecDone := make(chan error, 1)
 	sandboxSpecJoined := false
 	go func() {
+		if err := resetRunscStateAndPidFileDirs(req.GetActorDirs()); err != nil {
+			sandboxSpecDone <- err
+			return
+		}
 		sandboxSpecDone <- rcmd.ensureSpec(ocispec.SandboxID)
 	}()
 
@@ -1278,7 +1230,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 			}
 			deleteContainers(cleanupCtx, rcmd, containersToDelete, "Restore")
 			if s.cgroupDelegated && s.cgroupRoot != "" {
-				_ = cgroup.KillLeafUnder(cleanupCtx, s.cgroupRoot, s.sandboxCgroupLeaf(req.GetActorUid()))
+				_ = cgroup.KillLeafUnder(cleanupCtx, s.cgroupRoot, ocispec.GVisorCgroupLeaf(req.GetActorUid(), ocispec.SandboxID))
 			}
 			s.removeStaleActorCgroups(cleanupCtx, req.GetActorUid(), containers)
 			// Same overlay detach as the Run-failure path above.
@@ -1290,25 +1242,14 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 				if err := s.unhostActor(cleanupCtx, req.GetActorUid()); err != nil {
 					slog.WarnContext(cleanupCtx, "Failed to clean up actor network after Restore failure", slog.Any("err", err))
 				}
-			} else if prewarmed != nil {
-				s.sandboxPool.destroyPrewarmed(cleanupCtx, prewarmed)
 			}
 		}
 	}()
 
-	if prewarmed != nil {
-		hosted, err = s.hostActorPrewarmed(ctx, attribution, prewarmed)
-	} else {
-		hosted, err = s.hostActor(ctx, attribution, req.GetActorDirs())
-	}
+	hosted, err = s.hostActor(ctx, attribution, req.GetActorDirs())
 	timing.netSetup = lap(&tLast)
 	if err != nil {
 		return nil, err
-	}
-	err = <-sandboxSpecDone
-	sandboxSpecJoined = true
-	if err != nil {
-		return nil, fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
 	}
 
 	// Attribute the sandbox's runsc CLI output to the actor.
@@ -1317,6 +1258,13 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		return nil, fmt.Errorf("while starting sandbox log pipe: %w", err)
 	}
 	defer pw.Close()
+
+	err = <-sandboxSpecDone
+	sandboxSpecJoined = true
+	if err != nil {
+		return nil, fmt.Errorf("while preparing sandbox state and OCI spec for %q: %w", ocispec.SandboxID, err)
+	}
+
 	switch fidelity {
 	case ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS:
 		// Create and start the sandbox (cold boot with filesystem checkpoint bundles restored)
@@ -1336,15 +1284,13 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	case ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY:
 		// Create and restore the sandbox (restores process state and filesystem checkpoint bundles)
 		containersToDelete = append(containersToDelete, ocispec.SandboxID)
-		if prewarmed == nil {
-			err := rcmd.cmdCreate(ctx, pw, ocispec.SandboxID, restoreArgs)
-			timing.sandboxCreate = lap(&tLast)
-			if err != nil {
-				return nil, fmt.Errorf("while creating the sandbox: %w", err)
-			}
-			s.pinSandbox(ctx, hosted, req.GetActorDirs())
-			s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
+		err := rcmd.cmdCreate(ctx, pw, ocispec.SandboxID, restoreArgs)
+		timing.sandboxCreate = lap(&tLast)
+		if err != nil {
+			return nil, fmt.Errorf("while creating the sandbox: %w", err)
 		}
+		s.pinSandbox(ctx, hosted, req.GetActorDirs())
+		s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 		err = rcmd.cmdRestore(ctx, pw, ocispec.SandboxID, checkpointDir)
 		timing.sandboxRestore = lap(&tLast)
 		if err != nil {
@@ -1374,6 +1320,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		if err != nil {
 			return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
 		}
+		s.boostContainerCgroupForTransition(ctx, req.GetActorUid(), ac.GetName())
 		switch fidelity {
 		case ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS:
 			err = rcmd.cmdStart(ctx, pw, ac.GetName())
@@ -1436,9 +1383,6 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restored", attribution)
-	s.actorsMu.Lock()
-	hosted.activeRef = attribution.Ref
-	s.actorsMu.Unlock()
 	s.setSession(req.GetActorUid(), &workloadSession{rcmd: rcmd, containers: containerNames(containers)})
 	s.recordInitial(ctx, hosted)
 	s.watchSandbox(ctx, hosted, req.GetRunscPath(), req.GetActorDirs(), containers)
@@ -1476,19 +1420,11 @@ func (s *AteWorkerService) TerminateWorkload(ctx context.Context, req *ateworker
 }
 
 func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resources.ActorRef, actorUID, runscPath string, actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) error {
-	hosted := s.lookupActor(actorUID)
-	var prevRef resources.ActorRef
-	if hosted != nil {
+	if hosted := s.lookupActor(actorUID); hosted != nil {
 		hosted.stopping.Store(true)
-		s.actorsMu.Lock()
-		prevRef = hosted.activeRef
-		s.actorsMu.Unlock()
 	}
 	s.setSandboxCPUWeight(ctx, actorUID, cgroup.MaxCPUWeight)
 	var errs []error
-	if prevRef.Name != "" && prevRef != actorRef {
-		_ = s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: prevRef, UID: actorUID})
-	}
 	if err := s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: actorRef, UID: actorUID}); err != nil {
 		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
 	}
@@ -1498,11 +1434,6 @@ func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resou
 		actorUID:  actorUID,
 		actorDirs: actorDirs,
 		flags:     s.flags,
-	}
-	if hosted != nil {
-		rcmd.stateDirOverride = hosted.stateDir
-		rcmd.pidDirOverride = hosted.pidDir
-		rcmd.sandboxBundleOverride = hosted.sandboxBundleDir
 	}
 
 	// Detached from the caller: a deadline mid-`runsc delete` would leave the
@@ -1522,10 +1453,8 @@ func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resou
 
 	// The actor may resume on another worker, so this one may never see another
 	// Run or Restore for it. Reset files here to close the loop.
-	if hosted == nil || hosted.slotDir == "" {
-		if err := resetRunscStateAndPidFileDirs(actorDirs); err != nil {
-			errs = append(errs, fmt.Errorf("while resetting runsc state and pid file dirs: %w", err))
-		}
+	if err := resetRunscStateAndPidFileDirs(actorDirs); err != nil {
+		errs = append(errs, fmt.Errorf("while resetting runsc state and pid file dirs: %w", err))
 	}
 
 	// Detach the overlay rootfs mounts before atelet wipes the bundle dirs
@@ -1551,20 +1480,12 @@ func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resou
 // state and runsc delete CLI subprocesses and directly cleaning up the actor's
 // cgroup leaves, runsc state directories, overlay mounts, and network tunnel.
 func (s *AteWorkerService) terminateExitedSandbox(ctx context.Context, actorRef resources.ActorRef, actorUID string, actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) error {
-	hosted := s.lookupActor(actorUID)
 	var sandbox *sandboxProcess
-	var prevRef resources.ActorRef
-	if hosted != nil {
+	if hosted := s.lookupActor(actorUID); hosted != nil {
 		hosted.stopping.Store(true)
 		sandbox = hosted.sandbox
-		s.actorsMu.Lock()
-		prevRef = hosted.activeRef
-		s.actorsMu.Unlock()
 	}
 	var errs []error
-	if prevRef.Name != "" && prevRef != actorRef {
-		_ = s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: prevRef, UID: actorUID})
-	}
 	if err := s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: actorRef, UID: actorUID}); err != nil {
 		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
 	}
@@ -1573,7 +1494,7 @@ func (s *AteWorkerService) terminateExitedSandbox(ctx context.Context, actorRef 
 			leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
 			_ = cgroup.KillLeafUnder(ctx, s.cgroupRoot, leaf)
 		}
-		sandboxLeaf := s.sandboxCgroupLeaf(actorUID)
+		sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
 		_ = cgroup.KillLeafUnder(ctx, s.cgroupRoot, sandboxLeaf)
 		if sandbox != nil {
 			_ = sandbox.waitGone(sandboxExitTimeout)
@@ -1584,10 +1505,8 @@ func (s *AteWorkerService) terminateExitedSandbox(ctx context.Context, actorRef 
 		}
 		_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, sandboxLeaf)
 	}
-	if hosted == nil || hosted.slotDir == "" {
-		if err := resetRunscStateAndPidFileDirs(actorDirs); err != nil {
-			errs = append(errs, fmt.Errorf("while resetting runsc state and pid file dirs: %w", err))
-		}
+	if err := resetRunscStateAndPidFileDirs(actorDirs); err != nil {
+		errs = append(errs, fmt.Errorf("while resetting runsc state and pid file dirs: %w", err))
 	}
 	if err := imagecache.UnmountAllUnder(actorDirs.GetOciBundleDir()); err != nil {
 		errs = append(errs, fmt.Errorf("while unmounting bundle rootfs overlays: %w", err))
@@ -1610,21 +1529,23 @@ func deleteContainers(ctx context.Context, rcmd *runsc, containers []string, ope
 	}
 }
 
-// transitionSandboxBurstMilliCPU is the sandbox cgroup CFS CPU quota (4000m =
-// 4.0 vCPUs, cpu.max = "400000 100000") applied after runsc create _sandbox
-// finishes so sandbox_restore and app_restore have 4 full cores of unthrottled
-// burst headroom while keeping cgroup-aware GOMAXPROCS bounded.
-const transitionSandboxBurstMilliCPU int64 = 4000
+// transitionSandboxBurstMilliCPU is the cgroup CFS CPU quota (0 = "max 100000",
+// uncapped) applied after runsc create _sandbox has initialized --cpu-num=4 and
+// GOMAXPROCS=4 from transitionBurstFloorMilliCPU (4000m) so sandbox_restore,
+// app_restore, wakeup probes, and checkpoint serialization run without CFS
+// bandwidth throttling; steady-state cpu.max is enforced after wakeup probes
+// complete.
+const transitionSandboxBurstMilliCPU int64 = 0
 
 // setSandboxCPUWeight sets cpu.weight on the actor's sandbox cgroup leaf when
 // the worker's cgroup is delegated. When raising to MaxCPUWeight for a
-// lifecycle transition, it also raises cpu.max to transitionSandboxBurstMilliCPU
-// (4000m) so the transition is not throttled by the steady-state CFS quota.
+// lifecycle transition, it also sets cpu.max to transitionSandboxBurstMilliCPU
+// ("max 100000") so the transition is not throttled by a CFS quota.
 func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID string, weight int) {
 	if !s.cgroupDelegated {
 		return
 	}
-	leaf := s.sandboxCgroupLeaf(actorUID)
+	leaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
 	if weight == cgroup.MaxCPUWeight {
 		if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, transitionSandboxBurstMilliCPU); err != nil {
 			slog.WarnContext(ctx, "Could not raise cpu.max on sandbox cgroup for transition",
@@ -1637,6 +1558,25 @@ func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID str
 	}
 }
 
+// boostContainerCgroupForTransition uncaps cpu.max ("max 100000") and sets
+// cpu.weight to MaxCPUWeight (10000) on an application container's cgroup leaf
+// during startup and restore transitions before steady-state limits are
+// enforced after wakeup probes complete.
+func (s *AteWorkerService) boostContainerCgroupForTransition(ctx context.Context, actorUID, containerName string) {
+	if !s.cgroupDelegated {
+		return
+	}
+	leaf := ocispec.GVisorCgroupLeaf(actorUID, containerName)
+	if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, transitionSandboxBurstMilliCPU); err != nil {
+		slog.WarnContext(ctx, "Could not raise cpu.max on container cgroup for transition",
+			slog.String("actorUID", actorUID), slog.String("container", containerName), slog.Any("err", err))
+	}
+	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, cgroup.MaxCPUWeight); err != nil {
+		slog.WarnContext(ctx, "Could not set cpu.weight on container cgroup for transition",
+			slog.String("actorUID", actorUID), slog.String("container", containerName), slog.Any("err", err))
+	}
+}
+
 // enforceSteadyActorCPULimits lowers cpu.weight to DefaultCPUWeight (100) and
 // enforces the actor's declared steady-state cpu.max quota on both the sandbox
 // cgroup leaf and all application container cgroup leaves once startup or
@@ -1645,7 +1585,7 @@ func (s *AteWorkerService) enforceSteadyActorCPULimits(ctx context.Context, acto
 	if !s.cgroupDelegated {
 		return
 	}
-	sandboxLeaf := s.sandboxCgroupLeaf(actorUID)
+	sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
 	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, sandboxLeaf, cgroup.DefaultCPUWeight); err != nil {
 		slog.WarnContext(ctx, "Could not set steady cpu.weight on sandbox cgroup",
 			slog.String("actorUID", actorUID), slog.Any("err", err))
@@ -1686,10 +1626,6 @@ func (s *AteWorkerService) removeStaleActorCgroups(ctx context.Context, actorUID
 		leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
 		_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, leaf)
 	}
-	sandboxLeaf := s.sandboxCgroupLeaf(actorUID)
+	sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
 	_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, sandboxLeaf)
-	defaultLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
-	if defaultLeaf != sandboxLeaf {
-		_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, defaultLeaf)
-	}
 }

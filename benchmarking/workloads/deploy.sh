@@ -509,6 +509,8 @@ deploy() {
     kubectl wait --for=create deployment/benchmark-worker \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
     if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
+      kubectl exec -n ate-system postgres-0 -c postgres -- \
+        psql -U postgres -d atepg -c "DELETE FROM substrate.workers WHERE worker_namespace = 'benchmark-workloads';" >/dev/null 2>&1 || true
       for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
         kubectl rollout restart --namespace=ate-system "${ds}" || true
       done
@@ -528,6 +530,11 @@ deploy() {
       kubectl rollout status deployment/benchmark-worker \
         --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
       kill "${reaper_pid}" >/dev/null 2>&1 || true
+      live_uids="$(kubectl get pods -n benchmark-workloads -l ate.dev/worker-pool=benchmark-worker -o jsonpath='{range .items[?(!@.metadata.deletionTimestamp)]}'\''{.metadata.uid}'\'',{end}' 2>/dev/null | sed 's/,$//' || true)"
+      if [[ -n "${live_uids}" ]]; then
+        kubectl exec -n ate-system postgres-0 -c postgres -- \
+          psql -U postgres -d atepg -c "DELETE FROM substrate.workers WHERE worker_namespace = 'benchmark-workloads' AND name NOT IN (${live_uids});" >/dev/null 2>&1 || true
+      fi
       for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
         kubectl rollout status --namespace=ate-system "${ds}" --timeout="${WAIT_TIMEOUT_SECS}s" || true
       done

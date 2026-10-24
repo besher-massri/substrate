@@ -24,7 +24,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -57,50 +56,8 @@ type runsc struct {
 	// flags holds the configured flags; must not be nil.
 	flags *flagStore
 
-	stateDirOverride      string
-	pidDirOverride        string
-	sandboxBundleOverride string
-
 	specMu       sync.Mutex
 	specsWritten map[string]bool
-}
-
-// stateDir returns the runsc --root state directory for this workload, using
-// stateDirOverride when present.
-func (r *runsc) stateDir() string {
-	if r.stateDirOverride != "" {
-		return r.stateDirOverride
-	}
-	return runscStateDir(r.actorDirs)
-}
-
-// pidFile returns the PID file path for containerName, using pidDirOverride
-// when present.
-func (r *runsc) pidFile(containerName string) string {
-	if r.pidDirOverride != "" {
-		return filepath.Join(r.pidDirOverride, containerName+".pid")
-	}
-	return pidFilePath(r.actorDirs, containerName)
-}
-
-// bundlePath returns the OCI bundle path for containerName, using
-// sandboxBundleOverride for the sandbox container when present.
-func (r *runsc) bundlePath(containerName string) string {
-	if containerName == ocispec.SandboxID && r.sandboxBundleOverride != "" {
-		return r.sandboxBundleOverride
-	}
-	return ociBundlePath(r.actorDirs, containerName)
-}
-
-// markSpecWritten records that containerName's OCI config.json has already been
-// written into its bundle directory.
-func (r *runsc) markSpecWritten(containerName string) {
-	r.specMu.Lock()
-	if r.specsWritten == nil {
-		r.specsWritten = make(map[string]bool)
-	}
-	r.specsWritten[containerName] = true
-	r.specMu.Unlock()
 }
 
 // buildArgs constructs the runsc argument vector for command, appending
@@ -115,7 +72,7 @@ func (r *runsc) buildArgs(command, containerName string, extraArgs ...string) []
 	args := make([]string, 0,
 		len(globalFlags)+2+1+len(subcommandFlags)+len(extraArgs)+1)
 	args = append(args, globalFlags...)
-	args = append(args, "-root", r.stateDir())
+	args = append(args, "-root", runscStateDir(r.actorDirs))
 	args = append(args, command)
 	args = append(args, subcommandFlags...)
 	args = append(args, extraArgs...)
@@ -169,14 +126,14 @@ func (r *runsc) execRunsc(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 // transitionBurstFloorMilliCPU is the minimum container CFS CPU quota floor
-// (2000m = 2.0 vCPUs, cpu.max = "200000 100000") written into the OCI spec for
+// (4000m = 4.0 vCPUs, cpu.max = "400000 100000") written into the OCI spec for
 // runsc create and runsc restore. Because runsc's --cpu-num-from-quota reads
 // the newly created cgroup's cpu.max to size the sentry's GOMAXPROCS and
 // --cpu-num (and Go 1.27's cgroup-aware runtime sizes runsc-gofer's GOMAXPROCS
-// from the container cgroup's cpu.max), a 2000m floor initializes a compact
-// 2-P runtime without CFS throttling during startup and restore; steady-state
-// cpu.max is enforced after wakeup probes complete.
-const transitionBurstFloorMilliCPU int64 = 2 * sizing.DefaultBurstFloorMilliCPU
+// from the container cgroup's cpu.max), a 4000m floor initializes a compact
+// 4-P runtime with 4 cores of burst headroom during startup and restore;
+// steady-state cpu.max is enforced after wakeup probes complete.
+const transitionBurstFloorMilliCPU int64 = 4 * sizing.DefaultBurstFloorMilliCPU
 
 // maxOCICPUShares is the Linux cgroup v1 MAX_SHARES value (1 << 18 = 262144)
 // that runsc's cgroup v2 installer maps to cpu.weight = 10000 (MaxCPUWeight)
@@ -203,13 +160,13 @@ func applyTransitionCPUShares(spec *specs.Spec) {
 
 // writeSpec builds the container's OCI spec, shapes it for gVisor, and saves it
 // into the container's bundle. During creation and restore, the CPU quota floor
-// is raised to at least transitionBurstFloorMilliCPU (2000m) and CPU shares are
+// is raised to at least transitionBurstFloorMilliCPU (4000m) and CPU shares are
 // set to maxOCICPUShares (262144 -> cpu.weight = 10000) so runsc create
-// initializes the fresh cgroup at transition priority with --cpu-num=2 and
-// GOMAXPROCS=2; steady-state cpu.max and cpu.weight are enforced after wakeup
+// initializes the fresh cgroup at transition priority with --cpu-num=4 and
+// GOMAXPROCS=4; steady-state cpu.max and cpu.weight are enforced after wakeup
 // probes complete.
 func (r *runsc) writeSpec(containerName string) error {
-	bundlePath := r.bundlePath(containerName)
+	bundlePath := ociBundlePath(r.actorDirs, containerName)
 	var spec *specs.Spec
 	if containerName == ocispec.SandboxID {
 		// atelet makes only the application containers' bundles.
@@ -263,8 +220,8 @@ func (r *runsc) ensureSpec(containerName string) error {
 // the argument construction can be unit-tested without executing runsc.
 func (r *runsc) createArgs(containerName string, additionalArgs []string) []string {
 	args := append(noRootContainerArgs(containerName),
-		"-bundle", r.bundlePath(containerName),
-		"-pid-file", r.pidFile(containerName),
+		"-bundle", ociBundlePath(r.actorDirs, containerName),
+		"-pid-file", pidFilePath(r.actorDirs, containerName),
 	)
 	args = append(args, additionalArgs...)
 	return r.buildArgs("create", containerName, args...)
@@ -357,9 +314,9 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 // the argument construction can be unit-tested without executing runsc.
 func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
 	args := append(noRootContainerArgs(containerName),
-		"-bundle", r.bundlePath(containerName),
+		"-bundle", ociBundlePath(r.actorDirs, containerName),
 		"-image-path", checkpointPath,
-		"-pid-file", r.pidFile(containerName),
+		"-pid-file", pidFilePath(r.actorDirs, containerName),
 	)
 	return r.buildArgs("restore", containerName, args...)
 }

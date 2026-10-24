@@ -66,19 +66,11 @@ func checkpointCgroupDir(root, actorUID string) string {
 // serialization remains capped to the actor's CPU limit while raising cpu.weight
 // to MaxCPUWeight so checkpointing is not starved by steady-state actors.
 func isolateCheckpointCache(root string, actorDirs *ateworkerpb.ActorDirs, actorUID string) (*checkpointCgroup, error) {
-	return isolateCheckpointCacheWithLeaf(root, ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID), pidFilePath(actorDirs, ocispec.SandboxID), actorUID)
-}
-
-// isolateCheckpointCacheWithLeaf moves the sentry identified by pidFile from
-// sandboxLeaf into a sibling <uid>-_ckpt cgroup.
-func isolateCheckpointCacheWithLeaf(root, sandboxLeaf, pidFile, actorUID string) (*checkpointCgroup, error) {
-	pid, err := readSandboxPIDAt(pidFile)
+	pid, err := readSandboxPID(actorDirs)
 	if err != nil {
 		return nil, err
 	}
-	if sandboxLeaf == "" {
-		sandboxLeaf = ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
-	}
+	sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
 	leaf := filepath.Join(root, sandboxLeaf)
 	if !cgroupHasPID(leaf, pid) {
 		return nil, fmt.Errorf("sandbox pid %d is not in cgroup %q", pid, leaf)
@@ -106,10 +98,7 @@ func isolateCheckpointCacheWithLeaf(root, sandboxLeaf, pidFile, actorUID string)
 }
 
 func readSandboxPID(actorDirs *ateworkerpb.ActorDirs) (int, error) {
-	return readSandboxPIDAt(pidFilePath(actorDirs, ocispec.SandboxID))
-}
-
-func readSandboxPIDAt(pidFile string) (int, error) {
+	pidFile := pidFilePath(actorDirs, ocispec.SandboxID)
 	b, err := os.ReadFile(pidFile)
 	if err != nil {
 		return 0, fmt.Errorf("while reading sandbox pid file %q: %w", pidFile, err)
@@ -186,29 +175,10 @@ func checkpointIsolated(
 	checkpoint func(context.Context) error,
 	terminate func() error,
 ) error {
-	return checkpointIsolatedWithLeaf(
-		ctx,
-		cgroupDelegated,
-		cgroupRoot,
-		ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID),
-		pidFilePath(actorDirs, ocispec.SandboxID),
-		actorUID,
-		checkpoint,
-		terminate,
-	)
-}
-
-func checkpointIsolatedWithLeaf(
-	ctx context.Context,
-	cgroupDelegated bool,
-	cgroupRoot, sandboxLeaf, pidFile, actorUID string,
-	checkpoint func(context.Context) error,
-	terminate func() error,
-) error {
 	var ckptCgroup *checkpointCgroup
 	if cgroupDelegated {
 		var err error
-		ckptCgroup, err = isolateCheckpointCacheWithLeaf(cgroupRoot, sandboxLeaf, pidFile, actorUID)
+		ckptCgroup, err = isolateCheckpointCache(cgroupRoot, actorDirs, actorUID)
 		if err != nil {
 			slog.WarnContext(ctx, "Checkpointing without page cache isolation",
 				slog.String("actorUID", actorUID), slog.Any("err", err))
