@@ -17,7 +17,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -32,6 +31,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/sys/unix"
+
 	"go.ate.dev/substrate/internal/ateworker/actornet"
 	"go.ate.dev/substrate/internal/ateworker/cgroup"
 	"go.ate.dev/substrate/internal/imagecache"
@@ -45,8 +46,8 @@ import (
 
 const (
 	defaultSandboxPoolDir         = "/var/lib/ate/sandbox-pool"
-	defaultSandboxPoolCap         = 12
-	defaultSandboxPoolConcurrency = 2
+	defaultSandboxPoolCap         = 16
+	defaultSandboxPoolConcurrency = 3
 	maxCachedRootfsManifestBytes  = 4096
 	maxCachedRootfsTarBytes       = 16384
 )
@@ -227,6 +228,24 @@ func (p *sandboxPool) ensureConfigured(runscPath, checkpointDir string, sig [32]
 			return fmt.Errorf("staging runsc binary: %w", err)
 		}
 	}
+	srcSidecarDir := filepath.Join(filepath.Dir(runscPath), "gvisor-bin")
+	if entries, err := os.ReadDir(srcSidecarDir); err == nil {
+		dstSidecarDir := filepath.Join(binDir, "gvisor-bin")
+		if err := os.MkdirAll(dstSidecarDir, 0o700); err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.Type().IsRegular() {
+				continue
+			}
+			dstSidecar := filepath.Join(dstSidecarDir, entry.Name())
+			if _, err := os.Stat(dstSidecar); err != nil {
+				if err := linkOrCopyExecutable(filepath.Join(srcSidecarDir, entry.Name()), dstSidecar); err != nil {
+					return fmt.Errorf("staging runsc sidecar %s: %w", entry.Name(), err)
+				}
+			}
+		}
+	}
 	sigHex := hex.EncodeToString(sig[:8])
 	cachedRootfsDir := filepath.Join(p.rootDir, "fs", sigHex, resources.RootfsCheckpointSubdir)
 	if err := os.MkdirAll(cachedRootfsDir, 0o700); err != nil {
@@ -391,12 +410,13 @@ func (p *sandboxPool) createOne(ctx context.Context, runscPath, rootfsDir string
 	}
 	rcmd.markSpecWritten(ocispec.SandboxID)
 
-	var out bytes.Buffer
 	createArgs := rcmd.createArgs(ocispec.SandboxID, []string{"--fs-restore-image-path", rootfsDir})
 	cmd := exec.CommandContext(ctx, runscPath, createArgs...)
 	cmd.Env = runscCmdEnv()
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	// Leave Stdout and Stderr nil so os/exec attaches /dev/null as an *os.File
+	// without spawning a pipe-draining goroutine; runsc create daemonizes
+	// runsc-sandbox which inherits stdout/stderr onto fd 254/255 and would hold
+	// a pipe open for the lifetime of the sandbox.
 	if err := cmd.Run(); err != nil {
 		_ = netns.RemoveNamed(tempNSName)
 		actornet.ReleasePrewarmedVethPair(pair)
@@ -406,7 +426,7 @@ func (p *sandboxPool) createOne(ctx context.Context, runscPath, rootfsDir string
 		}
 		_ = imagecache.UnmountAllUnder(stateDir)
 		_ = os.RemoveAll(slotDir)
-		return nil, fmt.Errorf("runsc create prewarmed _sandbox: %w (output: %s)", err, out.String())
+		return nil, fmt.Errorf("runsc create prewarmed _sandbox: %w", err)
 	}
 
 	pidFile := filepath.Join(pidDir, ocispec.SandboxID+".pid")
@@ -445,21 +465,14 @@ func (p *sandboxPool) createOne(ctx context.Context, runscPath, rootfsDir string
 	}, nil
 }
 
-// isAlive reports whether the pre-warmed sandbox sentry process is still alive.
+// isAlive reports whether the pre-warmed sandbox sentry process is still alive
+// without spawning a pidfd watcher goroutine.
 func (psb *prewarmedSandbox) isAlive() bool {
 	if psb == nil || psb.sandbox == nil {
 		return false
 	}
-	exited, err := psb.sandbox.exited()
-	if err != nil {
-		return false
-	}
-	select {
-	case <-exited:
-		return false
-	default:
-		return true
-	}
+	err := unix.PidfdSendSignal(psb.sandbox.pidfd, 0, nil, 0)
+	return err == nil || errors.Is(err, unix.EPERM)
 }
 
 // destroyPrewarmed tears down an unused pre-warmed sandbox and removes its

@@ -864,7 +864,11 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	// Read before the snapshot: a MEMORY checkpoint stops the sandbox, and its
 	// cgroup with it. The final record waits for the teardown.
 	hosted := s.lookupActor(req.GetActorUid())
+	var actorSize sizing.SandboxSize
 	if hosted != nil {
+		if hosted.session != nil && hosted.session.rcmd != nil {
+			actorSize = hosted.session.rcmd.size
+		}
 		s.readFinal(ctx, hosted)
 	}
 
@@ -1009,6 +1013,12 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 		return nil, fmt.Errorf("while listing checkpoint files: %w", err)
 	}
 	durableFiles := durableSnapshotFiles(snapshotFiles)
+
+	if s.sandboxPool != nil && (actorSize.MilliCPU > 0 || actorSize.MemoryBytes > 0) {
+		if sig, ok := rootfsSignature(checkpointPath, fidelity, durableVolumeNames(req.GetSpec())); ok {
+			_ = s.sandboxPool.ensureConfigured(req.GetRunscPath(), checkpointPath, sig, actorSize)
+		}
+	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 

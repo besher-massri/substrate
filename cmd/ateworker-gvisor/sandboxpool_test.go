@@ -23,6 +23,7 @@ import (
 
 	"go.ate.dev/substrate/internal/ocispec"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/sizing"
 )
 
 func TestRootfsSignature(t *testing.T) {
@@ -95,5 +96,58 @@ func TestRunscOverrides(t *testing.T) {
 	}
 	if got := r.bundlePath("glutton"); got != "/actor/bundles/glutton" {
 		t.Fatalf("bundlePath(glutton) = %q, want /actor/bundles/glutton", got)
+	}
+}
+
+func TestEnsureConfiguredStagesSidecars(t *testing.T) {
+	tmp := t.TempDir()
+	srcBinDir := filepath.Join(tmp, "src-bin")
+	srcSidecarDir := filepath.Join(srcBinDir, "gvisor-bin")
+	if err := os.MkdirAll(srcSidecarDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runscPath := filepath.Join(srcBinDir, "runsc")
+	if err := os.WriteFile(runscPath, []byte("fake-runsc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, sidecar := range []string{"gvisor_sentry", "gvisor-proc-umounter", "checkpointgofer"} {
+		if err := os.WriteFile(filepath.Join(srcSidecarDir, sidecar), []byte("fake-"+sidecar), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ckptDir := filepath.Join(tmp, "ckpt")
+	rootfsDir := filepath.Join(ckptDir, "rootfs")
+	if err := os.MkdirAll(rootfsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{fsCheckpointManifest, "multitar.img", "pages_meta.img", "pages.img"} {
+		if err := os.WriteFile(filepath.Join(rootfsDir, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sig, ok := rootfsSignature(ckptDir, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, nil)
+	if !ok {
+		t.Fatal("expected rootfsSignature to succeed")
+	}
+
+	poolDir := filepath.Join(tmp, "pool")
+	p := &sandboxPool{
+		rootDir:     poolDir,
+		replenishCh: make(chan struct{}, 4),
+		readyCh:     make(chan *prewarmedSandbox, 4),
+	}
+	if err := p.ensureConfigured(runscPath, ckptDir, sig, sizing.SandboxSize{MilliCPU: 248, MemoryBytes: 512 << 20}); err != nil {
+		t.Fatalf("ensureConfigured() error = %v", err)
+	}
+	for _, rel := range []string{
+		"bin/runsc",
+		"bin/gvisor-bin/gvisor_sentry",
+		"bin/gvisor-bin/gvisor-proc-umounter",
+		"bin/gvisor-bin/checkpointgofer",
+	} {
+		if _, err := os.Stat(filepath.Join(poolDir, rel)); err != nil {
+			t.Fatalf("expected staged binary %s: %v", rel, err)
+		}
 	}
 }
