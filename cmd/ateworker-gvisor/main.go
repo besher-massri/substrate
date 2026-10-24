@@ -737,7 +737,6 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		return nil, fmt.Errorf("while creating the sandbox: %w", err)
 	}
 	s.pinSandbox(ctx, hosted, req.GetActorDirs())
-	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 	if err := rcmd.cmdStart(ctx, pw, ocispec.SandboxID); err != nil {
 		return nil, fmt.Errorf("while starting the sandbox: %w", err)
 	}
@@ -763,11 +762,11 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		if err := rcmd.cmdCreate(ctx, pw, ac.GetName(), nil); err != nil {
 			return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
 		}
-		s.boostContainerCgroupForTransition(ctx, req.GetActorUid(), ac.GetName())
 		if err := rcmd.cmdStart(ctx, pw, ac.GetName()); err != nil {
 			return nil, fmt.Errorf("while starting %q application container: %w", ac.GetName(), err)
 		}
 	}
+	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 
 	// Block until every wakeup-probe-enabled container reports 200. If probes
 	// are still pending after wakeupLivenessCheckDelay, watch for early container
@@ -1275,27 +1274,21 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 			return nil, fmt.Errorf("while creating the sandbox: %w", err)
 		}
 		s.pinSandbox(ctx, hosted, req.GetActorDirs())
-		s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 		err = rcmd.cmdStart(ctx, pw, ocispec.SandboxID)
 		timing.sandboxRestore = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while starting the sandbox: %w", err)
 		}
 	case ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY:
-		// Create and restore the sandbox (restores process state and filesystem checkpoint bundles)
+		// Create and restore the sandbox in a single runsc restore pass
+		// (restores process state and filesystem checkpoint bundles).
 		containersToDelete = append(containersToDelete, ocispec.SandboxID)
-		err := rcmd.cmdCreate(ctx, pw, ocispec.SandboxID, restoreArgs)
-		timing.sandboxCreate = lap(&tLast)
-		if err != nil {
-			return nil, fmt.Errorf("while creating the sandbox: %w", err)
-		}
-		s.pinSandbox(ctx, hosted, req.GetActorDirs())
-		s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
-		err = rcmd.cmdRestore(ctx, pw, ocispec.SandboxID, checkpointDir)
+		err := rcmd.cmdRestore(ctx, pw, ocispec.SandboxID, checkpointDir, restoreArgs)
 		timing.sandboxRestore = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while restoring the sandbox: %w", err)
 		}
+		s.pinSandbox(ctx, hosted, req.GetActorDirs())
 	}
 
 	// Create and restore each application container, each with its own log pipe so
@@ -1315,27 +1308,27 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		}
 		defer pw.Close()
 		containersToDelete = append(containersToDelete, ac.GetName())
-		err = rcmd.cmdCreate(ctx, pw, ac.GetName(), nil)
-		timing.appCreate += lap(&tLast)
-		if err != nil {
-			return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
-		}
-		s.boostContainerCgroupForTransition(ctx, req.GetActorUid(), ac.GetName())
 		switch fidelity {
 		case ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS:
+			err = rcmd.cmdCreate(ctx, pw, ac.GetName(), nil)
+			timing.appCreate += lap(&tLast)
+			if err != nil {
+				return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
+			}
 			err = rcmd.cmdStart(ctx, pw, ac.GetName())
 			timing.appRestore += lap(&tLast)
 			if err != nil {
 				return nil, fmt.Errorf("while starting %q application container: %w", ac.GetName(), err)
 			}
 		case ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY:
-			err = rcmd.cmdRestore(ctx, pw, ac.GetName(), checkpointDir)
+			err = rcmd.cmdRestore(ctx, pw, ac.GetName(), checkpointDir, nil)
 			timing.appRestore += lap(&tLast)
 			if err != nil {
 				return nil, fmt.Errorf("while restoring %q application container: %w", ac.GetName(), err)
 			}
 		}
 	}
+	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
 
 	// Block until every wakeup-probe-enabled container reports 200. If probes
 	// are still pending after wakeupLivenessCheckDelay, watch for early container
@@ -1529,18 +1522,19 @@ func deleteContainers(ctx context.Context, rcmd *runsc, containers []string, ope
 	}
 }
 
-// transitionSandboxBurstMilliCPU is the cgroup CFS CPU quota (0 = "max 100000",
-// uncapped) applied after runsc create _sandbox has initialized --cpu-num=4 and
-// GOMAXPROCS=4 from transitionBurstFloorMilliCPU (4000m) so sandbox_restore,
-// app_restore, wakeup probes, and checkpoint serialization run without CFS
-// bandwidth throttling; steady-state cpu.max is enforced after wakeup probes
-// complete.
-const transitionSandboxBurstMilliCPU int64 = 0
+// transitionSandboxBurstMilliCPU is the cgroup CFS CPU quota (4000m = 4.0
+// vCPUs, cpu.max = "400000 100000") applied after all sandbox and gofer
+// processes have started (or during checkpoint and teardown transitions) so
+// wakeup probes and checkpoint serialization have 4 cores of burst headroom
+// while keeping cpu.max bounded (never "max") so any child process reading
+// cpu.max never initializes 180 Go P structs on a 180-vCPU node.
+const transitionSandboxBurstMilliCPU int64 = 4 * sizing.DefaultBurstFloorMilliCPU
 
 // setSandboxCPUWeight sets cpu.weight on the actor's sandbox cgroup leaf when
 // the worker's cgroup is delegated. When raising to MaxCPUWeight for a
 // lifecycle transition, it also sets cpu.max to transitionSandboxBurstMilliCPU
-// ("max 100000") so the transition is not throttled by a CFS quota.
+// (4000m) so the transition has burst headroom before steady-state limits are
+// enforced.
 func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID string, weight int) {
 	if !s.cgroupDelegated {
 		return
@@ -1555,25 +1549,6 @@ func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID str
 	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, weight); err != nil {
 		slog.WarnContext(ctx, "Could not set cpu.weight on sandbox cgroup",
 			slog.String("actorUID", actorUID), slog.Int("weight", weight), slog.Any("err", err))
-	}
-}
-
-// boostContainerCgroupForTransition uncaps cpu.max ("max 100000") and sets
-// cpu.weight to MaxCPUWeight (10000) on an application container's cgroup leaf
-// during startup and restore transitions before steady-state limits are
-// enforced after wakeup probes complete.
-func (s *AteWorkerService) boostContainerCgroupForTransition(ctx context.Context, actorUID, containerName string) {
-	if !s.cgroupDelegated {
-		return
-	}
-	leaf := ocispec.GVisorCgroupLeaf(actorUID, containerName)
-	if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, transitionSandboxBurstMilliCPU); err != nil {
-		slog.WarnContext(ctx, "Could not raise cpu.max on container cgroup for transition",
-			slog.String("actorUID", actorUID), slog.String("container", containerName), slog.Any("err", err))
-	}
-	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, cgroup.MaxCPUWeight); err != nil {
-		slog.WarnContext(ctx, "Could not set cpu.weight on container cgroup for transition",
-			slog.String("actorUID", actorUID), slog.String("container", containerName), slog.Any("err", err))
 	}
 }
 

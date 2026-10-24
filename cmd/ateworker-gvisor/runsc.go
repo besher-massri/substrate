@@ -105,9 +105,8 @@ func noRootContainerArgs(containerName string) []string {
 }
 
 // runscCmdEnv returns the environment variables for runsc subprocesses,
-// bounding GOMAXPROCS to 4 unless already set in the environment so short-lived
-// runsc CLI, gofer, and sentry processes do not initialize 180 Go P structs on
-// high-core hosts.
+// bounding GOMAXPROCS to 2 unless already set in the environment so short-lived
+// runsc CLI processes do not initialize 180 Go P structs on high-core hosts.
 func runscCmdEnv() []string {
 	env := os.Environ()
 	for _, kv := range env {
@@ -115,7 +114,7 @@ func runscCmdEnv() []string {
 			return env
 		}
 	}
-	return append(env, "GOMAXPROCS=4")
+	return append(env, "GOMAXPROCS=2")
 }
 
 // execRunsc constructs an exec.Cmd for r.path with runscCmdEnv configured.
@@ -126,14 +125,16 @@ func (r *runsc) execRunsc(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 // transitionBurstFloorMilliCPU is the minimum container CFS CPU quota floor
-// (4000m = 4.0 vCPUs, cpu.max = "400000 100000") written into the OCI spec for
+// (2000m = 2.0 vCPUs, cpu.max = "200000 100000") written into the OCI spec for
 // runsc create and runsc restore. Because runsc's --cpu-num-from-quota reads
-// the newly created cgroup's cpu.max to size the sentry's GOMAXPROCS and
-// --cpu-num (and Go 1.27's cgroup-aware runtime sizes runsc-gofer's GOMAXPROCS
-// from the container cgroup's cpu.max), a 4000m floor initializes a compact
-// 4-P runtime with 4 cores of burst headroom during startup and restore;
-// steady-state cpu.max is enforced after wakeup probes complete.
-const transitionBurstFloorMilliCPU int64 = 4 * sizing.DefaultBurstFloorMilliCPU
+// the newly created sandbox cgroup's cpu.max to size the sentry's GOMAXPROCS
+// and --cpu-num (and runsc spawns runsc-gofer into the sandbox cgroup with
+// GOMAXPROCS stripped from cmd.Env so Go 1.27's cgroup-aware runtime sizes
+// runsc-gofer's GOMAXPROCS from the sandbox cgroup's cpu.max), a 2000m floor
+// initializes a compact 2-P runtime for both sentry and gofer while giving
+// startup and restore 2 cores of burst headroom; steady-state cpu.max is
+// enforced after wakeup probes complete.
+const transitionBurstFloorMilliCPU int64 = 2 * sizing.DefaultBurstFloorMilliCPU
 
 // maxOCICPUShares is the Linux cgroup v1 MAX_SHARES value (1 << 18 = 262144)
 // that runsc's cgroup v2 installer maps to cpu.weight = 10000 (MaxCPUWeight)
@@ -312,25 +313,29 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 
 // restoreArgs builds the argv for `runsc restore <container>`. Factored out so
 // the argument construction can be unit-tested without executing runsc.
-func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
+func (r *runsc) restoreArgs(containerName, checkpointPath string, additionalArgs []string) []string {
 	args := append(noRootContainerArgs(containerName),
 		"-bundle", ociBundlePath(r.actorDirs, containerName),
 		"-image-path", checkpointPath,
 		"-pid-file", pidFilePath(r.actorDirs, containerName),
 	)
+	args = append(args, additionalArgs...)
 	return r.buildArgs("restore", containerName, args...)
 }
 
 // We take a checkpoint only of the sandbox, but we need to call restore on each
-// container, using the same checkpoint.
-func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, checkpointPath string) error {
+// container, using the same checkpoint. Because runsc restore embeds Create and
+// automatically creates the container from its bundle config.json when not yet
+// created, calling cmdRestore directly avoids a separate runsc create CLI
+// subprocess for both the sandbox and application containers.
+func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, checkpointPath string, additionalArgs []string) error {
 	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
 
 	if err := r.ensureSpec(containerName); err != nil {
 		return fmt.Errorf("while writing the OCI spec for %q: %w", containerName, err)
 	}
 
-	cmd := r.execRunsc(ctx, r.restoreArgs(containerName, checkpointPath)...)
+	cmd := r.execRunsc(ctx, r.restoreArgs(containerName, checkpointPath, additionalArgs)...)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	if err := cmd.Run(); err != nil {

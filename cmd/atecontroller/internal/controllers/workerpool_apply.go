@@ -428,6 +428,7 @@ var workerGvisorCapabilities = []corev1.Capability{
 	"NET_ADMIN", "SYS_ADMIN", "SYS_CHROOT", "SYS_PTRACE",
 	"SETUID", "SETGID", "SETPCAP", "DAC_OVERRIDE",
 	"FOWNER", "CHOWN", "MKNOD", "NET_RAW", "SETFCAP",
+	"SYS_RESOURCE", "IPC_LOCK",
 }
 
 // workerMicroVMCapabilities is the capability set an unprivileged micro-VM worker

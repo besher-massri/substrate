@@ -324,9 +324,11 @@ func TestRestoreArgs(t *testing.T) {
 
 	for _, tc := range []struct {
 		container string
+		extra     []string
 		want      []string
 	}{{
 		container: ocispec.SandboxID,
+		extra:     []string{"--fs-restore-image-path", checkpointDir + "/rootfs"},
 		want: []string{
 			"-global1",
 			"-global2",
@@ -339,6 +341,7 @@ func TestRestoreArgs(t *testing.T) {
 			"-bundle", "/node/actors/test-actor-123/bundle/" + ocispec.SandboxID,
 			"-image-path", checkpointDir,
 			"-pid-file", "/node/actors/test-actor-123/pidfiles/" + ocispec.SandboxID + ".pid",
+			"--fs-restore-image-path", checkpointDir + "/rootfs",
 			ocispec.SandboxID,
 		},
 	}, {
@@ -357,7 +360,7 @@ func TestRestoreArgs(t *testing.T) {
 			"app",
 		},
 	}} {
-		if got := r.restoreArgs(tc.container, checkpointDir); !reflect.DeepEqual(got, tc.want) {
+		if got := r.restoreArgs(tc.container, checkpointDir, tc.extra); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("restoreArgs(%q) = %v, want %v", tc.container, got, tc.want)
 		}
 	}
