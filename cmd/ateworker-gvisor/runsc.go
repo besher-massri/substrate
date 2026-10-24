@@ -125,11 +125,45 @@ func (r *runsc) execRunsc(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
+// transitionBurstFloorMilliCPU is the minimum container CFS CPU quota floor
+// (2000m = 2.0 vCPUs, cpu.max = "200000 100000") written into the OCI spec for
+// runsc create and runsc restore. Because runsc's --cpu-num-from-quota reads
+// the newly created cgroup's cpu.max to size the sentry's GOMAXPROCS and
+// --cpu-num (and Go 1.27's cgroup-aware runtime sizes runsc-gofer's GOMAXPROCS
+// from the container cgroup's cpu.max), a 2000m floor initializes a compact
+// 2-P runtime without CFS throttling during startup and restore; steady-state
+// cpu.max is enforced after wakeup probes complete.
+const transitionBurstFloorMilliCPU int64 = 2 * sizing.DefaultBurstFloorMilliCPU
+
+// maxOCICPUShares is the Linux cgroup v1 MAX_SHARES value (1 << 18 = 262144)
+// that runsc's cgroup v2 installer maps to cpu.weight = 10000 (MaxCPUWeight)
+// when creating the sandbox and container cgroups before spawning child
+// processes via CLONE_INTO_CGROUP.
+const maxOCICPUShares uint64 = 262144
+
+// applyTransitionCPUShares sets Linux.Resources.CPU.Shares to maxOCICPUShares
+// (262144) on spec so runsc's cgroup v2 installation writes cpu.weight = 10000
+// before spawning the sandbox or gofer processes via CLONE_INTO_CGROUP.
+func applyTransitionCPUShares(spec *specs.Spec) {
+	if spec.Linux == nil {
+		spec.Linux = &specs.Linux{}
+	}
+	if spec.Linux.Resources == nil {
+		spec.Linux.Resources = &specs.LinuxResources{}
+	}
+	if spec.Linux.Resources.CPU == nil {
+		spec.Linux.Resources.CPU = &specs.LinuxCPU{}
+	}
+	shares := maxOCICPUShares
+	spec.Linux.Resources.CPU.Shares = &shares
+}
+
 // writeSpec builds the container's OCI spec, shapes it for gVisor, and saves it
 // into the container's bundle. During creation and restore, the CPU quota floor
-// is raised to at least DefaultBurstFloorMilliCPU (1000m) so runsc create never
-// throttles the restoring sentry at sub-vCPU quotas while --cpu-num-from-quota
-// still resolves to 1 vCPU; steady-state cpu.max is enforced after wakeup
+// is raised to at least transitionBurstFloorMilliCPU (2000m) and CPU shares are
+// set to maxOCICPUShares (262144 -> cpu.weight = 10000) so runsc create
+// initializes the fresh cgroup at transition priority with --cpu-num=2 and
+// GOMAXPROCS=2; steady-state cpu.max and cpu.weight are enforced after wakeup
 // probes complete.
 func (r *runsc) writeSpec(containerName string) error {
 	bundlePath := ociBundlePath(r.actorDirs, containerName)
@@ -154,7 +188,8 @@ func (r *runsc) writeSpec(containerName string) error {
 		DurableVolumes: r.durableVolumes,
 		Size:           r.size,
 	})
-	r.size.ApplyToOCISpecWithFloor(spec, sizing.DefaultBurstFloorMilliCPU)
+	r.size.ApplyToOCISpecWithFloor(spec, transitionBurstFloorMilliCPU)
+	applyTransitionCPUShares(spec)
 	return ocispec.Save(bundlePath, spec)
 }
 

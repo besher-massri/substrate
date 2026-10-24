@@ -76,6 +76,9 @@ func TestWriteSpec(t *testing.T) {
 		if got := spec.Annotations["io.kubernetes.cri.container-name"]; got != name {
 			t.Errorf("%s container-name annotation = %q, want the spec shaped for gVisor", name, got)
 		}
+		if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.Resources.CPU == nil || spec.Linux.Resources.CPU.Shares == nil || *spec.Linux.Resources.CPU.Shares != maxOCICPUShares {
+			t.Errorf("%s Linux.Resources.CPU.Shares = %v, want %d", name, spec.Linux, maxOCICPUShares)
+		}
 		if name == ocispec.SandboxID {
 			if spec.Process != nil || spec.Root != nil || spec.Mounts != nil {
 				t.Errorf("sandbox spec has process %v, root %v, mounts %v; want none", spec.Process, spec.Root, spec.Mounts)

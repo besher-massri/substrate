@@ -158,14 +158,14 @@ func TestSetSandboxCPUWeight(t *testing.T) {
 		t.Fatalf("sandbox cpu.weight with !cgroupDelegated = %q, want \"100\\n\"", got)
 	}
 
-	// Delegated: transitions between MaxCPUWeight (with uncapped cpu.max) and DefaultCPUWeight.
+	// Delegated: transitions between MaxCPUWeight (with 4000m burst cpu.max) and DefaultCPUWeight.
 	s.cgroupDelegated = true
 	s.setSandboxCPUWeight(context.Background(), testActorUID, cgroup.MaxCPUWeight)
 	if got := mustRead(t, filepath.Join(f.leaf, "cpu.weight")); got != "10000" {
 		t.Fatalf("sandbox cpu.weight after startup boost = %q, want \"10000\"", got)
 	}
-	if got := mustRead(t, filepath.Join(f.leaf, "cpu.max")); got != "max 100000" {
-		t.Fatalf("sandbox cpu.max after startup boost = %q, want \"max 100000\"", got)
+	if got := mustRead(t, filepath.Join(f.leaf, "cpu.max")); got != "400000 100000" {
+		t.Fatalf("sandbox cpu.max after startup boost = %q, want \"400000 100000\"", got)
 	}
 	s.enforceSteadyActorCPULimits(context.Background(), testActorUID, 248, nil)
 	if got := mustRead(t, filepath.Join(f.leaf, "cpu.weight")); got != "100" {
@@ -173,6 +173,16 @@ func TestSetSandboxCPUWeight(t *testing.T) {
 	}
 	if got := mustRead(t, filepath.Join(f.leaf, "cpu.max")); got != "24800 100000" {
 		t.Fatalf("sandbox cpu.max after wakeup probe = %q, want \"24800 100000\"", got)
+	}
+	s.removeStaleActorCgroups(context.Background(), testActorUID, nil)
+	// Because f.leaf still contains dummy files in the temp dir, os.Remove is a
+	// safe no-op; once empty, removeStaleActorCgroups removes it cleanly.
+	for _, name := range []string{"cgroup.procs", "memory.max", "cpu.max", "cpu.weight"} {
+		_ = os.Remove(filepath.Join(f.leaf, name))
+	}
+	s.removeStaleActorCgroups(context.Background(), testActorUID, nil)
+	if _, err := os.Stat(f.leaf); !os.IsNotExist(err) {
+		t.Fatalf("sandbox cgroup leaf still exists after removeStaleActorCgroups: %v", err)
 	}
 }
 

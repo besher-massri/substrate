@@ -55,6 +55,7 @@ import (
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/serverboot"
 	"go.ate.dev/substrate/internal/sizing"
+	"go.ate.dev/substrate/internal/snapshotcache"
 	"go.ate.dev/substrate/internal/version"
 	"go.ate.dev/substrate/internal/wakeupprobe"
 	"go.ate.dev/substrate/internal/workerstats"
@@ -652,9 +653,7 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		flags:          s.flags,
 	}
 
-	if preboostRestoreCgroupEnabled() {
-		s.ensureRestoreCgroupsPreboosted(ctx, req.GetActorUid(), containers)
-	}
+	s.removeStaleActorCgroups(ctx, req.GetActorUid(), containers)
 
 	bgCtx, cancelBg := context.WithCancel(ctx)
 	defer cancelBg()
@@ -700,6 +699,7 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 				slog.WarnContext(cleanupCtx, "Failed to deactivate actor networking after Run failure", slog.Any("err", err))
 			}
 			deleteContainers(cleanupCtx, rcmd, containersToDelete, "Run")
+			s.removeStaleActorCgroups(cleanupCtx, req.GetActorUid(), containers)
 			// Detach any bundle rootfs overlays a partially-completed setup
 			// mounted, mirroring the post-checkpoint cleanup — otherwise they
 			// linger in this namespace until atelet wipes the bundle dirs.
@@ -1166,10 +1166,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		flags:          s.flags,
 	}
 
-	preboostCgroup := preboostRestoreCgroupEnabled()
-	if preboostCgroup {
-		s.ensureRestoreCgroupsPreboosted(ctx, req.GetActorUid(), containers)
-	}
+	s.removeStaleActorCgroups(ctx, req.GetActorUid(), containers)
 
 	bgCtx, cancelBg := context.WithCancel(ctx)
 	defer cancelBg()
@@ -1225,6 +1222,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 				slog.WarnContext(cleanupCtx, "Failed to deactivate actor networking after Restore failure", slog.Any("err", err))
 			}
 			deleteContainers(cleanupCtx, rcmd, containersToDelete, "Restore")
+			s.removeStaleActorCgroups(cleanupCtx, req.GetActorUid(), containers)
 			// Same overlay detach as the Run-failure path above.
 			if err := imagecache.UnmountAllUnder(req.GetActorDirs().GetOciBundleDir()); err != nil {
 				slog.WarnContext(ctx, "Failed to unmount bundle rootfs overlays after Restore failure",
@@ -1351,7 +1349,7 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	<-readaheadDone
 	readaheadJoined = true
-	if !req.GetPreserveRestoreDir() || os.Getenv("ATEWORKER_EVICT_PRESERVED_RESTORE_CACHE") == "true" {
+	if os.Getenv("ATEWORKER_EVICT_RESTORE_CACHE") == "true" || (req.GetPreserveRestoreDir() && os.Getenv("ATEWORKER_EVICT_PRESERVED_RESTORE_CACHE") == "true") {
 		dropActorCheckpointCacheAsync(hosted.ctx, req.GetActorUid(), checkpointDir, req.GetPreserveRestoreDir(), func(waitCtx context.Context) error {
 			if fidelity == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
 				if err := rcmd.cmdWaitRestore(waitCtx, ocispec.SandboxID); err != nil {
@@ -1367,6 +1365,8 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 			}
 			return nil
 		})
+	} else if !req.GetPreserveRestoreDir() {
+		snapshotcache.DropFiles(snapshotcache.FindFiles(checkpointDir, isCheckpointDataFile))
 	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restored", attribution)
@@ -1439,6 +1439,7 @@ func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resou
 	if err := cleanupContainers(cleanupCtx, rcmd, containers); err != nil {
 		errs = append(errs, fmt.Errorf("while cleaning up runsc containers: %w", err))
 	}
+	s.removeStaleActorCgroups(cleanupCtx, actorUID, containers)
 
 	// The actor may resume on another worker, so this one may never see another
 	// Run or Restore for it. Reset files here to close the loop.
@@ -1504,18 +1505,24 @@ func deleteContainers(ctx context.Context, rcmd *runsc, containers []string, ope
 	}
 }
 
+// transitionSandboxBurstMilliCPU is the sandbox cgroup CFS CPU quota (4000m =
+// 4.0 vCPUs, cpu.max = "400000 100000") applied after runsc create _sandbox
+// finishes so sandbox_restore and app_restore have 4 full cores of unthrottled
+// burst headroom while keeping cgroup-aware GOMAXPROCS bounded.
+const transitionSandboxBurstMilliCPU int64 = 4000
+
 // setSandboxCPUWeight sets cpu.weight on the actor's sandbox cgroup leaf when
 // the worker's cgroup is delegated. When raising to MaxCPUWeight for a
-// lifecycle transition, it also uncaps cpu.max so the transition is not
-// throttled by the steady-state CFS quota.
+// lifecycle transition, it also raises cpu.max to transitionSandboxBurstMilliCPU
+// (4000m) so the transition is not throttled by the steady-state CFS quota.
 func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID string, weight int) {
 	if !s.cgroupDelegated {
 		return
 	}
 	leaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
 	if weight == cgroup.MaxCPUWeight {
-		if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, 0); err != nil {
-			slog.WarnContext(ctx, "Could not uncap cpu.max on sandbox cgroup for transition",
+		if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, transitionSandboxBurstMilliCPU); err != nil {
+			slog.WarnContext(ctx, "Could not raise cpu.max on sandbox cgroup for transition",
 				slog.String("actorUID", actorUID), slog.Any("err", err))
 		}
 	}
@@ -1559,45 +1566,21 @@ func (s *AteWorkerService) enforceSteadyActorCPULimits(ctx context.Context, acto
 	}
 }
 
-// preboostRestoreCgroupEnabled reports whether pre-creating sandbox and
-// application container cgroups at MaxCPUWeight before runsc create/restore is
-// enabled (enabled by default unless ATEWORKER_PREBOOST_RESTORE_CGROUP=false).
-func preboostRestoreCgroupEnabled() bool {
-	return os.Getenv("ATEWORKER_PREBOOST_RESTORE_CGROUP") != "false"
-}
-
-// ensureRestoreCgroupsPreboosted pre-creates the sandbox and application
-// container cgroup leaves at MaxCPUWeight before runsc create/restore runs,
-// while leaving cpu.max strictly at the actor's declared limit.
-func (s *AteWorkerService) ensureRestoreCgroupsPreboosted(ctx context.Context, actorUID string, containers []*ateworkerpb.Container) {
-	if !s.cgroupDelegated {
+// removeStaleActorCgroups removes any leftover empty cgroup v2 leaves for
+// actorUID's sandbox and application containers before runsc create runs or
+// after container teardown completes. Because runsc's cgroupV2.Install only
+// applies spec.Linux.Resources (cpu.max, cpu.weight, memory.max) and records
+// cgroup ownership when os.Mkdir creates a fresh directory, clearing stale
+// leaves guarantees runsc create initializes cgroup limits and
+// --cpu-num-from-quota properly.
+func (s *AteWorkerService) removeStaleActorCgroups(ctx context.Context, actorUID string, containers []*ateworkerpb.Container) {
+	if !s.cgroupDelegated || s.cgroupRoot == "" {
 		return
+	}
+	for _, ac := range containers {
+		leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
+		_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, leaf)
 	}
 	sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
-	if err := cgroup.EnsureActorLeafCPUWeightUnder(s.cgroupRoot, sandboxLeaf, cgroup.MaxCPUWeight); err != nil {
-		slog.WarnContext(ctx, "Could not pre-boost sandbox cgroup cpu.weight",
-			slog.String("actorUID", actorUID), slog.Any("err", err))
-	}
-	for _, ac := range containers {
-		leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
-		if err := cgroup.EnsureActorLeafCPUWeightUnder(s.cgroupRoot, leaf, cgroup.MaxCPUWeight); err != nil {
-			slog.WarnContext(ctx, "Could not pre-boost container cgroup cpu.weight",
-				slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Any("err", err))
-		}
-	}
-}
-
-// setActorContainersCPUWeight updates cpu.weight on all application container
-// cgroup leaves of actorUID when the worker's cgroup is delegated.
-func (s *AteWorkerService) setActorContainersCPUWeight(ctx context.Context, actorUID string, containers []*ateworkerpb.Container, weight int) {
-	if !s.cgroupDelegated {
-		return
-	}
-	for _, ac := range containers {
-		leaf := ocispec.GVisorCgroupLeaf(actorUID, ac.GetName())
-		if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, leaf, weight); err != nil {
-			slog.WarnContext(ctx, "Could not set cpu.weight on container cgroup",
-				slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Int("weight", weight), slog.Any("err", err))
-		}
-	}
+	_ = cgroup.RemoveActorLeafUnder(s.cgroupRoot, sandboxLeaf)
 }
