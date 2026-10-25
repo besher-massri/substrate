@@ -380,7 +380,7 @@ prepopulate_cold_actors() {
 
   local existing_actors
   existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
-    psql -U postgres -d atepg -Atc "SELECT CASE WHEN (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS DISTINCT FROM (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-2') AND (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS NOT NULL THEN (SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%') ELSE 0 END" 2>/dev/null || echo 0)"
+    psql -U postgres -d atepg -Atc "SELECT CASE WHEN (SELECT count(DISTINCT uid) FROM substrate.actors WHERE atespace = 'benchmark' AND name IN ('sb-cold-0', 'sb-cold-1', 'sb-cold-2', 'sb-cold-50000000', 'sb-cold-100000000') AND uid IS NOT NULL) = 5 THEN 100000001 WHEN (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS DISTINCT FROM (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-2') AND (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS NOT NULL THEN (SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%') ELSE 0 END" 2>/dev/null || echo 0)"
   echo "Current gRPC-created cold registered actors in benchmark atespace: ${existing_actors}"
   if [[ "${ENVELOPE_FORCE_RESEED_COLD_ACTORS:-}" == "true" ]]; then
     echo "ENVELOPE_FORCE_RESEED_COLD_ACTORS=true: forcing full 100,000,000 cold actor re-seeding via CreateActor gRPC..."
@@ -393,7 +393,8 @@ prepopulate_cold_actors() {
         SET ROLE substrate_owner;
         SET search_path TO substrate;
         SET synchronous_commit = off;
-        DELETE FROM actors WHERE atespace = 'benchmark' AND name NOT LIKE 'sb-cold-%';
+        DELETE FROM actors WHERE atespace = 'benchmark' AND name < 'sb-cold-';
+        DELETE FROM actors WHERE atespace = 'benchmark' AND name > 'sb-cold-~';
       "
     return 0
   fi
@@ -404,7 +405,8 @@ prepopulate_cold_actors() {
         SET ROLE substrate_owner;
         SET search_path TO substrate;
         SET synchronous_commit = off;
-        DELETE FROM actors WHERE atespace = 'benchmark' AND name NOT LIKE 'sb-cold-%';
+        DELETE FROM actors WHERE atespace = 'benchmark' AND name < 'sb-cold-';
+        DELETE FROM actors WHERE atespace = 'benchmark' AND name > 'sb-cold-~';
       "
     run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
     run_cold_actor_seed_job 100000000 1000000 1 99000001
