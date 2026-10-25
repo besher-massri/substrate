@@ -221,6 +221,40 @@ func (r *taskRuntime) iterate() {
 	}
 }
 
+// coldActorStepBucket maps a virtual user index vuIdx in [0, 1000000) and per-VU
+// actor slot i in [0, actorsPerUser) to a 1-million-actor bucket index in
+// [0, 100) such that each VU owns actorsPerUser distinct actors (giving a
+// step-wide participating pool of actorsPerUser * 1,000,000 actors) while the
+// primary slices across steps (n=5 -> 0..4, n=10 -> 5..14, n=25 -> 15..39,
+// n=50 -> 40..69, n=100 -> 70..99) partition [0, 100) without cross-step
+// collisions.
+func coldActorStepBucket(actorsPerUser, vuIdx, i int) int {
+	if actorsPerUser <= 1 {
+		return 0
+	}
+	offset := 0
+	span := actorsPerUser
+	switch actorsPerUser {
+	case 5:
+		offset, span = 0, 5
+	case 10:
+		offset, span = 5, 10
+	case 25:
+		offset, span = 15, 25
+	case 50:
+		offset, span = 40, 30
+	case 100:
+		offset, span = 70, 30
+	}
+	if i < span {
+		return offset + (vuIdx+i)%span
+	}
+	if offset > 0 {
+		return (vuIdx + i - span) % offset
+	}
+	return (vuIdx + i) % actorsPerUser
+}
+
 func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	n := r.cfg.ActorsPerUser
 	if n < 1 {
@@ -232,13 +266,14 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 		u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
 		bmetrics.UpdateUsers(userClass, 1)
 		for i := 0; i < n; i++ {
-			actorNum := i*1000000 + vuIdx + 1
+			bucket := coldActorStepBucket(n, vuIdx, i)
+			actorNum := bucket*1000000 + vuIdx + 1
 			a := &gluttonActor{
 				cfg:         r.cfg,
 				stub:        stub,
 				httpSem:     r.httpSem,
 				actorName:   fmt.Sprintf("sb-cold-%d", actorNum),
-				firstResume: true,
+				firstResume: i == 0,
 			}
 			if i == 0 {
 				r.atespaceOnce.Do(func() {

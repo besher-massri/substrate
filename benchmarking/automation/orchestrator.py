@@ -713,6 +713,16 @@ def main() -> None:
                         isolate_workload_args(test),
                         test.get("actorCPU", ""),
                     )
+                elif i > 0 and os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true":
+                    deploy_workloads(
+                        test.get("workerCount", 1),
+                        sandbox_class,
+                        test.get("actorMemory", ""),
+                        test.get("workerWaitTimeout", ""),
+                        test.get("workerMemory", ""),
+                        isolate_workload_args(test),
+                        test.get("actorCPU", ""),
+                    )
                 try:
                     status = run_test(
                         test,

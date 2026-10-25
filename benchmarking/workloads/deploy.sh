@@ -525,7 +525,46 @@ deploy() {
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
     if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
       kubectl exec -n ate-system postgres-0 -c postgres -- \
-        psql -U postgres -d atepg -c "DELETE FROM substrate.workers WHERE worker_namespace = 'benchmark-workloads';" >/dev/null 2>&1 || true
+        psql -U postgres -d atepg -c "SET ROLE substrate_owner; SET search_path TO substrate; TRUNCATE TABLE worker_assignments, leases; DELETE FROM workers WHERE worker_namespace = 'benchmark-workloads';" >/dev/null 2>&1 || true
+      kubectl delete daemonset ate-cache-wiper -n default --ignore-not-found=true >/dev/null 2>&1 || true
+      kubectl apply -f - <<'WIPER_EOF' || true
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ate-cache-wiper
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: ate-cache-wiper
+  template:
+    metadata:
+      labels:
+        app: ate-cache-wiper
+    spec:
+      tolerations:
+      - key: ate.dev/sandboxClass
+        operator: Exists
+        effect: NoSchedule
+      initContainers:
+      - name: wipe
+        image: mirror.gcr.io/library/busybox:1.36.1
+        securityContext:
+          privileged: true
+        command: ["sh", "-c", "rm -rf /host-ate/actor-snapshot-cache /host-ate/actors/* /host-ate/snapshots/* /host-ate/sandboxes/* /host-ate/containers/* 2>/dev/null || true"]
+        volumeMounts:
+        - name: host-ate
+          mountPath: /host-ate
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+      volumes:
+      - name: host-ate
+        hostPath:
+          path: /var/lib/ate
+WIPER_EOF
+      kubectl rollout status daemonset/ate-cache-wiper -n default --timeout=300s || true
+      kubectl delete daemonset ate-cache-wiper -n default --ignore-not-found=true >/dev/null 2>&1 || true
       for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
         kubectl rollout restart --namespace=ate-system "${ds}" || true
       done
@@ -557,6 +596,8 @@ deploy() {
         kubectl wait --for=jsonpath='{.status.readyReplicas}'="${WORKER_COUNT}" workerpool/benchmark-worker \
           --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s" || true
       fi
+      kubectl rollout restart deployment/ate-api-server --namespace=ate-system || true
+      kubectl rollout status deployment/ate-api-server --namespace=ate-system --timeout=300s || true
     else
       kubectl rollout status deployment/benchmark-worker \
         --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"

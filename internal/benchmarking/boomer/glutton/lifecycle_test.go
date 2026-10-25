@@ -313,3 +313,43 @@ func TestNoteFailureIgnoresRetryLater(t *testing.T) {
 		t.Errorf("consecutiveFailures = %d, want 0", a.consecutiveFailures)
 	}
 }
+
+func TestColdActorStepBucketBijectionAndDisjointness(t *testing.T) {
+	steps := []int{5, 10, 25, 50, 100}
+	for _, n := range steps {
+		for _, vuIdx := range []int{0, 1, 7, 42, 999999} {
+			seen := make(map[int]bool, n)
+			for i := range n {
+				b := coldActorStepBucket(n, vuIdx, i)
+				if b < 0 || b >= 100 {
+					t.Fatalf("coldActorStepBucket(%d, %d, %d) = %d, out of [0, 100)", n, vuIdx, i, b)
+				}
+				if seen[b] {
+					t.Fatalf("coldActorStepBucket(%d, %d, %d) produced duplicate bucket %d", n, vuIdx, i, b)
+				}
+				seen[b] = true
+			}
+			if len(seen) != n {
+				t.Fatalf("coldActorStepBucket(%d, %d, *) produced %d distinct buckets, want %d", n, vuIdx, len(seen), n)
+			}
+		}
+	}
+
+	stepPrimaryBuckets := make(map[int]int)
+	for _, n := range steps {
+		maxPrimary := min(n, 30)
+		for vuIdx := range 100 {
+			for i := range maxPrimary {
+				b := coldActorStepBucket(n, vuIdx, i)
+				if prevStep, exists := stepPrimaryBuckets[b]; exists && prevStep != n {
+					t.Fatalf("bucket %d used in primary iterations by both n=%d and n=%d", b, prevStep, n)
+				}
+				stepPrimaryBuckets[b] = n
+			}
+		}
+	}
+	if len(stepPrimaryBuckets) != 100 {
+		t.Fatalf("primary slices across steps covered %d buckets, want all 100", len(stepPrimaryBuckets))
+	}
+}
+
