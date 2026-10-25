@@ -390,11 +390,15 @@ prepopulate_cold_actors() {
     echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; cleaning non-cold actors."
     kubectl exec -n ate-system postgres-0 -c postgres -- \
       psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
-        SET ROLE substrate_owner;
-        SET search_path TO substrate;
-        SET synchronous_commit = off;
+        BEGIN;
+        SET LOCAL ROLE substrate_owner;
+        SET LOCAL search_path TO substrate;
+        SET LOCAL synchronous_commit = off;
+        SET LOCAL enable_seqscan = off;
         DELETE FROM actors WHERE atespace = 'benchmark' AND name < 'sb-cold-';
         DELETE FROM actors WHERE atespace = 'benchmark' AND name > 'sb-cold-~';
+        COMMIT;
+        CHECKPOINT;
       "
     return 0
   fi
@@ -402,11 +406,14 @@ prepopulate_cold_actors() {
     echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; topping up to 100,000,000 via CreateActor gRPC..."
     kubectl exec -n ate-system postgres-0 -c postgres -- \
       psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
-        SET ROLE substrate_owner;
-        SET search_path TO substrate;
-        SET synchronous_commit = off;
+        BEGIN;
+        SET LOCAL ROLE substrate_owner;
+        SET LOCAL search_path TO substrate;
+        SET LOCAL synchronous_commit = off;
+        SET LOCAL enable_seqscan = off;
         DELETE FROM actors WHERE atespace = 'benchmark' AND name < 'sb-cold-';
         DELETE FROM actors WHERE atespace = 'benchmark' AND name > 'sb-cold-~';
+        COMMIT;
       "
     run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
     run_cold_actor_seed_job 100000000 1000000 1 99000001
@@ -524,8 +531,9 @@ deploy() {
     kubectl wait --for=create deployment/benchmark-worker \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
     if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
+      kubectl wait --for=condition=Ready pod/postgres-0 --namespace=ate-system --timeout=300s || true
       kubectl exec -n ate-system postgres-0 -c postgres -- \
-        psql -U postgres -d atepg -c "SET ROLE substrate_owner; SET search_path TO substrate; TRUNCATE TABLE worker_assignments, leases; DELETE FROM workers WHERE worker_namespace = 'benchmark-workloads';" >/dev/null 2>&1 || true
+        psql -U postgres -d atepg -c "SET ROLE substrate_owner; SET search_path TO substrate; TRUNCATE TABLE worker_assignments, leases, workers;" >/dev/null 2>&1 || true
       kubectl delete daemonset ate-cache-wiper -n default --ignore-not-found=true >/dev/null 2>&1 || true
       kubectl apply -f - <<'WIPER_EOF' || true
 apiVersion: apps/v1
@@ -584,17 +592,17 @@ WIPER_EOF
       kubectl rollout status deployment/benchmark-worker \
         --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
       kill "${reaper_pid}" >/dev/null 2>&1 || true
-      live_uids="$(kubectl get pods -n benchmark-workloads -l ate.dev/worker-pool=benchmark-worker -o jsonpath='{range .items[?(!@.metadata.deletionTimestamp)]}'\''{.metadata.uid}'\'',{end}' 2>/dev/null | sed 's/,$//' || true)"
-      if [[ -n "${live_uids}" ]]; then
-        kubectl exec -n ate-system postgres-0 -c postgres -- \
-          psql -U postgres -d atepg -c "DELETE FROM substrate.workers WHERE worker_namespace = 'benchmark-workloads' AND name NOT IN (${live_uids});" >/dev/null 2>&1 || true
-      fi
       for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
         kubectl rollout status --namespace=ate-system "${ds}" --timeout="${WAIT_TIMEOUT_SECS}s" || true
       done
       if ((WORKER_COUNT > 0)); then
         kubectl wait --for=jsonpath='{.status.readyReplicas}'="${WORKER_COUNT}" workerpool/benchmark-worker \
           --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s" || true
+      fi
+      live_uids="$(kubectl get pods -n benchmark-workloads -l ate.dev/worker-pool=benchmark-worker -o jsonpath='{range .items[?(!@.metadata.deletionTimestamp)]}'\''{.metadata.uid}'\'',{end}' 2>/dev/null | sed 's/,$//' || true)"
+      if [[ -n "${live_uids}" ]]; then
+        kubectl exec -n ate-system postgres-0 -c postgres -- \
+          psql -U postgres -d atepg -c "SET ROLE substrate_owner; SET search_path TO substrate; TRUNCATE TABLE worker_assignments, leases; DELETE FROM workers WHERE name NOT IN (${live_uids});" >/dev/null 2>&1 || true
       fi
       kubectl rollout restart deployment/ate-api-server --namespace=ate-system || true
       kubectl rollout status deployment/ate-api-server --namespace=ate-system --timeout=300s || true
