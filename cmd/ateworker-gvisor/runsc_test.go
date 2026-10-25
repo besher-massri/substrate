@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 
 	"go.ate.dev/substrate/internal/actorlock"
@@ -747,3 +749,78 @@ func BenchmarkGVisorRestorePrep(b *testing.B) {
 		}
 	})
 }
+
+func TestActorAffinitySlice(t *testing.T) {
+	if got := actorAffinityWidth(248); got != defaultRunscAffinityCPUs {
+		t.Errorf("actorAffinityWidth(248) = %d, want %d", got, defaultRunscAffinityCPUs)
+	}
+	if got := actorAffinityWidth(8000); got != 8 {
+		t.Errorf("actorAffinityWidth(8000) = %d, want 8", got)
+	}
+	if got := actorAffinityWidth(12500); got != 13 {
+		t.Errorf("actorAffinityWidth(12500) = %d, want 13", got)
+	}
+
+	avail := make([]int, 180)
+	for i := range avail {
+		avail[i] = i
+	}
+	setA := selectActorCPUSet("actor-a", avail, 8)
+	if got := setA.Count(); got != 8 {
+		t.Fatalf("selectActorCPUSet(actor-a) count = %d, want 8", got)
+	}
+	setA2 := selectActorCPUSet("actor-a", avail, 8)
+	if setA != setA2 {
+		t.Error("selectActorCPUSet is not deterministic for the same actorUID")
+	}
+	setB := selectActorCPUSet("actor-b", avail, 8)
+	if got := setB.Count(); got != 8 {
+		t.Fatalf("selectActorCPUSet(actor-b) count = %d, want 8", got)
+	}
+	if setA == setB {
+		t.Error("selectActorCPUSet returned identical 8-CPU masks for distinct actorUIDs on 180 CPUs")
+	}
+
+	full := selectActorCPUSet("actor-a", avail[:4], 8)
+	if got := full.Count(); got != 4 {
+		t.Errorf("selectActorCPUSet when width >= len(avail) count = %d, want 4", got)
+	}
+}
+
+func TestRunCmdWithAvailRestoresParentAffinity(t *testing.T) {
+	avail := hostAvailableCPUs()
+	if len(avail) < 2 {
+		t.Skipf("need at least 2 available CPUs to test affinity slicing, got %d", len(avail))
+	}
+	var before unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &before); err != nil {
+		t.Fatalf("SchedGetaffinity before = %v", err)
+	}
+
+	r := &runsc{actorUID: "actor-affinity-test"}
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", "grep '^Cpus_allowed_list:' /proc/self/status")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := r.runCmdWithAvail(cmd, avail, 1); err != nil {
+		t.Fatalf("runCmdWithAvail() = %v", err)
+	}
+
+	var after unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &after); err != nil {
+		t.Fatalf("SchedGetaffinity after = %v", err)
+	}
+	if after != before {
+		t.Errorf("parent thread CPU affinity changed: got %v, want %v", cpuSetToSlice(&after), cpuSetToSlice(&before))
+	}
+
+	expectedSet := selectActorCPUSet(r.actorUID, avail, 1)
+	expectedCPUs := cpuSetToSlice(&expectedSet)
+	if len(expectedCPUs) != 1 {
+		t.Fatalf("expectedCPUs = %v, want 1 CPU", expectedCPUs)
+	}
+	gotLine := strings.TrimSpace(out.String())
+	if strings.Contains(gotLine, "-") || strings.Contains(gotLine, ",") {
+		t.Errorf("child process Cpus_allowed_list was not bounded to 1 CPU: %q", gotLine)
+	}
+}
+

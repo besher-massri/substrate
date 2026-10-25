@@ -875,11 +875,11 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	//   * After we exit, atelet will upload checkpoint to GCS
 	//   * After we exit, atelet will tear down OCI bundles and reset the actor directory.
 
-	// Checkpoint only saves state; no sizing is applied, so size is left zero.
 	rcmd := &runsc{
 		path:      req.GetRunscPath(),
 		actorUID:  req.GetActorUid(),
 		actorDirs: req.GetActorDirs(),
+		size:      actorSize,
 		flags:     s.flags,
 	}
 

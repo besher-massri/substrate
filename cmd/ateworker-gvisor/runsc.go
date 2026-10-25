@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ import (
 	"go.ate.dev/substrate/internal/ocispec"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/sizing"
+	"golang.org/x/sys/unix"
 )
 
 // wakeupLivenessCheckDelay is the grace period before waitForWakeupProbesWithLiveness
@@ -124,6 +126,119 @@ func (r *runsc) execRunsc(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, r.path, args...)
 	cmd.Env = runscCmdEnv()
 	return cmd
+}
+
+// defaultRunscAffinityCPUs is the default number of host CPUs included in the
+// per-actor CPU affinity slice inherited by runsc and its child processes
+// (gvisor-sentry-prewarmer, runsc-sandbox, and runsc-gofer) on high-core-count
+// hosts. Because runsc strips GOMAXPROCS and sets GODEBUG=containermaxprocs=0
+// when spawning its child processes, Go's runtime initialization in each child
+// sizes its initial P count and OS thread pool from sched_getaffinity(2) and
+// trims capabilities across all threads via AllThreadsSyscall. Bounding the
+// inherited affinity mask to an actor-hashed slice of 8 CPUs (or the actor's
+// declared CPU ceiling when larger) avoids 180-CPU runtime initialization on
+// large nodes while distributing actors uniformly across all host CPUs.
+const defaultRunscAffinityCPUs = 8
+
+// hostAvailableCPUs returns the sorted list of CPU IDs in the current process's
+// initial scheduling affinity mask.
+var hostAvailableCPUs = sync.OnceValue(func() []int {
+	var mask unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &mask); err != nil {
+		return nil
+	}
+	return cpuSetToSlice(&mask)
+})
+
+// cpuSetToSlice returns the sorted CPU indices set in mask.
+func cpuSetToSlice(mask *unix.CPUSet) []int {
+	count := mask.Count()
+	if count <= 0 {
+		return nil
+	}
+	const maxCPUSetBits = len(unix.CPUSet{}) * 64
+	cpus := make([]int, 0, count)
+	for cpu := 0; cpu < maxCPUSetBits && len(cpus) < count; cpu++ {
+		if mask.IsSet(cpu) {
+			cpus = append(cpus, cpu)
+		}
+	}
+	return cpus
+}
+
+// actorAffinityWidth returns the target number of CPUs for an actor's runsc
+// affinity slice, using at least defaultRunscAffinityCPUs and scaling up when
+// the actor's declared CPU limit exceeds defaultRunscAffinityCPUs cores.
+func actorAffinityWidth(milliCPU int64) int {
+	ceilCPUs := int((milliCPU + 999) / 1000)
+	return max(defaultRunscAffinityCPUs, ceilCPUs)
+}
+
+// selectActorCPUSet constructs a CPU affinity mask containing width CPUs chosen
+// as a deterministic circular window over availCPUs hashed by actorUID. Because
+// the window wraps around len(availCPUs), every available host CPU has an
+// identical selection probability with no edge bias.
+func selectActorCPUSet(actorUID string, availCPUs []int, width int) unix.CPUSet {
+	var out unix.CPUSet
+	n := len(availCPUs)
+	if n == 0 {
+		return out
+	}
+	if width <= 0 || width >= n || actorUID == "" {
+		for _, cpu := range availCPUs {
+			out.Set(cpu)
+		}
+		return out
+	}
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	for i := 0; i < len(actorUID); i++ {
+		h ^= uint32(actorUID[i])
+		h *= prime32
+	}
+	start := int(h % uint32(n))
+	for i := range width {
+		out.Set(availCPUs[(start+i)%n])
+	}
+	return out
+}
+
+// runCmd executes cmd, temporarily bounding the calling OS thread's CPU
+// affinity mask around cmd.Start() when the host has more CPUs than the actor's
+// target affinity slice so the spawned runsc process and its children inherit
+// the bounded mask while the worker thread immediately restores its prior mask.
+func (r *runsc) runCmd(cmd *exec.Cmd) error {
+	return r.runCmdWithAvail(cmd, hostAvailableCPUs(), actorAffinityWidth(r.size.MilliCPU))
+}
+
+// runCmdWithAvail executes cmd using availCPUs and width to compute the child's
+// inherited CPU affinity mask when len(availCPUs) > width.
+func (r *runsc) runCmdWithAvail(cmd *exec.Cmd, availCPUs []int, width int) error {
+	if r.actorUID == "" || width <= 0 || len(availCPUs) <= width {
+		return cmd.Run()
+	}
+	sliceMask := selectActorCPUSet(r.actorUID, availCPUs, width)
+
+	runtime.LockOSThread()
+	var prevMask unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &prevMask); err != nil {
+		runtime.UnlockOSThread()
+		return cmd.Run()
+	}
+	if err := unix.SchedSetaffinity(0, &sliceMask); err != nil {
+		runtime.UnlockOSThread()
+		return cmd.Run()
+	}
+	startErr := cmd.Start()
+	_ = unix.SchedSetaffinity(0, &prevMask)
+	runtime.UnlockOSThread()
+	if startErr != nil {
+		return startErr
+	}
+	return cmd.Wait()
 }
 
 // transitionBurstFloorMilliCPU is the minimum container CFS CPU quota floor
@@ -241,7 +356,7 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 	cmd.Stdout = out
 	cmd.Stderr = out
 
-	err := cmd.Run()
+	err := r.runCmd(cmd)
 	if err != nil {
 		return fmt.Errorf("while running `runsc create`: %w", err)
 	}
@@ -256,7 +371,7 @@ func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName strin
 	cmd.Stdout = out
 	cmd.Stderr = out
 
-	err := cmd.Run()
+	err := r.runCmd(cmd)
 	if err != nil {
 		return fmt.Errorf("while running `runsc start`: %w", err)
 	}
@@ -281,7 +396,7 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 	cmd := r.execRunsc(ctx, r.checkpointArgs(containerName, checkpointPath, fsCheckpointPaths)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	err := r.runCmd(cmd)
 	if err != nil {
 		return fmt.Errorf("while running `runsc checkpoint`: %w", err)
 	}
@@ -306,7 +421,7 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 	cmd := r.execRunsc(ctx, r.fsCheckpointArgs(containerName, checkpointPath, fsCheckpointPaths)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	err := r.runCmd(cmd)
 	if err != nil {
 		return fmt.Errorf("while running `runsc fscheckpoint`: %w", err)
 	}
@@ -340,7 +455,7 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 	cmd := r.execRunsc(ctx, r.restoreArgs(containerName, checkpointPath, additionalArgs)...)
 	cmd.Stdout = out
 	cmd.Stderr = out
-	if err := cmd.Run(); err != nil {
+	if err := r.runCmd(cmd); err != nil {
 		return fmt.Errorf("while running `runsc restore`: %w", err)
 	}
 	return nil
@@ -353,7 +468,7 @@ func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	err := r.runCmd(cmd)
 	if err != nil {
 		return fmt.Errorf("while running `runsc delete`: %w", err)
 	}
@@ -367,7 +482,7 @@ func (r *runsc) cmdState(ctx context.Context, containerName string) error {
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := r.runCmd(cmd); err != nil {
 		return fmt.Errorf("while running `runsc state`: %w", err)
 	}
 	return nil
@@ -382,7 +497,7 @@ func (r *runsc) cmdList(ctx context.Context) ([]string, error) {
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := r.runCmd(cmd); err != nil {
 		return nil, fmt.Errorf("while running `runsc list`: %w", err)
 	}
 	return strings.Fields(out.String()), nil
@@ -396,7 +511,7 @@ func (r *runsc) cmdKill(ctx context.Context, containerName, signal string) error
 	cmd := r.execRunsc(ctx, r.buildArgs("kill", "", containerName, signal)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := r.runCmd(cmd); err != nil {
 		return fmt.Errorf("while running `runsc kill`: %w", err)
 	}
 	return nil
@@ -408,7 +523,7 @@ func (r *runsc) runWait(ctx context.Context, containerName string, extraArgs ...
 	cmd := r.execRunsc(ctx, r.buildArgs("wait", containerName, extraArgs...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := r.runCmd(cmd); err != nil {
 		return fmt.Errorf("while running `runsc wait`: %w", err)
 	}
 	return nil
