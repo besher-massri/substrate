@@ -279,12 +279,12 @@ func TestApplyWorkloadRuntimeAndScaleOverrides(t *testing.T) {
 	applyWorkloadRuntimeAndScaleOverrides(objs, true, false, environ)
 
 	apiDep := findObject(objs, "Deployment", "ate-api-server")
-	if replicas, _, _ := unstructured.NestedInt64(apiDep.Object, "spec", "replicas"); replicas != 6 {
-		t.Errorf("size100 ate-api-server replicas = %d, want 6", replicas)
+	if replicas, _, _ := unstructured.NestedInt64(apiDep.Object, "spec", "replicas"); replicas != 16 {
+		t.Errorf("size100 ate-api-server replicas = %d, want 16", replicas)
 	}
 	apiEnv := containerEnvMap(t, apiDep, "ate-api-server")
-	if apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] != "192" {
-		t.Errorf("ATE_API_POSTGRES_POOL_MAX_CONNS = %q, want 192", apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"])
+	if apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] != "64" {
+		t.Errorf("ATE_API_POSTGRES_POOL_MAX_CONNS = %q, want 64", apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"])
 	}
 	if apiEnv["ATE_API_SNAPSHOT_LOCATION"] != "gs://test-bucket/snapshots" {
 		t.Errorf("ate-api-server env missing forwarded vars: %v", apiEnv)

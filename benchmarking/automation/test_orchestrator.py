@@ -76,11 +76,12 @@ class DeploySubstrateTest(unittest.TestCase):
             [
                 "system:serviceaccount:ate-system:ate-client",
                 "spiffe://cluster.local/ns/benchmarking/sa/benchmark-runner",
+                "spiffe://cluster.local/ns/benchmarking/sa/default",
             ],
         )
         self.assertEqual(
             env["ATE_INGRESS_ALLOWED_SPIFFE_IDS"],
-            "spiffe://cluster.local/ns/benchmarking/sa/benchmark-runner",
+            "spiffe://cluster.local/ns/benchmarking/sa/benchmark-runner,spiffe://cluster.local/ns/benchmarking/sa/default",
         )
 
     @mock.patch("orchestrator.run")

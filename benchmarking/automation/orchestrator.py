@@ -447,8 +447,54 @@ def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
             time.sleep(15)
 
 
+def wipe_worker_disks() -> None:
+    """Run a short-lived DaemonSet across worker nodes to clear /var/lib/ate
+    state before a fresh Substrate deployment."""
+    wiper_manifest = """apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ate-cache-wiper
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: ate-cache-wiper
+  template:
+    metadata:
+      labels:
+        app: ate-cache-wiper
+    spec:
+      tolerations:
+      - key: ate.dev/sandboxClass
+        operator: Exists
+        effect: NoSchedule
+      initContainers:
+      - name: wipe
+        image: mirror.gcr.io/library/busybox:1.36.1
+        securityContext:
+          privileged: true
+        command: ["sh", "-c", "rm -rf /host-ate/actor-snapshot-cache /host-ate/actors/* /host-ate/snapshots/* /host-ate/sandboxes/* /host-ate/containers/* 2>/dev/null || true"]
+        volumeMounts:
+        - name: host-ate
+          mountPath: /host-ate
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+      volumes:
+      - name: host-ate
+        hostPath:
+          path: /var/lib/ate
+"""
+    run_no_check(["kubectl", "delete", "daemonset", "ate-cache-wiper", "-n", "default", "--ignore-not-found=true"])
+    subprocess.run(["kubectl", "apply", "-f", "-"], input=wiper_manifest, text=True, check=False)
+    run_no_check(["kubectl", "rollout", "status", "daemonset/ate-cache-wiper", "-n", "default", "--timeout=300s"])
+    run_no_check(["kubectl", "delete", "daemonset", "ate-cache-wiper", "-n", "default", "--ignore-not-found=true"])
+
+
 def teardown_substrate() -> None:
     run_no_check(["hack/install-ate.sh", "delete", "ate-system"])
+    if os.environ.get("ENVELOPE_PRESET") or os.environ.get("SCALE_PROFILE"):
+        wipe_worker_disks()
 
 
 def install_microvm_deps() -> None:
@@ -465,6 +511,23 @@ def teardown_microvm_deps() -> None:
     run_no_check(["hack/install-microvm-deps.sh", "--delete"])
 
 
+def _extract_int_flag(flags: Iterable[str], name: str, default: int) -> int:
+    prefix = f"--{name}="
+    flags_list = [str(f) for f in flags]
+    for i, f in enumerate(flags_list):
+        if f.startswith(prefix):
+            try:
+                return int(f[len(prefix):])
+            except ValueError:
+                return default
+        if f == f"--{name}" and i + 1 < len(flags_list):
+            try:
+                return int(flags_list[i + 1])
+            except ValueError:
+                return default
+    return default
+
+
 def deploy_workloads(
     worker_count: int = 1,
     sandbox_class: str = "gvisor",
@@ -473,6 +536,7 @@ def deploy_workloads(
     worker_memory: str = "",
     fake_atelet_args: Iterable[str] = (),
     actor_cpu: str = "",
+    n_participating: int = 0,
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -503,7 +567,10 @@ def deploy_workloads(
     # An isolate block's tuning of fake-atelet, on the fake data plane.
     cmd += list(fake_atelet_args)
     # deploy.sh itself blocks until every template's golden snapshot exists.
-    run(cmd)
+    if n_participating > 0:
+        run(cmd, env={**os.environ, "ENVELOPE_N_PARTICIPATING": str(n_participating)})
+    else:
+        run(cmd)
 
 
 def teardown_workloads() -> None:
@@ -680,49 +747,39 @@ def main() -> None:
             if ttype not in images:
                 images[ttype] = TYPES[ttype].build_image(commit)
 
-            # Idempotent sweep before anything else: a previous CronJob
-            # fire that crashed mid-test (or any other process that left
-            # state behind) would otherwise leak its substrate + workloads
-            # into this run. All teardowns use --ignore-not-found, so
-            # this is cheap on a clean cluster. Order matters:
-            # microvm-deps deletes a SandboxConfig CR, which requires the
-            # SandboxConfig CRD that teardown_substrate removes.
-            if os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true":
-                teardown_workloads()
-                teardown_microvm_deps()
-                teardown_substrate()
+            # Idempotent sweep before anything else: every test starts from a
+            # fresh deployment of ate-system, postgres-0, and benchmark-workloads.
+            # Order matters: microvm-deps deletes a SandboxConfig CR, which
+            # requires the SandboxConfig CRD that teardown_substrate removes.
+            teardown_workloads()
+            teardown_microvm_deps()
+            teardown_substrate()
 
             sandbox_class = test.get("sandboxClass", "gvisor")
             status = "error"
             failure_msg = None
             start_time = time.time()
+            flags = test.get("flags", [])
+            users = _extract_int_flag(flags, "users", 0)
+            actors_per_user = _extract_int_flag(flags, "actors-per-user", 1)
+            n_participating = min(users, 1_000_000) * actors_per_user if users > 0 else 0
             try:
-                if i == 0 or os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true":
-                    deploy_substrate(substrate_args(test))
-                    TYPES[ttype].pre_test(test)
-                    # install-microvm-deps needs the CRDs from deploy_substrate;
-                    # deploy_workloads needs the microvm SandboxConfig.
-                    if sandbox_class == "microvm":
-                        install_microvm_deps()
-                    deploy_workloads(
-                        test.get("workerCount", 1),
-                        sandbox_class,
-                        test.get("actorMemory", ""),
-                        test.get("workerWaitTimeout", ""),
-                        test.get("workerMemory", ""),
-                        isolate_workload_args(test),
-                        test.get("actorCPU", ""),
-                    )
-                elif i > 0 and os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true":
-                    deploy_workloads(
-                        test.get("workerCount", 1),
-                        sandbox_class,
-                        test.get("actorMemory", ""),
-                        test.get("workerWaitTimeout", ""),
-                        test.get("workerMemory", ""),
-                        isolate_workload_args(test),
-                        test.get("actorCPU", ""),
-                    )
+                deploy_substrate(substrate_args(test))
+                TYPES[ttype].pre_test(test)
+                # install-microvm-deps needs the CRDs from deploy_substrate;
+                # deploy_workloads needs the microvm SandboxConfig.
+                if sandbox_class == "microvm":
+                    install_microvm_deps()
+                deploy_workloads(
+                    test.get("workerCount", 1),
+                    sandbox_class,
+                    test.get("actorMemory", ""),
+                    test.get("workerWaitTimeout", ""),
+                    test.get("workerMemory", ""),
+                    isolate_workload_args(test),
+                    test.get("actorCPU", ""),
+                    n_participating=n_participating,
+                )
                 try:
                     status = run_test(
                         test,
@@ -740,16 +797,11 @@ def main() -> None:
                 print(f"Test {test['name']} setup failed: {e}", flush=True)
                 failure_msg = str(e)
             finally:
-                # Always tear down, even if deploy or run failed, so the
-                # next test (and the next CronJob fire) starts clean.
-                # microvm-deps must go before substrate for the same reason
-                # as above. When ENVELOPE_PHASE1_DB_WORKAROUNDS=true, preserve
-                # ate-system and postgres-0 so the 100M registered actors table
-                # and Prometheus target state remain intact after the run.
-                if os.environ.get("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true":
-                    teardown_workloads()
-                    teardown_microvm_deps()
-                    teardown_substrate()
+                # Always tear down between tests so the next test (and the next
+                # CronJob fire) starts clean.
+                teardown_workloads()
+                teardown_microvm_deps()
+                teardown_substrate()
             duration = time.time() - start_time
             results.append((test["name"], status, duration, failure_msg))
         finally:

@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"os"
 	"slices"
 	"time"
 
@@ -79,13 +78,10 @@ func (s *RPCService) CreateActor(ctx context.Context, req *ateapipb.CreateActorR
 }
 
 // resolveActorTemplateCached resolves the ActorTemplate referenced by inActor,
-// consulting a short-lived (2s TTL) in-memory cache when
-// ENVELOPE_PHASE1_DB_WORKAROUNDS=true so high-throughput CreateActor seeding
-// does not issue redundant per-actor PostgreSQL SELECTs for the shared template.
+// consulting a short-lived (2s TTL) in-memory cache so high-throughput
+// CreateActor calls do not issue redundant per-actor PostgreSQL SELECTs for
+// the shared immutable template.
 func (s *ServiceImpl) resolveActorTemplateCached(ctx context.Context, inActor *ateapipb.Actor) (*ateapipb.ActorTemplate, error) {
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true" {
-		return resolveActorTemplate(ctx, s.store, inActor)
-	}
 	ref := resources.ActorTemplateRefFromObjectRef(inActor.GetActorTemplate())
 	now := time.Now()
 	s.templateCacheMu.RLock()
@@ -112,13 +108,9 @@ func (s *ServiceImpl) resolveActorTemplateCached(ctx context.Context, inActor *a
 }
 
 // getTagCached fetches a Tag by reference, consulting a short-lived (2s TTL)
-// in-memory cache when ENVELOPE_PHASE1_DB_WORKAROUNDS=true so high-throughput
-// CreateActor seeding does not issue redundant per-actor PostgreSQL SELECTs for
-// the template's golden tag.
+// in-memory cache so high-throughput CreateActor calls do not issue redundant
+// per-actor PostgreSQL SELECTs for the template's golden tag.
 func (s *ServiceImpl) getTagCached(ctx context.Context, ref resources.TagRef) (*ateapipb.Tag, error) {
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") != "true" {
-		return s.store.GetTag(ctx, ref)
-	}
 	now := time.Now()
 	s.tagCacheMu.RLock()
 	if entry, ok := s.tagCache[ref]; ok && now.Before(entry.expiresAt) {

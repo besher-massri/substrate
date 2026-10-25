@@ -99,8 +99,10 @@ func (e *Env) waitAndSetupBundledPostgres(ctx context.Context) error {
 // postgres-size10/postgres-config-patch.yaml is tuned to these numbers, so they
 // move together.
 const (
-	size10PostgresCPURequest = "80"
-	size10PostgresMemory     = "140Gi"
+	size10PostgresCPURequest  = "80"
+	size10PostgresMemory      = "140Gi"
+	size100PostgresCPURequest = "160"
+	size100PostgresMemory     = "1000Gi"
 )
 
 // postgresPoolSelector selects the nodes of the pool the cordon-control-plane
@@ -342,27 +344,62 @@ func applyPostgresSize10Overrides(objs []*unstructured.Unstructured, confPatch [
 	return nil
 }
 
-// applyPostgresSize100Overrides raises max_connections to 2000 and
-// max_wal_size to 32GB on configmap/postgres-config for the size100
-// multi-replica control-plane profile while keeping shared_buffers = 35GB
-// and all other size10 PostgreSQL settings intact.
+// applyPostgresSize100Overrides raises shared_buffers to 256GB, max_connections
+// to 2000, max_wal_size to 64GB, and checkpoint_timeout to 30min on
+// configmap/postgres-config and resizes statefulset/postgres for a dedicated
+// c3d-highmem-180 node under the size100 profile.
 func applyPostgresSize100Overrides(objs []*unstructured.Unstructured) error {
+	var configMap, statefulSet *unstructured.Unstructured
 	for _, obj := range objs {
-		if obj.GetNamespace() != NamespaceAteSystem || obj.GetKind() != "ConfigMap" || obj.GetName() != "postgres-config" {
+		if obj.GetNamespace() != NamespaceAteSystem {
 			continue
 		}
-		conf, _, err := unstructured.NestedString(obj.Object, "data", "postgresql.conf")
-		if err != nil || conf == "" {
-			return fmt.Errorf("%s carries no postgresql.conf to resize for size100", kube.Describe(obj))
+		switch {
+		case obj.GetKind() == "ConfigMap" && obj.GetName() == "postgres-config":
+			configMap = obj
+		case obj.GetKind() == "StatefulSet" && obj.GetName() == "postgres":
+			statefulSet = obj
 		}
-		conf = strings.ReplaceAll(conf, "max_connections = 300", "max_connections = 2000")
-		conf = strings.ReplaceAll(conf, "max_wal_size = 16GB", "max_wal_size = 32GB\n    checkpoint_timeout = 30min")
-		if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && !strings.Contains(conf, "synchronous_commit = off") {
-			conf += "\n    synchronous_commit = off\n    wal_writer_delay = 10ms\n    wal_writer_flush_after = 1MB\n"
-		}
-		return unstructured.SetNestedField(obj.Object, conf, "data", "postgresql.conf")
 	}
-	return fmt.Errorf("the postgres manifest has no configmap/postgres-config to resize for size100")
+	if configMap == nil {
+		return fmt.Errorf("the postgres manifest has no configmap/postgres-config to resize for size100")
+	}
+	if statefulSet == nil {
+		return fmt.Errorf("the postgres manifest has no statefulset/postgres to resize for size100")
+	}
+	conf, _, err := unstructured.NestedString(configMap.Object, "data", "postgresql.conf")
+	if err != nil || conf == "" {
+		return fmt.Errorf("%s carries no postgresql.conf to resize for size100", kube.Describe(configMap))
+	}
+	conf = strings.ReplaceAll(conf, "shared_buffers = 35GB", "shared_buffers = 256GB")
+	conf = strings.ReplaceAll(conf, "max_connections = 300", "max_connections = 2000")
+	conf = strings.ReplaceAll(conf, "max_wal_size = 16GB", "max_wal_size = 64GB\n    checkpoint_timeout = 30min")
+	if err := unstructured.SetNestedField(configMap.Object, conf, "data", "postgresql.conf"); err != nil {
+		return err
+	}
+
+	containers, found, err := unstructured.NestedSlice(statefulSet.Object, "spec", "template", "spec", "containers")
+	if err != nil || !found || len(containers) == 0 {
+		return fmt.Errorf("%s has no containers to resize for size100", kube.Describe(statefulSet))
+	}
+	container, ok := containers[0].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s: container 0 is not an object", kube.Describe(statefulSet))
+	}
+	for _, field := range []struct {
+		path  []string
+		value string
+	}{
+		{[]string{"resources", "requests", "cpu"}, size100PostgresCPURequest},
+		{[]string{"resources", "requests", "memory"}, size100PostgresMemory},
+		{[]string{"resources", "limits", "memory"}, size100PostgresMemory},
+	} {
+		if err := unstructured.SetNestedField(container, field.value, field.path...); err != nil {
+			return fmt.Errorf("while setting %v on %s: %w", field.path, kube.Describe(statefulSet), err)
+		}
+	}
+	containers[0] = container
+	return unstructured.SetNestedSlice(statefulSet.Object, containers, "spec", "template", "spec", "containers")
 }
 
 // DeployPostgres deploys the experimental single-replica PostgreSQL

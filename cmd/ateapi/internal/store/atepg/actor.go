@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"time"
 
@@ -175,54 +174,35 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 		return nil, fmt.Errorf("marshaling actor: %w", err)
 	}
 
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
-		p.createBatchOnce.Do(func() {
-			p.createBatchCh = make(chan *createActorReq, 65536)
-			for i := 0; i < 32; i++ {
-				go p.runCreateActorBatcher()
-			}
-		})
-		req := &createActorReq{
-			atespace:   atespace,
-			name:       name,
-			uid:        dbActor.GetMetadata().GetUid(),
-			version:    dbActor.GetMetadata().GetVersion(),
-			protoBytes: protoBytes,
-			done:       make(chan error, 1),
+	p.createBatchOnce.Do(func() {
+		p.createBatchCh = make(chan *createActorReq, 65536)
+		for i := 0; i < 32; i++ {
+			go p.runCreateActorBatcher()
 		}
-		select {
-		case p.createBatchCh <- req:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		select {
-		case err = <-req.done:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		if err != nil {
-			if isUniqueViolation(err) {
-				return nil, store.ErrAlreadyExists
-			}
-			if isForeignKeyViolation(err) {
-				return nil, store.ErrFailedPrecondition
-			}
-			return nil, fmt.Errorf("inserting actor %s/%s: %w", atespace, name, err)
-		}
-		return dbActor, nil
+	})
+	req := &createActorReq{
+		atespace:   atespace,
+		name:       name,
+		uid:        dbActor.GetMetadata().GetUid(),
+		version:    dbActor.GetMetadata().GetVersion(),
+		protoBytes: protoBytes,
+		done:       make(chan error, 1),
 	}
-
-	_, err = p.pool.Exec(ctx, `
-		INSERT INTO actors (atespace, name, uid, version, proto)
-		VALUES ($1, $2, $3, $4, $5)`,
-		atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes)
+	select {
+	case p.createBatchCh <- req:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case err = <-req.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if err != nil {
 		if isUniqueViolation(err) {
 			return nil, store.ErrAlreadyExists
 		}
 		if isForeignKeyViolation(err) {
-			// The atespace referenced by this actor doesn't exist (or was
-			// deleted concurrently with the control API's own pre-check).
 			return nil, store.ErrFailedPrecondition
 		}
 		return nil, fmt.Errorf("inserting actor %s/%s: %w", atespace, name, err)

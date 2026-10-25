@@ -365,81 +365,36 @@ EOF
   kubectl delete job seed-cold-actors --namespace=benchmarking --ignore-not-found
 }
 
-# prepopulate_cold_actors seeds 100,000,000 cold registered actors in PostgreSQL
-# substrate.actors via real CreateActor gRPC calls before the benchmark runner
-# Job starts when ENVELOPE_N_REG >= 100000000, ensuring 100,000,000 total
-# registered actors exist in PostgreSQL during active rotation without
-# background CreateActor load competing with ResumeActor and SuspendActor.
+# prepopulate_cold_actors seeds (ENVELOPE_N_REG - ENVELOPE_N_PARTICIPATING)
+# cold registered actors in PostgreSQL substrate.actors via real CreateActor
+# gRPC calls before the benchmark runner Job starts, ensuring ENVELOPE_N_REG
+# total registered actors exist in PostgreSQL once glutton creates its
+# participating actors.
 prepopulate_cold_actors() {
-  if (( ${ENVELOPE_N_REG:-0} < 100000000 )) && [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" != "true" ]]; then
+  local n_reg="${ENVELOPE_N_REG:-0}"
+  local n_participating="${ENVELOPE_N_PARTICIPATING:-1000000}"
+  local target_cold=$(( n_reg - n_participating ))
+  if (( target_cold <= 0 )); then
+    echo "Skipping cold actor pre-population (ENVELOPE_N_REG=${n_reg}, ENVELOPE_N_PARTICIPATING=${n_participating}, target_cold=${target_cold})."
     return 0
   fi
-  echo "Ensuring benchmark atespace and reference cold actor sb-cold-0..."
+
+  echo "Ensuring benchmark atespace before seeding ${target_cold} cold registered actors via CreateActor gRPC..."
   run_kubectl_ate create atespace benchmark >/dev/null 2>&1 \
     || run_kubectl_ate get atespace benchmark >/dev/null
 
-  local existing_actors
-  existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
-    psql -U postgres -d atepg -Atc "SELECT CASE WHEN (SELECT count(DISTINCT uid) FROM substrate.actors WHERE atespace = 'benchmark' AND name IN ('sb-cold-0', 'sb-cold-1', 'sb-cold-2', 'sb-cold-50000000', 'sb-cold-100000000') AND uid IS NOT NULL) = 5 THEN 100000001 WHEN (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS DISTINCT FROM (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-2') AND (SELECT uid FROM substrate.actors WHERE atespace = 'benchmark' AND name = 'sb-cold-1') IS NOT NULL THEN (SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark' AND name LIKE 'sb-cold-%') ELSE 0 END" 2>/dev/null || echo 0)"
-  echo "Current gRPC-created cold registered actors in benchmark atespace: ${existing_actors}"
-  if [[ "${ENVELOPE_FORCE_RESEED_COLD_ACTORS:-}" == "true" ]]; then
-    echo "ENVELOPE_FORCE_RESEED_COLD_ACTORS=true: forcing full 100,000,000 cold actor re-seeding via CreateActor gRPC..."
-    existing_actors=0
-  fi
-  if ((existing_actors >= 100000000)); then
-    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; cleaning non-cold actors."
-    kubectl exec -n ate-system postgres-0 -c postgres -- \
-      psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
-        BEGIN;
-        SET LOCAL ROLE substrate_owner;
-        SET LOCAL search_path TO substrate;
-        SET LOCAL synchronous_commit = off;
-        SET LOCAL enable_seqscan = off;
-        DELETE FROM actors WHERE atespace = 'benchmark' AND name < 'sb-cold-';
-        DELETE FROM actors WHERE atespace = 'benchmark' AND name > 'sb-cold-~';
-        COMMIT;
-        CHECKPOINT;
-      "
-    return 0
-  fi
-  if ((existing_actors >= 99000000)); then
-    echo "PostgreSQL substrate.actors already holds ${existing_actors} cold registered actors; topping up to 100,000,000 via CreateActor gRPC..."
-    kubectl exec -n ate-system postgres-0 -c postgres -- \
-      psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
-        BEGIN;
-        SET LOCAL ROLE substrate_owner;
-        SET LOCAL search_path TO substrate;
-        SET LOCAL synchronous_commit = off;
-        SET LOCAL enable_seqscan = off;
-        DELETE FROM actors WHERE atespace = 'benchmark' AND name < 'sb-cold-';
-        DELETE FROM actors WHERE atespace = 'benchmark' AND name > 'sb-cold-~';
-        COMMIT;
-      "
-    run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
-    run_cold_actor_seed_job 100000000 1000000 1 99000001
-    return 0
-  fi
-
-  echo "Pre-populating 100,000,000 cold registered actors via CreateActor gRPC..."
   kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
       SET ROLE substrate_owner;
       SET search_path TO substrate;
       ALTER TABLE actor_egress_policies DROP CONSTRAINT IF EXISTS actor_egress_policies_atespace_actor_name_fkey;
       ALTER TABLE actors DROP CONSTRAINT IF EXISTS actors_atespace_fkey;
-      CREATE TEMP TABLE keep_actors AS SELECT * FROM actors WHERE atespace <> 'benchmark';
-      CREATE TEMP TABLE keep_egress AS SELECT * FROM actor_egress_policies WHERE atespace <> 'benchmark';
-      TRUNCATE TABLE actor_egress_policies, actors;
-      INSERT INTO actors SELECT * FROM keep_actors;
-      INSERT INTO actor_egress_policies SELECT * FROM keep_egress;
     "
-  kubectl rollout restart deployment/ate-api-server --namespace=ate-system || true
-  kubectl rollout status deployment/ate-api-server --namespace=ate-system --timeout=300s || true
-  run_kubectl_ate create actor sb-cold-0 -a benchmark --template benchmark-workloads/glutton >/dev/null 2>&1 || true
 
-  run_cold_actor_seed_job 100000000 6250000 16 0
+  local shard_count=$(( (target_cold + 31) / 32 ))
+  run_cold_actor_seed_job "${target_cold}" "${shard_count}" 32 0
 
-  echo "Restoring foreign keys and analyzing substrate.actors (100,000,001 rows)..."
+  echo "Restoring foreign keys and analyzing substrate.actors (${target_cold} cold rows)..."
   kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
       SET ROLE substrate_owner;
@@ -449,8 +404,11 @@ prepopulate_cold_actors() {
       ALTER TABLE actor_egress_policies ADD CONSTRAINT actor_egress_policies_atespace_actor_name_fkey
         FOREIGN KEY (atespace, actor_name) REFERENCES actors(atespace, name) ON DELETE CASCADE NOT VALID;
       ANALYZE actors;
+      RESET ROLE;
+      CHECKPOINT;
     "
 
+  local existing_actors
   existing_actors="$(kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -Atc "SELECT count(*) FROM substrate.actors WHERE atespace = 'benchmark'")"
   echo "Verified pre-populated cold registered actors in substrate.actors: ${existing_actors}"
@@ -530,86 +488,8 @@ deploy() {
   else
     kubectl wait --for=create deployment/benchmark-worker \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
-    if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
-      kubectl wait --for=condition=Ready pod/postgres-0 --namespace=ate-system --timeout=300s || true
-      kubectl exec -n ate-system postgres-0 -c postgres -- \
-        psql -U postgres -d atepg -c "SET ROLE substrate_owner; SET search_path TO substrate; TRUNCATE TABLE worker_assignments, leases, workers;" >/dev/null 2>&1 || true
-      kubectl delete daemonset ate-cache-wiper -n default --ignore-not-found=true >/dev/null 2>&1 || true
-      kubectl apply -f - <<'WIPER_EOF' || true
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: ate-cache-wiper
-  namespace: default
-spec:
-  selector:
-    matchLabels:
-      app: ate-cache-wiper
-  template:
-    metadata:
-      labels:
-        app: ate-cache-wiper
-    spec:
-      tolerations:
-      - key: ate.dev/sandboxClass
-        operator: Exists
-        effect: NoSchedule
-      initContainers:
-      - name: wipe
-        image: mirror.gcr.io/library/busybox:1.36.1
-        securityContext:
-          privileged: true
-        command: ["sh", "-c", "rm -rf /host-ate/actor-snapshot-cache /host-ate/actors/* /host-ate/snapshots/* /host-ate/sandboxes/* /host-ate/containers/* 2>/dev/null || true"]
-        volumeMounts:
-        - name: host-ate
-          mountPath: /host-ate
-      containers:
-      - name: pause
-        image: registry.k8s.io/pause:3.9
-      volumes:
-      - name: host-ate
-        hostPath:
-          path: /var/lib/ate
-WIPER_EOF
-      kubectl rollout status daemonset/ate-cache-wiper -n default --timeout=300s || true
-      kubectl delete daemonset ate-cache-wiper -n default --ignore-not-found=true >/dev/null 2>&1 || true
-      for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
-        kubectl rollout restart --namespace=ate-system "${ds}" || true
-      done
-      kubectl patch deploy -n benchmark-workloads benchmark-worker \
-        -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":"100%","maxSurge":0}}}}' || true
-      kubectl rollout restart deployment/benchmark-worker --namespace=benchmark-workloads || true
-      (
-        for _ in $(seq 1 180); do
-          sleep 3
-          term_pods="$(kubectl get pods -n benchmark-workloads -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
-          if [[ -n "${term_pods}" ]]; then
-            echo "${term_pods}" | xargs -r -n 50 kubectl delete pod -n benchmark-workloads --grace-period=0 --force >/dev/null 2>&1 || true
-          fi
-        done
-      ) &
-      reaper_pid=$!
-      kubectl rollout status deployment/benchmark-worker \
-        --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
-      kill "${reaper_pid}" >/dev/null 2>&1 || true
-      for ds in $(kubectl get daemonset --namespace=ate-system -l app=atelet -o name 2>/dev/null || true); do
-        kubectl rollout status --namespace=ate-system "${ds}" --timeout="${WAIT_TIMEOUT_SECS}s" || true
-      done
-      if ((WORKER_COUNT > 0)); then
-        kubectl wait --for=jsonpath='{.status.readyReplicas}'="${WORKER_COUNT}" workerpool/benchmark-worker \
-          --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s" || true
-      fi
-      live_uids="$(kubectl get pods -n benchmark-workloads -l ate.dev/worker-pool=benchmark-worker -o jsonpath='{range .items[?(!@.metadata.deletionTimestamp)]}'\''{.metadata.uid}'\'',{end}' 2>/dev/null | sed 's/,$//' || true)"
-      if [[ -n "${live_uids}" ]]; then
-        kubectl exec -n ate-system postgres-0 -c postgres -- \
-          psql -U postgres -d atepg -c "SET ROLE substrate_owner; SET search_path TO substrate; TRUNCATE TABLE worker_assignments, leases; DELETE FROM workers WHERE name NOT IN (${live_uids});" >/dev/null 2>&1 || true
-      fi
-      kubectl rollout restart deployment/ate-api-server --namespace=ate-system || true
-      kubectl rollout status deployment/ate-api-server --namespace=ate-system --timeout=300s || true
-    else
-      kubectl rollout status deployment/benchmark-worker \
-        --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
-    fi
+    kubectl rollout status deployment/benchmark-worker \
+      --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
   fi
 
   # The store enforces that a template's atespace exists at create time.
@@ -622,16 +502,6 @@ WIPER_EOF
   # automation deletes the actors between the tests; it also removes the old
   # golden actor and snapshot server-side.
   for template in "${TEMPLATES[@]}"; do
-    if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" == "true" ]]; then
-      local existing_json existing_tag existing_cpu
-      existing_json="$(run_kubectl_ate get actor-template "${template}" -a benchmark-workloads -o json 2>/dev/null || true)"
-      existing_tag="$(jq -r '.status.goldenSnapshotStatus.goldenTag.name // empty' <<<"${existing_json}" 2>/dev/null || true)"
-      existing_cpu="$(jq -r '(.resources.limits.cpuMillicores // empty) | tostring' <<<"${existing_json}" 2>/dev/null || true)"
-      if [[ -n "${existing_tag}" && "${existing_cpu}" == "${ACTOR_CPU_MILLICORES}" ]]; then
-        echo "Reusing existing actor-template ${template} with goldenTag ${existing_tag} (cpuMillicores=${existing_cpu})..."
-        continue
-      fi
-    fi
     for _tmpl_try in 1 2 3; do
       run_kubectl_ate delete actor-template "${template}" -a benchmark-workloads \
         >/dev/null 2>&1 || true

@@ -1182,8 +1182,7 @@ func (c *countingCreateStore) CreateActor(_ context.Context, actor *ateapipb.Act
 	return out, nil
 }
 
-func TestCreateActor_TemplateAndTagCacheUnderPhase1Workarounds(t *testing.T) {
-	t.Setenv("ENVELOPE_PHASE1_DB_WORKAROUNDS", "true")
+func TestCreateActor_TemplateAndTagCache(t *testing.T) {
 	ctx := context.Background()
 
 	tmplUID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -1248,7 +1247,6 @@ func TestCreateActor_TemplateAndTagCacheUnderPhase1Workarounds(t *testing.T) {
 }
 
 func BenchmarkCreateActorCached(b *testing.B) {
-	b.Setenv("ENVELOPE_PHASE1_DB_WORKAROUNDS", "true")
 	ctx := context.Background()
 
 	tmplUID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"

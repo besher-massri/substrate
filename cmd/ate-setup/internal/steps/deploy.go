@@ -725,7 +725,6 @@ var objectstorePluginEnvKeys = []string{
 	"ATE_GCS_ENDPOINT",
 	"ATE_S3_ENDPOINT",
 	"ATE_S3_FORCE_PATH_STYLE",
-	"ATE_CACHE_ACTOR_SNAPSHOTS",
 	"AWS_ACCESS_KEY_ID",
 	"AWS_SECRET_ACCESS_KEY",
 	"AWS_REGION",
@@ -766,7 +765,7 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 			k == "ATE_API_POSTGRES_OWNER_CONNECTION_STRING" ||
 			k == "ATE_API_POSTGRES_SCHEMA":
 			// Handled via Secret.
-		case strings.HasPrefix(k, "ATE_API_") || k == "ATE_SOFT_NODE_AFFINITY" || k == "ATE_CACHE_ACTOR_SNAPSHOTS" || k == "ENVELOPE_PHASE1_DB_WORKAROUNDS":
+		case strings.HasPrefix(k, "ATE_API_") || k == "ATE_SOFT_NODE_AFFINITY":
 			apiEnv[k] = v
 		case strings.HasPrefix(k, "ATEWORKER_") || k == "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR" || k == "ATE_ACTOR_CPU_LIMIT_FLOOR":
 			controllerEnv[k] = v
@@ -774,17 +773,12 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 		if k == "ATE_SOFT_NODE_AFFINITY" {
 			routerEnv[k] = v
 		}
-		if k == "ATE_CACHE_ACTOR_SNAPSHOTS" || k == "ATELET_SNAPSHOT_DETACH_DELAY" {
+		if k == "ATELET_SNAPSHOT_DETACH_DELAY" {
 			ateletEnv[k] = v
 		}
 	}
-	highScale100m := size100 && envMap["ATE_SOFT_NODE_AFFINITY"] == "true"
 	if size100 && apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] == "" {
-		if highScale100m {
-			apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] = "72"
-		} else {
-			apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] = "192"
-		}
+		apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] = "64"
 	}
 
 	for _, obj := range objs {
@@ -792,17 +786,13 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 		name := obj.GetName()
 		switch {
 		case kind == "Deployment" && name == "ate-api-server":
-			if highScale100m {
-				_ = unstructured.SetNestedField(obj.Object, int64(24), "spec", "replicas")
-			} else if size100 {
-				_ = unstructured.SetNestedField(obj.Object, int64(6), "spec", "replicas")
+			if size100 {
+				_ = unstructured.SetNestedField(obj.Object, int64(16), "spec", "replicas")
 			}
 			mutatePodContainers(obj, func(cname string, c map[string]any) {
 				switch cname {
 				case "ate-api-server":
-					if highScale100m {
-						setContainerResources(c, "2", "6Gi", "16", "24Gi")
-					} else if size100 {
+					if size100 {
 						setContainerResources(c, "8", "16Gi", "16", "32Gi")
 					}
 					mergeContainerEnv(c, apiEnv)
@@ -827,15 +817,13 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 				_ = unstructured.SetNestedField(obj.Object, int64(8), "spec", "replicas")
 			}
 			mutatePodContainers(obj, func(cname string, c map[string]any) {
-				if highScale100m {
-					setContainerResources(c, "2", "4Gi", "8", "16Gi")
-				} else if size100 {
-					setContainerResources(c, "4", "4Gi", "8", "8Gi")
+				if size100 {
+					setContainerResources(c, "4", "4Gi", "8", "16Gi")
 				}
 				if cname == "atenet-router" {
 					mergeContainerEnv(c, routerEnv)
 				}
-				if cname == "envoy" && highScale100m {
+				if cname == "envoy" && size100 {
 					setContainerCommandConcurrency(c, "4")
 				}
 			})
@@ -844,11 +832,7 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 			if size100 {
 				_ = unstructured.SetNestedField(obj.Object, int64(8), "spec", "replicas")
 				mutatePodContainers(obj, func(_ string, c map[string]any) {
-					if highScale100m {
-						setContainerResources(c, "2", "4Gi", "8", "8Gi")
-					} else {
-						setContainerResources(c, "4", "4Gi", "8", "8Gi")
-					}
+					setContainerResources(c, "4", "4Gi", "8", "8Gi")
 				})
 			}
 

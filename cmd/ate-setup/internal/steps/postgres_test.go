@@ -139,9 +139,10 @@ func TestApplyPostgresSize100Overrides(t *testing.T) {
 	cm := findObject(objs, "ConfigMap", "postgres-config")
 	data, _, _ := unstructured.NestedStringMap(cm.Object, "data")
 	for _, want := range []string{
-		"shared_buffers = 35GB",
+		"shared_buffers = 256GB",
 		"max_connections = 2000",
-		"max_wal_size = 32GB",
+		"max_wal_size = 64GB",
+		"checkpoint_timeout = 30min",
 		"ssl = on",
 	} {
 		if !strings.Contains(data["postgresql.conf"], want) {
@@ -153,11 +154,11 @@ func TestApplyPostgresSize100Overrides(t *testing.T) {
 	resources, _, _ := unstructured.NestedMap(containers[0].(map[string]any), "resources")
 	requests, _ := resources["requests"].(map[string]any)
 	limits, _ := resources["limits"].(map[string]any)
-	if requests["cpu"] != size10PostgresCPURequest {
-		t.Errorf("requests.cpu = %v, want %s", requests["cpu"], size10PostgresCPURequest)
+	if requests["cpu"] != size100PostgresCPURequest {
+		t.Errorf("requests.cpu = %v, want %s", requests["cpu"], size100PostgresCPURequest)
 	}
-	if requests["memory"] != size10PostgresMemory || limits["memory"] != size10PostgresMemory {
-		t.Errorf("memory request/limit = %v/%v, want %s for both", requests["memory"], limits["memory"], size10PostgresMemory)
+	if requests["memory"] != size100PostgresMemory || limits["memory"] != size100PostgresMemory {
+		t.Errorf("memory request/limit = %v/%v, want %s for both", requests["memory"], limits["memory"], size100PostgresMemory)
 	}
 }
 

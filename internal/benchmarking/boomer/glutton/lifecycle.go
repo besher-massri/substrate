@@ -91,9 +91,9 @@ func initPing(cfg *userclass.Config) (taskFn func(), shutdown func(context.Conte
 	if cfg.Tracer == nil {
 		cfg.Tracer = otel.Tracer("substrate-boomer/glutton")
 	}
-	rt := &taskRuntime{cfg: cfg}
-	if cfg.ActorsPerUser >= 5 || os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
-		rt.httpSem = make(chan struct{}, 8192)
+	rt := &taskRuntime{
+		cfg:     cfg,
+		httpSem: make(chan struct{}, 8192),
 	}
 	return rt.iterate, rt.shutdown
 }
@@ -221,81 +221,15 @@ func (r *taskRuntime) iterate() {
 	}
 }
 
-// coldActorStepBucket maps a virtual user index vuIdx in [0, 1000000) and per-VU
-// actor slot i in [0, actorsPerUser) to a 1-million-actor bucket index in
-// [0, 100) such that each VU owns actorsPerUser distinct actors (giving a
-// step-wide participating pool of actorsPerUser * 1,000,000 actors) while the
-// primary slices across steps (n=5 -> 0..4, n=10 -> 5..14, n=25 -> 15..39,
-// n=50 -> 40..69, n=100 -> 70..99) partition [0, 100) without cross-step
-// collisions.
-func coldActorStepBucket(actorsPerUser, vuIdx, i int) int {
-	if actorsPerUser <= 1 {
-		return 0
-	}
-	offset := 0
-	span := actorsPerUser
-	switch actorsPerUser {
-	case 5:
-		offset, span = 0, 5
-	case 10:
-		offset, span = 5, 10
-	case 25:
-		offset, span = 15, 25
-	case 50:
-		offset, span = 40, 30
-	case 100:
-		offset, span = 70, 30
-	}
-	if i < span {
-		return offset + (vuIdx+i)%span
-	}
-	if offset > 0 {
-		return (vuIdx + i - span) % offset
-	}
-	return (vuIdx + i) % actorsPerUser
-}
-
 func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	n := r.cfg.ActorsPerUser
 	if n < 1 {
 		n = 1
 	}
-	if r.cfg.ActorsPerUser >= 5 {
-		vuIdx := int(r.userSeq.Add(1)-1) % 1000000
-		stub := r.pickStub(uint64(vuIdx))
-		u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
-		bmetrics.UpdateUsers(userClass, 1)
-		for i := 0; i < n; i++ {
-			bucket := coldActorStepBucket(n, vuIdx, i)
-			actorNum := bucket*1000000 + vuIdx + 1
-			a := &gluttonActor{
-				cfg:         r.cfg,
-				stub:        stub,
-				httpSem:     r.httpSem,
-				actorName:   fmt.Sprintf("sb-cold-%d", actorNum),
-				firstResume: i == 0,
-			}
-			if i == 0 {
-				r.atespaceOnce.Do(func() {
-					r.atespaceErr = a.ensureAtespace(ctx)
-				})
-				if r.atespaceErr != nil {
-					bmetrics.UpdateUsers(userClass, -1)
-					return nil, r.atespaceErr
-				}
-			}
-			u.actors = append(u.actors, a)
-		}
-		return u, nil
-	}
-	syncCreate := n
-	if n >= 50 {
-		syncCreate = 1
-	}
-	u := &gluttonUser{actors: make([]*gluttonActor, 0, syncCreate)}
+	u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
 	bmetrics.UpdateUsers(userClass, 1)
 	var lastCreateErr error
-	for i := 0; i < syncCreate; i++ {
+	for i := 0; i < n; i++ {
 		a := &gluttonActor{
 			cfg:         r.cfg,
 			stub:        r.pickStub(r.userSeq.Add(1)),
@@ -318,7 +252,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 			lastCreateErr = err
 			slog.Warn("glutton create failed partway; using actors created so far",
 				slog.String("atespace", r.cfg.Atespace),
-				slog.Int("wanted", syncCreate),
+				slog.Int("wanted", n),
 				slog.Int("got", len(u.actors)),
 				slog.String("err", err.Error()))
 			break
@@ -337,9 +271,6 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 // leaks actors until shutdown — acceptable for benchmark runs that ramp up,
 // hold, then tear down cleanly.
 func (r *taskRuntime) shutdown(ctx context.Context) {
-	if r.cfg.ActorsPerUser >= 5 {
-		return
-	}
 	r.users.Range(func(_, val any) bool {
 		u := val.(*gluttonUser)
 		for _, a := range u.actors {

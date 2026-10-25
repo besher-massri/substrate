@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -487,9 +486,6 @@ func (w *ActorWorkflow) releaseReplacedSnapshot(ctx context.Context, actor *atea
 	defer func() { err = done(err) }()
 
 	switch {
-	case (os.Getenv("ATE_CACHE_ACTOR_SNAPSHOTS") == "true" || os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true") && actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace:
-		markSkipped(ctx, "actor snapshots cached locally")
-		return nil
 	case w.objectStorePlugin == nil:
 		markSkipped(ctx, "no object store configured")
 		return nil

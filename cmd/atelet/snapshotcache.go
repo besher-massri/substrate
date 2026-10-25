@@ -167,7 +167,7 @@ func cacheModeFor(sandboxClass string) cacheMode {
 // cacheModeOff otherwise, which covers private snapshots and a caller that
 // did not say. atelet never infers cacheability from the URI.
 func snapshotCacheMode(object *ateletpb.ObjectStorage, classMode cacheMode) cacheMode {
-	if object.GetSharing() == ateletpb.SnapshotSharing_SNAPSHOT_SHARING_SHARED || os.Getenv("ATE_CACHE_ACTOR_SNAPSHOTS") == "true" {
+	if object.GetSharing() == ateletpb.SnapshotSharing_SNAPSHOT_SHARING_SHARED {
 		return classMode
 	}
 	return cacheModeOff
