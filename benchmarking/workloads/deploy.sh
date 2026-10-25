@@ -279,6 +279,21 @@ run_cold_actor_seed_job() {
   kubectl create namespace benchmarking --dry-run=client -o yaml | kubectl apply -f -
   kubectl label namespace benchmarking ate.dev/api-access=true --overwrite
   kubectl create serviceaccount benchmark-runner --namespace=benchmarking --dry-run=client -o yaml | kubectl apply -f -
+  kubectl apply -f - <<'RBAC_EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: automated-benchmarking-permissions
+  namespace: ate-system
+subjects:
+- kind: ServiceAccount
+  name: benchmark-runner
+  namespace: benchmarking
+roleRef:
+  kind: Role
+  name: atelet-endpointslices
+  apiGroup: rbac.authorization.k8s.io
+RBAC_EOF
   kubectl delete job seed-cold-actors --namespace=benchmarking --ignore-not-found
 
   hack/run-tool.sh ko apply -f - <<EOF
@@ -352,11 +367,11 @@ EOF
 
 # prepopulate_cold_actors seeds 100,000,000 cold registered actors in PostgreSQL
 # substrate.actors via real CreateActor gRPC calls before the benchmark runner
-# Job starts when ENVELOPE_PHASE1_DB_WORKAROUNDS=true, ensuring 100,000,000
-# total registered actors exist in PostgreSQL during active rotation without
+# Job starts when ENVELOPE_N_REG >= 100000000, ensuring 100,000,000 total
+# registered actors exist in PostgreSQL during active rotation without
 # background CreateActor load competing with ResumeActor and SuspendActor.
 prepopulate_cold_actors() {
-  if [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" != "true" ]]; then
+  if (( ${ENVELOPE_N_REG:-0} < 100000000 )) && [[ "${ENVELOPE_PHASE1_DB_WORKAROUNDS:-}" != "true" ]]; then
     return 0
   fi
   echo "Ensuring benchmark atespace and reference cold actor sb-cold-0..."
@@ -403,8 +418,6 @@ prepopulate_cold_actors() {
       SET search_path TO substrate;
       ALTER TABLE actor_egress_policies DROP CONSTRAINT IF EXISTS actor_egress_policies_atespace_actor_name_fkey;
       ALTER TABLE actors DROP CONSTRAINT IF EXISTS actors_atespace_fkey;
-      ALTER TABLE actor_egress_policies SET UNLOGGED;
-      ALTER TABLE actors SET UNLOGGED;
       CREATE TEMP TABLE keep_actors AS SELECT * FROM actors WHERE atespace <> 'benchmark';
       CREATE TEMP TABLE keep_egress AS SELECT * FROM actor_egress_policies WHERE atespace <> 'benchmark';
       TRUNCATE TABLE actor_egress_policies, actors;
