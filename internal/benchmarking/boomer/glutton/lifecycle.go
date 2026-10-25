@@ -170,6 +170,13 @@ func (r *taskRuntime) iterate() {
 		return
 	}
 
+	if actor.uncreated {
+		if err := actor.create(ctx); err != nil {
+			return
+		}
+		actor.uncreated = false
+	}
+
 	if !actor.actorRunning || dynconfig.Get[gluttonKnobs](r.cfg.Dyn).LifecycleMode != dynconfig.LifecycleModeNone {
 		if err := actor.resume(ctx); err != nil {
 			if actor.noteFailure(err) {
@@ -247,15 +254,12 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 				bmetrics.UpdateUsers(userClass, -1)
 				return nil, r.atespaceErr
 			}
-		}
-		if err := a.create(ctx); err != nil {
-			lastCreateErr = err
-			slog.Warn("glutton create failed partway; using actors created so far",
-				slog.String("atespace", r.cfg.Atespace),
-				slog.Int("wanted", n),
-				slog.Int("got", len(u.actors)),
-				slog.String("err", err.Error()))
-			break
+			if err := a.create(ctx); err != nil {
+				lastCreateErr = err
+				break
+			}
+		} else {
+			a.uncreated = true
 		}
 		u.actors = append(u.actors, a)
 	}
@@ -274,6 +278,9 @@ func (r *taskRuntime) shutdown(ctx context.Context) {
 	r.users.Range(func(_, val any) bool {
 		u := val.(*gluttonUser)
 		for _, a := range u.actors {
+			if a.uncreated {
+				continue
+			}
 			if a.actorRunning {
 				if dynconfig.Get[gluttonKnobs](r.cfg.Dyn).LifecycleMode == dynconfig.LifecycleModePause {
 					_ = a.pause(ctx)
@@ -359,6 +366,7 @@ type gluttonActor struct {
 	stub         ateapipb.ControlClient
 	httpSem      chan struct{}
 	actorName    string
+	uncreated    bool
 	firstResume  bool
 	actorRunning bool
 	ramFilled    bool

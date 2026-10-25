@@ -31,9 +31,10 @@ var (
 	ImageCacheDir = filepath.Join(nodepath.BasePath, "image-cache")
 
 	// SnapshotScratchDir holds short-lived directories for snapshot manifests
-	// moved through the object-store plugin. It lives under BasePath, which the
-	// node plugin shares with atelet.
-	SnapshotScratchDir = filepath.Join(nodepath.BasePath, "snapshot-scratch")
+	// moved through the object-store plugin. It lives under SnapshotsDir, which
+	// the node plugin shares with atelet, so cached manifest links stay on the
+	// same mount when SnapshotsDir is mounted on a dedicated filesystem.
+	SnapshotScratchDir = filepath.Join(nodepath.SnapshotsDir, ".snapshot-scratch")
 
 	// SandboxAssetCacheDir is the node-local sandbox asset cache (see
 	// cmd/atelet/internal/filecache): runsc releases, micro-VM kernels, VMMs

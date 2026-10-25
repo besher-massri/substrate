@@ -314,3 +314,38 @@ func TestNoteFailureIgnoresRetryLater(t *testing.T) {
 	}
 }
 
+func TestGluttonIterate_MultiActorPerUserPacesCreation(t *testing.T) {
+	srv := &fake.Server{}
+	fakeCtrl := &fakeControlClient{}
+	cfg := newTestConfig(t, srv, &userclass.Config{
+		APIStub:       fakeCtrl,
+		Atespace:      "bench-test",
+		ActorsPerUser: 3,
+		Dyn: dynconfig.Static(gluttonKnobs{
+			Lifecycle: dynconfig.Lifecycle{LifecycleMode: dynconfig.LifecycleModeSuspend},
+		}),
+	})
+
+	rt := &taskRuntime{cfg: cfg}
+	for i := 1; i <= 3; i++ {
+		rt.iterate()
+		calls := fakeCtrl.recordedCalls()
+		if got := countCalls(calls, "CreateActor"); got != i {
+			t.Fatalf("after iteration %d: CreateActor count = %d, want %d; calls = %v", i, got, i, calls)
+		}
+		if got := countCalls(calls, "ResumeActor"); got != i {
+			t.Fatalf("after iteration %d: ResumeActor count = %d, want %d; calls = %v", i, got, i, calls)
+		}
+	}
+
+	rt.iterate()
+	calls := fakeCtrl.recordedCalls()
+	if got := countCalls(calls, "CreateActor"); got != 3 {
+		t.Fatalf("after warm iteration 4: CreateActor count = %d, want 3; calls = %v", got, calls)
+	}
+	if got := countCalls(calls, "ResumeActor"); got != 4 {
+		t.Fatalf("after warm iteration 4: ResumeActor count = %d, want 4; calls = %v", got, calls)
+	}
+}
+
+

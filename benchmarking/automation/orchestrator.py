@@ -449,7 +449,8 @@ def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
 
 def wipe_worker_disks() -> None:
     """Run a short-lived DaemonSet across worker nodes to clear /var/lib/ate
-    state before a fresh Substrate deployment."""
+    state and mount a dedicated tmpfs at /var/lib/ate/snapshots on large-RAM
+    worker nodes before a fresh Substrate deployment."""
     wiper_manifest = """apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -464,6 +465,7 @@ spec:
       labels:
         app: ate-cache-wiper
     spec:
+      hostPID: true
       tolerations:
       - key: ate.dev/sandboxClass
         operator: Exists
@@ -473,7 +475,20 @@ spec:
         image: mirror.gcr.io/library/busybox:1.36.1
         securityContext:
           privileged: true
-        command: ["sh", "-c", "rm -rf /host-ate/actor-snapshot-cache /host-ate/actors/* /host-ate/snapshots/* /host-ate/sandboxes/* /host-ate/containers/* 2>/dev/null || true"]
+        command:
+        - sh
+        - -c
+        - |
+          if grep -q " /var/lib/ate/snapshots tmpfs " /proc/1/mountinfo; then
+            nsenter -t 1 -m -- umount -l /var/lib/ate/snapshots 2>/dev/null || true
+          fi
+          rm -rf /host-ate/actor-snapshot-cache /host-ate/snapshot-cache /host-ate/snapshot-scratch /host-ate/actors /host-ate/snapshots /host-ate/sandboxes /host-ate/containers 2>/dev/null || true
+          mkdir -p /host-ate/actors /host-ate/snapshots
+          mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+          if [ "${mem_kb:-0}" -gt 500000000 ]; then
+            nsenter -t 1 -m -- mount -t tmpfs -o size=580G,nr_inodes=25000000 tmpfs /var/lib/ate/snapshots
+            nsenter -t 1 -m -- mkdir -p /var/lib/ate/snapshots/.snapshot-cache /var/lib/ate/snapshots/.snapshot-scratch
+          fi
         volumeMounts:
         - name: host-ate
           mountPath: /host-ate
@@ -485,10 +500,10 @@ spec:
         hostPath:
           path: /var/lib/ate
 """
-    run_no_check(["kubectl", "delete", "daemonset", "ate-cache-wiper", "-n", "default", "--ignore-not-found=true"])
+    run_no_check(["kubectl", "delete", "daemonset", "ate-cache-wiper", "-n", "default", "--ignore-not-found=true", "--wait=true"])
     subprocess.run(["kubectl", "apply", "-f", "-"], input=wiper_manifest, text=True, check=False)
-    run_no_check(["kubectl", "rollout", "status", "daemonset/ate-cache-wiper", "-n", "default", "--timeout=300s"])
-    run_no_check(["kubectl", "delete", "daemonset", "ate-cache-wiper", "-n", "default", "--ignore-not-found=true"])
+    run_no_check(["kubectl", "rollout", "status", "daemonset/ate-cache-wiper", "-n", "default", "--timeout=600s"])
+    run_no_check(["kubectl", "delete", "daemonset", "ate-cache-wiper", "-n", "default", "--ignore-not-found=true", "--wait=true"])
 
 
 def teardown_substrate() -> None:
@@ -760,7 +775,7 @@ def main() -> None:
             failure_msg = None
             start_time = time.time()
             flags = test.get("flags", [])
-            users = _extract_int_flag(flags, "users", 0)
+            users = int(test.get("users", 0)) or _extract_int_flag(flags, "users", 0)
             actors_per_user = _extract_int_flag(flags, "actors-per-user", 1)
             n_participating = min(users, 1_000_000) * actors_per_user if users > 0 else 0
             try:

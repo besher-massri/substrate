@@ -374,14 +374,16 @@ prepopulate_cold_actors() {
   local n_reg="${ENVELOPE_N_REG:-0}"
   local n_participating="${ENVELOPE_N_PARTICIPATING:-1000000}"
   local target_cold=$(( n_reg - n_participating ))
+  if (( n_reg > 0 )); then
+    run_kubectl_ate create atespace benchmark >/dev/null 2>&1 \
+      || run_kubectl_ate get atespace benchmark >/dev/null
+  fi
   if (( target_cold <= 0 )); then
     echo "Skipping cold actor pre-population (ENVELOPE_N_REG=${n_reg}, ENVELOPE_N_PARTICIPATING=${n_participating}, target_cold=${target_cold})."
     return 0
   fi
 
   echo "Ensuring benchmark atespace before seeding ${target_cold} cold registered actors via CreateActor gRPC..."
-  run_kubectl_ate create atespace benchmark >/dev/null 2>&1 \
-    || run_kubectl_ate get atespace benchmark >/dev/null
 
   kubectl exec -n ate-system postgres-0 -c postgres -- \
     psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c "
