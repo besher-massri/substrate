@@ -132,7 +132,7 @@ const (
 
 	// Cap rows fetched per poll; a burst beyond it carries over to the next poll
 	// (events are delayed, never dropped).
-	outboxBatch = 1024
+	outboxBatch = 4096
 
 	// Minimum time retention keeps outbox rows.
 	outboxRetentionAge = 15 * time.Minute
@@ -460,7 +460,7 @@ func (p *Persistence) WatchWorkers(ctx context.Context) (*store.WorkerWatch, err
 		return nil, fmt.Errorf("reading worker outbox cursor: %w", err)
 	}
 
-	ch := make(chan store.WorkerEvent, 128)
+	ch := make(chan store.WorkerEvent, 16384)
 	// Committed writes in this process are published straight onto ch, ahead
 	// of the poll that would carry them.
 	p.addWatcher(ch)

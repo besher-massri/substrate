@@ -147,7 +147,7 @@ func TestListActors_CrossScopePageToken(t *testing.T) {
 
 func TestBuildBatchInsertActorsSQL(t *testing.T) {
 	got2 := buildBatchInsertActorsSQL(2)
-	want2 := "INSERT INTO actors (atespace, name, uid, version, proto) VALUES ($1,$2,$3,$4,$5),($6,$7,$8,$9,$10) ON CONFLICT (atespace, name) DO NOTHING"
+	want2 := "INSERT INTO actors (atespace, name, uid, version, proto) VALUES ($1,$2,$3,$4,$5),($6,$7,$8,$9,$10)"
 	if got2 != want2 {
 		t.Errorf("buildBatchInsertActorsSQL(2) = %q, want %q", got2, want2)
 	}
@@ -156,7 +156,7 @@ func TestBuildBatchInsertActorsSQL(t *testing.T) {
 	if !strings.HasPrefix(got1024, "INSERT INTO actors (atespace, name, uid, version, proto) VALUES ($1,$2,$3,$4,$5),") {
 		t.Errorf("unexpected prefix in buildBatchInsertActorsSQL(1024)")
 	}
-	if !strings.HasSuffix(got1024, ",($5116,$5117,$5118,$5119,$5120) ON CONFLICT (atespace, name) DO NOTHING") {
+	if !strings.HasSuffix(got1024, ",($5116,$5117,$5118,$5119,$5120)") {
 		t.Errorf("unexpected suffix in buildBatchInsertActorsSQL(1024): %q", got1024[len(got1024)-80:])
 	}
 }

@@ -131,11 +131,7 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.Act
 	// the one requested.
 	finalAttrs = lifecycleOpAttrs(actor, "", wireFidelity)
 	var finalized *ateapipb.Actor
-	var inMemSuspending *ateapipb.Actor
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actorRef.Atespace != resources.GoldenActorAtespace {
-		inMemSuspending = actor
-	}
-	if finalized, err = w.ensureSuspendedFinalized(leaseCtx, actorRef, mode, ateletState, inMemSuspending); err != nil {
+	if finalized, err = w.ensureSuspendedFinalized(leaseCtx, actorRef, mode, ateletState); err != nil {
 		return nil, err
 	}
 	actor = finalized
@@ -204,11 +200,6 @@ func (w *ActorWorkflow) ensureMarkedSuspending(ctx context.Context, actorRef res
 		snap.SandboxRuntime = proto.CloneOf(toUpdate.GetStatus().GetWorkerAssignment().GetSandboxRuntime())
 		toUpdate.Status.Snapshots = append(toUpdate.Status.Snapshots, snap)
 		return nil
-	}
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace {
-		cloned := proto.CloneOf(actor)
-		_ = mutateSuspending(cloned)
-		return cloned, nil
 	}
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), mutateSuspending)
 	if err != nil {
@@ -395,13 +386,8 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 		return nil, crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationSuspend, crashMessageSnapshotStateConflict)
 	}
 
-	keepWorkerBound := os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
-		os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" &&
-		latestActor.GetStatus().GetAssignedNode() != "" &&
-		latestActor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace
-
 	// 1. Free the worker (if it hasn't been freed yet)
-	if latestActor.GetStatus().GetWorkerAssignment() != nil && !keepWorkerBound {
+	if latestActor.GetStatus().GetWorkerAssignment() != nil {
 		t := time.Now()
 		_, err := releaseWorker(ctx, w.store, latestActor)
 		dReleaseWorker = time.Since(t)
@@ -429,17 +415,13 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 		// Keep the actor on the node that holds its snapshot. atelet holds an
 		// async suspend's snapshot until it detaches it, which it does only
 		// once the snapshot is durable.
-		if ateletKeptLocal(ateletState, snap) || !durable || keepWorkerBound {
+		if ateletKeptLocal(ateletState, snap) || !durable {
 			snap.Locality = toUpdate.GetStatus().GetAssignedNode()
 		} else {
 			toUpdate.Status.AssignedNode = ""
 		}
 		pruneSnapshots(toUpdate.Status, snap)
-		if keepWorkerBound {
-			toUpdate.Status.WorkerAssignment = proto.CloneOf(latestActor.GetStatus().GetWorkerAssignment())
-		} else {
-			toUpdate.Status.WorkerAssignment = nil
-		}
+		toUpdate.Status.WorkerAssignment = nil
 		return nil
 	})
 	dUpdateActor = time.Since(t)
@@ -505,7 +487,7 @@ func (w *ActorWorkflow) releaseReplacedSnapshot(ctx context.Context, actor *atea
 	defer func() { err = done(err) }()
 
 	switch {
-	case (os.Getenv("ATE_CACHE_ACTOR_SNAPSHOTS") == "true" || os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" || os.Getenv("ATE_SKIP_ACTOR_GCS_UPLOAD") == "true") && actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace:
+	case (os.Getenv("ATE_CACHE_ACTOR_SNAPSHOTS") == "true" || os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true") && actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace:
 		markSkipped(ctx, "actor snapshots cached locally")
 		return nil
 	case w.objectStorePlugin == nil:

@@ -413,9 +413,6 @@ func (r *slaveRunner) sumUsersAmount(msg *genericMessage) int {
 		r.userClassesCountFromMaster[c] = n
 		amount = amount + int(n)
 	}
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
-		amount = amount * 103 / 100
-	}
 	return amount
 }
 

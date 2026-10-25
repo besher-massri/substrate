@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/jackc/pgx/v5"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -51,9 +50,6 @@ func (p *Persistence) CreateEgressPolicy(ctx context.Context, actorRef resources
 }
 
 func (p *Persistence) GetEgressPolicy(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.EgressPolicy, error) {
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actorRef.Atespace != resources.GoldenActorAtespace {
-		return nil, store.ErrNotFound
-	}
 	return getEgressPolicyRow(ctx, p.pool, `
 		SELECT uid, version, proto FROM actor_egress_policies
 		WHERE atespace = $1 AND actor_name = $2`, actorRef.Atespace, actorRef.Name)

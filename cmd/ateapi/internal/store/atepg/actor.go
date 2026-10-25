@@ -42,8 +42,7 @@ type createActorReq struct {
 // for n rows without fmt.Fprintf formatting overhead.
 func buildBatchInsertActorsSQL(n int) string {
 	const prefix = "INSERT INTO actors (atespace, name, uid, version, proto) VALUES "
-	const suffix = " ON CONFLICT (atespace, name) DO NOTHING"
-	buf := make([]byte, 0, len(prefix)+len(suffix)+n*32)
+	buf := make([]byte, 0, len(prefix)+n*32)
 	buf = append(buf, prefix...)
 	for i := 0; i < n; i++ {
 		if i > 0 {
@@ -62,15 +61,25 @@ func buildBatchInsertActorsSQL(n int) string {
 		buf = strconv.AppendInt(buf, base+5, 10)
 		buf = append(buf, ')')
 	}
-	buf = append(buf, suffix...)
 	return string(buf)
 }
 
 // batchInsertActors flushes a slice of createActorReq in a single multi-row
 // INSERT statement so high-concurrency actor registration amortizes PostgreSQL
-// round-trip and WAL commit overhead across up to 1024 rows.
+// round-trip and WAL commit overhead across up to 1024 rows. If a batch fails
+// (for example, due to a duplicate actor name or missing atespace), it falls
+// back to individual inserts so only the invalid request fails.
 func (p *Persistence) batchInsertActors(batch []*createActorReq) {
 	if len(batch) == 0 {
+		return
+	}
+	if len(batch) == 1 {
+		req := batch[0]
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, err := p.pool.Exec(ctx, `INSERT INTO actors (atespace, name, uid, version, proto) VALUES ($1, $2, $3, $4, $5)`,
+			req.atespace, req.name, req.uid, req.version, req.protoBytes)
+		cancel()
+		req.done <- err
 		return
 	}
 	query := buildBatchInsertActorsSQL(len(batch))
@@ -82,8 +91,18 @@ func (p *Persistence) batchInsertActors(batch []*createActorReq) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	_, err := p.pool.Exec(ctx, query, args...)
 	cancel()
+	if err == nil {
+		for _, req := range batch {
+			req.done <- nil
+		}
+		return
+	}
 	for _, req := range batch {
-		req.done <- err
+		rCtx, rCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, rErr := p.pool.Exec(rCtx, `INSERT INTO actors (atespace, name, uid, version, proto) VALUES ($1, $2, $3, $4, $5)`,
+			req.atespace, req.name, req.uid, req.version, req.protoBytes)
+		rCancel()
+		req.done <- rErr
 	}
 }
 

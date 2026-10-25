@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -309,12 +308,6 @@ func NewPersistence(ctx context.Context, pool *pgxpool.Pool) (*Persistence, erro
 func newPersistence(ctx context.Context, pool, watchPool, ownerPool, probePool *pgxpool.Pool) (*Persistence, error) {
 	if err := applyMigrations(ctx, ownerPool); err != nil {
 		return nil, err
-	}
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" {
-		_, _ = ownerPool.Exec(ctx, `
-			ALTER TABLE actor_egress_policies SET UNLOGGED;
-			ALTER TABLE actors SET UNLOGGED;
-		`)
 	}
 	maintenanceCtx, stopMaintenance := context.WithCancel(context.Background())
 	p := &Persistence{

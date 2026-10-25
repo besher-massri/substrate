@@ -89,11 +89,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	}
 	defer lease.Close()
 
-	var prefetched *ateapipb.Actor
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actorRef.Atespace != resources.GoldenActorAtespace {
-		prefetched = actor
-	}
-	actor, actorTemplate, err = w.loadActorForResume(leaseCtx, actorRef, prefetched)
+	actor, actorTemplate, err = w.loadActorForResume(leaseCtx, actorRef)
 	if err != nil {
 		return nil, false, err
 	}
@@ -134,11 +130,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 		return nil, false, err
 	}
 	var running *ateapipb.Actor
-	var inMemRunning *ateapipb.Actor
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && actorRef.Atespace != resources.GoldenActorAtespace {
-		inMemRunning = actor
-	}
-	if running, err = w.finalizeRunning(leaseCtx, actorRef, inMemRunning); err != nil {
+	if running, err = w.finalizeRunning(leaseCtx, actorRef); err != nil {
 		return nil, false, err
 	}
 	actor = running
@@ -498,28 +490,10 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	relaxable := canRelaxRuntime(actor, constraints)
 
 	var assignedWorker *ateapipb.Worker
-	fastBound := false
-	wName := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName()
-	if os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" &&
-		os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" &&
-		actor.GetStatus().GetAssignedNode() != "" &&
-		wName != "" &&
-		actor.GetMetadata().GetAtespace() != resources.GoldenActorAtespace {
-		if nodeWorkers, nerr := w.workerCache.WorkersByNode(actor.GetStatus().GetAssignedNode()); nerr == nil {
-			for _, nw := range nodeWorkers {
-				if nw.GetMetadata().GetName() == wName && nw.GetNodeName() != "" && w.appliesWithFallback(nw, constraints, relaxable) {
-					assignedWorker = nw
-					fastBound = true
-					break
-				}
-			}
-		}
-	}
-	if !fastBound {
-		assignedWorker, err = w.workerHoldingStaleClaim(ctx, actor, constraints, relaxable)
-		if err != nil {
-			return nil, nil, err
-		}
+	pinnedNodeCacheMiss := false
+	assignedWorker, err = w.workerHoldingStaleClaim(ctx, actor, constraints, relaxable)
+	if err != nil {
+		return nil, nil, err
 	}
 	if assignedWorker == nil {
 		pickedWorker, err := w.scheduler.Schedule(ctx, constraints)
@@ -527,12 +501,16 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 			constraints.RequiredRuntime = hardware.Requirement{}
 			pickedWorker, err = w.scheduler.Schedule(ctx, constraints)
 		}
-		if errors.Is(err, scheduling.ErrNoCapacity) && len(constraints.RequiredNodes) > 0 && os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
-			constraints.RequiredNodes = nil
-			pickedWorker, err = w.scheduler.Schedule(ctx, constraints)
-			if errors.Is(err, scheduling.ErrNoCapacity) && relaxable {
-				constraints.RequiredRuntime = hardware.Requirement{}
-				pickedWorker, err = w.scheduler.Schedule(ctx, constraints)
+		if errors.Is(err, scheduling.ErrNoCapacity) && len(constraints.RequiredNodes) == 1 && w.workerCache != nil {
+			if nodeWorkers, nerr := w.workerCache.WorkersByNode(constraints.RequiredNodes[0]); nerr == nil {
+				for _, nw := range nodeWorkers {
+					if nw.GetNodeName() != "" && w.scheduler.Applies(nw, constraints) {
+						pickedWorker = nw
+						err = nil
+						pinnedNodeCacheMiss = true
+						break
+					}
+				}
 			}
 		}
 		if err != nil {
@@ -550,9 +528,6 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 			// The stale claim only passed the relaxed check, so bind under it:
 			// admit asks the same question again under the row lock.
 			constraints.RequiredRuntime = hardware.Requirement{}
-		}
-		if len(constraints.RequiredNodes) > 0 && !slices.Contains(constraints.RequiredNodes, assignedWorker.GetNodeName()) && os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
-			constraints.RequiredNodes = nil
 		}
 	}
 
@@ -576,43 +551,32 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	// and two claims for the last place cannot both be admitted.
 	// The bind evaluates the fresh row; record the assignment from the same view.
 	bound := assignedWorker
-	if !fastBound {
-		admit := func(fresh *ateapipb.Worker) error {
-			if !w.scheduler.Applies(fresh, constraints) || !w.scheduler.HasRoom(fresh, constraints) {
-				return errWorkerFilledUp
-			}
-			bound = fresh
-			return nil
+	admit := func(fresh *ateapipb.Worker) error {
+		if !w.scheduler.Applies(fresh, constraints) || !w.scheduler.HasRoom(fresh, constraints) {
+			return errWorkerFilledUp
 		}
-		if err := w.store.BindActorToWorker(ctx, assignedWorker.GetMetadata().GetName(), assignment, admit); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				w.workerCache.Forget(assignedWorker.GetMetadata().GetName())
-				return nil, nil, fmt.Errorf("selected worker disappeared before claim: %w", store.ErrVersionConflict)
-			}
-			// errWorkerFilledUp leaves the cache alone: it reports no room for
-			// this actor's size, so forgetting the worker would hide it from
-			// every smaller actor until the next watch event or relist.
-			return nil, nil, err
+		bound = fresh
+		return nil
+	}
+	if err := w.store.BindActorToWorker(ctx, assignedWorker.GetMetadata().GetName(), assignment, admit); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			w.workerCache.Forget(assignedWorker.GetMetadata().GetName())
+			return nil, nil, fmt.Errorf("selected worker disappeared before claim: %w", store.ErrVersionConflict)
 		}
-	} else {
-		assignment.WorkerEpoch = bound.GetEpoch()
+		if errors.Is(err, errWorkerFilledUp) && pinnedNodeCacheMiss {
+			outcome = ateattr.SchedulerOutcomeNoCapacity
+			return nil, nil, apierror.ResourceExhausted("%w", errNoWorkerRoom)
+		}
+		// errWorkerFilledUp leaves the cache alone: it reports no room for
+		// this actor's size, so forgetting the worker would hide it from
+		// every smaller actor until the next watch event or relist.
+		return nil, nil, err
 	}
 
 	newAssignment := workerAssignmentFrom(bound, snapRuntime)
 	// The cached Worker may predate a raised epoch; the bind read it under the
 	// Worker's row lock.
 	newAssignment.WorkerEpoch = assignment.GetWorkerEpoch()
-	if fastBound {
-		storedActor := proto.CloneOf(actor)
-		storedActor.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
-		storedActor.Status.WorkerAssignment = newAssignment
-		storedActor.Status.AssignedNode = newAssignment.GetNodeName()
-		poolNamespace = bound.GetWorkerNamespace()
-		pool = bound.GetWorkerPool()
-		class = hardware.SandboxClass(bound.GetStatus())
-		outcome = ateattr.SchedulerOutcomeAssigned
-		return storedActor, bound, nil
-	}
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
 		toUpdate.Status.WorkerAssignment = newAssignment
@@ -756,9 +720,6 @@ func canRelaxRuntime(actor *ateapipb.Actor, constraints scheduling.Constraints) 
 func (w *ActorWorkflow) appliesWithFallback(worker *ateapipb.Worker, constraints scheduling.Constraints, relaxable bool) bool {
 	relaxed := constraints
 	relaxed.RequiredRuntime = hardware.Requirement{}
-	if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
-		relaxed.RequiredNodes = nil
-	}
 	if !w.scheduler.Applies(worker, relaxed) {
 		return false
 	}

@@ -726,7 +726,6 @@ var objectstorePluginEnvKeys = []string{
 	"ATE_S3_ENDPOINT",
 	"ATE_S3_FORCE_PATH_STYLE",
 	"ATE_CACHE_ACTOR_SNAPSHOTS",
-	"ATE_SKIP_ACTOR_GCS_UPLOAD",
 	"AWS_ACCESS_KEY_ID",
 	"AWS_SECRET_ACCESS_KEY",
 	"AWS_REGION",
@@ -767,7 +766,7 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 			k == "ATE_API_POSTGRES_OWNER_CONNECTION_STRING" ||
 			k == "ATE_API_POSTGRES_SCHEMA":
 			// Handled via Secret.
-		case strings.HasPrefix(k, "ATE_API_") || k == "ATE_SOFT_NODE_AFFINITY" || k == "ATE_CACHE_ACTOR_SNAPSHOTS" || k == "ATE_SKIP_ACTOR_GCS_UPLOAD" || k == "ENVELOPE_PHASE1_DB_WORKAROUNDS":
+		case strings.HasPrefix(k, "ATE_API_") || k == "ATE_SOFT_NODE_AFFINITY" || k == "ATE_CACHE_ACTOR_SNAPSHOTS" || k == "ENVELOPE_PHASE1_DB_WORKAROUNDS":
 			apiEnv[k] = v
 		case strings.HasPrefix(k, "ATEWORKER_") || k == "ATE_ENABLE_ACTOR_CPU_BURST_FLOOR" || k == "ATE_ACTOR_CPU_LIMIT_FLOOR":
 			controllerEnv[k] = v

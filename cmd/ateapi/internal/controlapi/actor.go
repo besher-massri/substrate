@@ -214,10 +214,8 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 		outActor.Status.Snapshots = []*ateapipb.Snapshot{snap}
 		outActor.Status.LastAssignedGeneration = 1
 	}
-	if !(os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && atespace != resources.GoldenActorAtespace) {
-		if errs := apivalidation.ValidateActorUpdate(ctx, field.NewPath("actor"), outActor, inActor, true); len(errs) > 0 {
-			return nil, resources.ToInternalError(errs)
-		}
+	if errs := apivalidation.ValidateActorUpdate(ctx, field.NewPath("actor"), outActor, inActor, true); len(errs) > 0 {
+		return nil, resources.ToInternalError(errs)
 	}
 
 	// Save the data in the storage layer.

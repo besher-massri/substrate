@@ -206,13 +206,6 @@ func (p *NodePlugin) FetchSnapshot(ctx context.Context, req *objectstorev1.Fetch
 		} else if hit {
 			return &objectstorev1.FetchSnapshotResponse{}, nil
 		}
-		if os.Getenv("ATE_SKIP_ACTOR_GCS_UPLOAD") == "true" && uri.Atespace() != resources.GoldenActorAtespace {
-			if hit, err := p.tryFetchAnyGoldenSnapshot(dstDir, root, req.GetFiles()); err != nil {
-				return nil, toStatus(err)
-			} else if hit {
-				return &objectstorev1.FetchSnapshotResponse{}, nil
-			}
-		}
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -344,71 +337,6 @@ func (p *NodePlugin) tryFetchCachedActorSnapshot(ctx context.Context, tr *transf
 		return true, err
 	}
 	return true, nil
-}
-
-func (p *NodePlugin) tryFetchAnyGoldenSnapshot(dstDir string, root *os.Root, files []string) (bool, error) {
-	goldenRoot := filepath.Join(p.root, "golden-snapshot-cache")
-	entries, err := os.ReadDir(goldenRoot)
-	if err != nil {
-		return false, nil
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		cacheDir := filepath.Join(goldenRoot, entry.Name())
-		allPresent := true
-		for _, f := range files {
-			if f == goldenDeltaFile {
-				continue
-			}
-			if fi, serr := os.Stat(filepath.Join(cacheDir, f)); serr != nil || !fi.Mode().IsRegular() {
-				allPresent = false
-				break
-			}
-		}
-		if !allPresent {
-			continue
-		}
-		for _, fileName := range files {
-			if fileName == goldenDeltaFile {
-				_ = root.Remove(fileName)
-				continue
-			}
-			if dir := filepath.Dir(fileName); dir != "." {
-				if err := root.MkdirAll(dir, 0o700); err != nil {
-					return false, err
-				}
-			}
-			cachedPath := filepath.Join(cacheDir, fileName)
-			if fi, lerr := root.Lstat(fileName); lerr == nil {
-				if fi.Mode()&os.ModeSymlink != 0 {
-					return false, fmt.Errorf("restore file %s is a symlink", fileName)
-				}
-				_ = root.Remove(fileName)
-			}
-			if err := os.Link(cachedPath, filepath.Join(p.root, dstDir, fileName)); err == nil {
-				continue
-			}
-			src, oerr := os.Open(cachedPath)
-			if oerr != nil {
-				return false, oerr
-			}
-			dst, derr := root.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-			if derr != nil {
-				src.Close()
-				return false, fmt.Errorf("while opening %s in restore directory: %w", fileName, derr)
-			}
-			_, copyErr := io.Copy(dst, src)
-			closeErr := dst.Close()
-			src.Close()
-			if cerr := errors.Join(copyErr, closeErr); cerr != nil {
-				return false, cerr
-			}
-		}
-		return true, nil
-	}
-	return false, nil
 }
 
 func (p *NodePlugin) cacheActorSnapshot(uri resources.SnapshotURI, srcDir string, files []string) {
@@ -701,26 +629,6 @@ func (p *NodePlugin) UploadSnapshot(ctx context.Context, req *objectstorev1.Uplo
 		return nil, toStatus(fmt.Errorf("while opening snapshot directory: %w", err))
 	}
 	defer root.Close()
-
-	if isCacheableActorURI(uri) && os.Getenv("ATE_SKIP_ACTOR_GCS_UPLOAD") == "true" && uri.Atespace() != resources.GoldenActorAtespace {
-		for _, fileName := range req.GetFiles() {
-			local, err := root.Open(fileName)
-			if err != nil {
-				return nil, toStatus(fmt.Errorf("while opening %s in snapshot directory: %w", fileName, err))
-			}
-			info, statErr := local.Stat()
-			_ = local.Close()
-			if statErr != nil {
-				return nil, toStatus(fmt.Errorf("while inspecting %s in snapshot directory: %w", fileName, statErr))
-			}
-			if !info.Mode().IsRegular() {
-				return nil, toStatus(fmt.Errorf("snapshot file %s is not a regular file", fileName))
-			}
-		}
-		p.cacheActorSnapshot(uri, srcDir, req.GetFiles())
-		_ = os.Remove(filepath.Join(p.root, filepath.Dir(srcDir), "complete-memory-ranges"))
-		return &objectstorev1.UploadSnapshotResponse{}, nil
-	}
 
 	tr := p.begin(req.GetActorJwt())
 

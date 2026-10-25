@@ -1567,22 +1567,23 @@ func (s *AteWorkerService) setSandboxCPUWeight(ctx context.Context, actorUID str
 }
 
 // enforceSteadyActorCPULimits lowers cpu.weight to DefaultCPUWeight (100) and
-// enforces the actor's declared steady-state cpu.max quota on both the sandbox
-// cgroup leaf and all application container cgroup leaves once startup or
-// restore wakeup probes complete.
+// enforces the actor's effective steady-state cpu.max quota (honoring the
+// configured burst floor) on both the sandbox cgroup leaf and all application
+// container cgroup leaves once startup or restore wakeup probes complete.
 func (s *AteWorkerService) enforceSteadyActorCPULimits(ctx context.Context, actorUID string, milliCPU int64, containers []*ateworkerpb.Container) {
 	if !s.cgroupDelegated {
 		return
 	}
+	effectiveMilli := sizing.EffectiveContainerMilliCPU(milliCPU)
 	sandboxLeaf := ocispec.GVisorCgroupLeaf(actorUID, ocispec.SandboxID)
 	if err := cgroup.SetActorLeafCPUWeightUnder(s.cgroupRoot, sandboxLeaf, cgroup.DefaultCPUWeight); err != nil {
 		slog.WarnContext(ctx, "Could not set steady cpu.weight on sandbox cgroup",
 			slog.String("actorUID", actorUID), slog.Any("err", err))
 	}
-	if milliCPU > 0 {
-		if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, sandboxLeaf, milliCPU); err != nil {
+	if effectiveMilli > 0 {
+		if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, sandboxLeaf, effectiveMilli); err != nil {
 			slog.WarnContext(ctx, "Could not set steady cpu.max on sandbox cgroup",
-				slog.String("actorUID", actorUID), slog.Int64("milliCPU", milliCPU), slog.Any("err", err))
+				slog.String("actorUID", actorUID), slog.Int64("milliCPU", effectiveMilli), slog.Any("err", err))
 		}
 	}
 	for _, ac := range containers {
@@ -1591,10 +1592,10 @@ func (s *AteWorkerService) enforceSteadyActorCPULimits(ctx context.Context, acto
 			slog.WarnContext(ctx, "Could not set steady cpu.weight on container cgroup",
 				slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Any("err", err))
 		}
-		if milliCPU > 0 {
-			if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, milliCPU); err != nil {
+		if effectiveMilli > 0 {
+			if err := cgroup.SetActorLeafCPUMaxUnder(s.cgroupRoot, leaf, effectiveMilli); err != nil {
 				slog.WarnContext(ctx, "Could not set steady cpu.max on container cgroup",
-					slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Int64("milliCPU", milliCPU), slog.Any("err", err))
+					slog.String("actorUID", actorUID), slog.String("container", ac.GetName()), slog.Int64("milliCPU", effectiveMilli), slog.Any("err", err))
 			}
 		}
 	}
