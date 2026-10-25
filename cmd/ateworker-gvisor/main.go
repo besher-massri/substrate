@@ -667,14 +667,20 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		egressDone <- err
 	}()
 
-	prepDone := make(chan error, 1)
-	prepJoined := false
+	sandboxSpecDone := make(chan error, 1)
+	sandboxSpecJoined := false
 	go func() {
 		if err := rcmd.ensureSpec(ocispec.SandboxID); err != nil {
-			prepDone <- fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
+			sandboxSpecDone <- fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
 			return
 		}
-		prepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
+		sandboxSpecDone <- nil
+	}()
+
+	appPrepDone := make(chan error, 1)
+	appPrepJoined := false
+	go func() {
+		appPrepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
 	}()
 
 	var hosted *hostedActor
@@ -685,8 +691,11 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 			if !egressJoined {
 				<-egressDone
 			}
-			if !prepJoined {
-				<-prepDone
+			if !sandboxSpecJoined {
+				<-sandboxSpecDone
+			}
+			if !appPrepJoined {
+				<-appPrepDone
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
@@ -716,8 +725,8 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 	if err != nil {
 		return nil, err
 	}
-	err = <-prepDone
-	prepJoined = true
+	err = <-sandboxSpecDone
+	sandboxSpecJoined = true
 	if err != nil {
 		return nil, err
 	}
@@ -736,6 +745,12 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 		return nil, fmt.Errorf("while starting the sandbox: %w", err)
 	}
 	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
+
+	err = <-appPrepDone
+	appPrepJoined = true
+	if err != nil {
+		return nil, err
+	}
 
 	// Create and start each application container, each with its own log pipe so
 	// every line is tagged with the originating container (ate.actor.container.name).
@@ -1172,18 +1187,24 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		egressDone <- err
 	}()
 
-	prepDone := make(chan error, 1)
-	prepJoined := false
+	sandboxSpecDone := make(chan error, 1)
+	sandboxSpecJoined := false
 	go func() {
 		if err := resetRunscStateAndPidFileDirs(req.GetActorDirs()); err != nil {
-			prepDone <- fmt.Errorf("while preparing sandbox state for %q: %w", ocispec.SandboxID, err)
+			sandboxSpecDone <- fmt.Errorf("while preparing sandbox state for %q: %w", ocispec.SandboxID, err)
 			return
 		}
 		if err := rcmd.ensureSpec(ocispec.SandboxID); err != nil {
-			prepDone <- fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
+			sandboxSpecDone <- fmt.Errorf("while writing the OCI spec for %q: %w", ocispec.SandboxID, err)
 			return
 		}
-		prepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
+		sandboxSpecDone <- nil
+	}()
+
+	appPrepDone := make(chan error, 1)
+	appPrepJoined := false
+	go func() {
+		appPrepDone <- prepareAppContainers(bgCtx, req.GetActorDirs(), rcmd, containers)
 	}()
 
 	readaheadDone := make(chan struct{})
@@ -1205,8 +1226,11 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 			if !egressJoined {
 				<-egressDone
 			}
-			if !prepJoined {
-				<-prepDone
+			if !sandboxSpecJoined {
+				<-sandboxSpecDone
+			}
+			if !appPrepJoined {
+				<-appPrepDone
 			}
 			if !readaheadJoined {
 				<-readaheadDone
@@ -1247,9 +1271,8 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	}
 	defer pw.Close()
 
-	err = <-prepDone
-	prepJoined = true
-	timing.appRootfs = lap(&tLast)
+	err = <-sandboxSpecDone
+	sandboxSpecJoined = true
 	if err != nil {
 		return nil, err
 	}
@@ -1281,6 +1304,13 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 		s.pinSandbox(ctx, hosted, req.GetActorDirs())
 	}
 	s.setSandboxCPUWeight(ctx, req.GetActorUid(), cgroup.MaxCPUWeight)
+
+	err = <-appPrepDone
+	appPrepJoined = true
+	timing.appRootfs = lap(&tLast)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create and restore each application container, each with its own log pipe so
 	// every line is tagged with the originating container (ate.actor.container.name).

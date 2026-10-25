@@ -127,16 +127,16 @@ func (r *runsc) execRunsc(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 // transitionBurstFloorMilliCPU is the minimum container CFS CPU quota floor
-// (2000m = 2.0 vCPUs, cpu.max = "200000 100000") written into the OCI spec for
+// (4000m = 4.0 vCPUs, cpu.max = "400000 100000") written into the OCI spec for
 // runsc create and runsc restore. Because runsc's --cpu-num-from-quota reads
 // the newly created sandbox cgroup's cpu.max to size the sentry's GOMAXPROCS
 // and --cpu-num (and runsc spawns runsc-gofer into the sandbox cgroup with
 // GOMAXPROCS stripped from cmd.Env so Go 1.27's cgroup-aware runtime sizes
-// runsc-gofer's GOMAXPROCS from the sandbox cgroup's cpu.max), a 2000m floor
-// initializes a compact 2-P runtime for both sentry and gofer while giving
-// startup and restore 2 cores of burst headroom; steady-state cpu.max is
-// enforced after wakeup probes complete.
-const transitionBurstFloorMilliCPU int64 = 2 * sizing.DefaultBurstFloorMilliCPU
+// runsc-gofer's GOMAXPROCS from the sandbox cgroup's cpu.max), a 4000m floor
+// initializes a 4-P runtime for both sentry and gofer while giving startup and
+// restore 4 cores of burst headroom from the start of cmdRestore(_sandbox);
+// steady-state cpu.max is enforced after wakeup probes complete.
+const transitionBurstFloorMilliCPU int64 = 4 * sizing.DefaultBurstFloorMilliCPU
 
 // maxOCICPUShares is the Linux cgroup v1 MAX_SHARES value (1 << 18 = 262144)
 // that runsc's cgroup v2 installer maps to cpu.weight = 10000 (MaxCPUWeight)

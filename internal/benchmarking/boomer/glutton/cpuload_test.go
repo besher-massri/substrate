@@ -97,8 +97,8 @@ func TestEnsureCPULoadBurnSliceEnvOverride(t *testing.T) {
 
 	for _, bad := range []string{"0", "-5", "invalid", "9999999999999"} {
 		t.Setenv(EnvGluttonCPUBurnSliceMS, bad)
-		if got := configuredCPUBurnSliceMS(); got != 0 {
-			t.Errorf("configuredCPUBurnSliceMS() with %q = %d, want 0", bad, got)
+		if got := configuredCPUBurnSliceMS(); got != defaultCPUBurnSliceMS {
+			t.Errorf("configuredCPUBurnSliceMS() with %q = %d, want %d", bad, got, defaultCPUBurnSliceMS)
 		}
 	}
 }

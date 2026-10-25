@@ -734,19 +734,26 @@ func (u *gluttonActor) ensureRAMFilled(ctx context.Context) {
 
 // EnvGluttonCPUBurnSliceMS optionally configures the cycle_length_ms field
 // sent on GluttonUseCPU requests from boomer (for example, "200" for 200ms
-// work/sleep cycles). When unset or non-positive, cycle_length_ms is left at
-// 0 so the glutton server applies its own default cycle length.
+// work/sleep cycles). When unset or non-positive, cycle_length_ms defaults to
+// defaultCPUBurnSliceMS (100ms, matching the Linux CFS bandwidth period).
 const EnvGluttonCPUBurnSliceMS = "GLUTTON_CPU_BURN_SLICE_MS"
 
+// defaultCPUBurnSliceMS is the default UseCPU cycle_length_ms sent by boomer
+// when GLUTTON_CPU_BURN_SLICE_MS is unset or invalid, matching the 100ms Linux
+// CFS bandwidth period so fractional-CPU actors consume their duty cycle
+// evenly within each 100ms CFS quota period.
+const defaultCPUBurnSliceMS int32 = 100
+
 // configuredCPUBurnSliceMS parses EnvGluttonCPUBurnSliceMS as a positive
-// 32-bit integer millisecond duration, returning 0 when unset or invalid.
+// 32-bit integer millisecond duration, returning defaultCPUBurnSliceMS (100ms)
+// when unset or invalid.
 func configuredCPUBurnSliceMS() int32 {
 	if raw := strings.TrimSpace(os.Getenv(EnvGluttonCPUBurnSliceMS)); raw != "" {
 		if ms, err := strconv.ParseInt(raw, 10, 32); err == nil && ms > 0 {
 			return int32(ms)
 		}
 	}
-	return 0
+	return defaultCPUBurnSliceMS
 }
 
 // ensureCPULoad starts cpu_cores goroutines in the actor, each burning

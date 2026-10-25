@@ -24,7 +24,6 @@ import (
 	"net/url"
 	"os"
 	"slices"
-	"strings"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
@@ -235,9 +234,7 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 
 	// Without this an actor that is created and never resumed has no record at
 	// all, at any retention.
-	if !(os.Getenv("ENVELOPE_PHASE1_DB_WORKAROUNDS") == "true" && (strings.HasPrefix(name, "sb-bg-") || strings.HasPrefix(name, "sb-cold-"))) {
-		logActorStateChanged(ctx, stored, ateattr.OperationCreate)
-	}
+	logActorStateChanged(ctx, stored, ateattr.OperationCreate)
 
 	return stored, nil
 }

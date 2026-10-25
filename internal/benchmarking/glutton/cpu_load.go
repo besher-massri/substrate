@@ -62,16 +62,16 @@ func (s *Service) UseCPU(_ context.Context, req *gluttonpb.UseCPURequest) (*glut
 const EnvGluttonCPUBurnSliceMS = "GLUTTON_CPU_BURN_SLICE_MS"
 
 // cpuLoadDefaultCycle is applied when a request has cycle_length_ms=0 and
-// GLUTTON_CPU_BURN_SLICE_MS is not set. A 200ms cycle halves timer wakeup and
-// scheduler context-switch rates across dense sub-core actor pools compared to
-// a 100ms cycle while keeping each work slice bounded within two Linux CFS
-// quota periods.
-const cpuLoadDefaultCycle = 200 * time.Millisecond
+// GLUTTON_CPU_BURN_SLICE_MS is not set. A 100ms cycle aligns with the Linux
+// CFS bandwidth period (100,000 us) so fractional-CPU actors consume their
+// target duty cycle evenly inside each 100ms CFS quota period without bursting
+// across two periods and triggering premature cgroup cpu.max throttling.
+const cpuLoadDefaultCycle = 100 * time.Millisecond
 
 // cpuBurnBatchIterations is the number of LCG iterations executed between
 // clock_gettime(CLOCK_THREAD_CPUTIME_ID) reads so non-vDSO clock syscall traps
 // (especially under gVisor systrap) do not dominate the spin loop.
-const cpuBurnBatchIterations = 65536
+const cpuBurnBatchIterations = 524288
 
 // DefaultCPULoadCycle returns the effective default CPU burn cycle duration,
 // honoring GLUTTON_CPU_BURN_SLICE_MS when set to a positive 32-bit integer

@@ -240,8 +240,8 @@ func processUserCPUTime(t *testing.T) time.Duration {
 }
 
 func TestDefaultCPULoadCycleAndEnvOverride(t *testing.T) {
-	if got := DefaultCPULoadCycle(); got != 200*time.Millisecond {
-		t.Fatalf("DefaultCPULoadCycle() default = %v, want 200ms", got)
+	if got := DefaultCPULoadCycle(); got != 100*time.Millisecond {
+		t.Fatalf("DefaultCPULoadCycle() default = %v, want 100ms", got)
 	}
 	t.Setenv(EnvGluttonCPUBurnSliceMS, " 50 ")
 	if got := DefaultCPULoadCycle(); got != 50*time.Millisecond {
@@ -249,8 +249,8 @@ func TestDefaultCPULoadCycleAndEnvOverride(t *testing.T) {
 	}
 	for _, bad := range []string{"0", "-10", "invalid", "9999999999999"} {
 		t.Setenv(EnvGluttonCPUBurnSliceMS, bad)
-		if got := DefaultCPULoadCycle(); got != 200*time.Millisecond {
-			t.Fatalf("DefaultCPULoadCycle() with %q = %v, want 200ms fallback", bad, got)
+		if got := DefaultCPULoadCycle(); got != 100*time.Millisecond {
+			t.Fatalf("DefaultCPULoadCycle() with %q = %v, want 100ms fallback", bad, got)
 		}
 	}
 }
