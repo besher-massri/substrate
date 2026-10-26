@@ -131,11 +131,13 @@ def get_steady_state_window(
         return start_ts, end_ts
 
     samples: list[tuple[int, float]] = []
+    first_resume_samples: list[tuple[int, float]] = []
+    warm_resume_samples: list[tuple[int, float]] = []
     try:
         with open(stats_history_csv, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                name = row.get("Name", "")
+                name = (row.get("Name") or "").strip()
                 if (
                     name in ("", "Aggregated", "Total")
                     and "User Count" in row
@@ -144,6 +146,22 @@ def get_steady_state_window(
                     try:
                         samples.append((int(row["Timestamp"]),
                                         float(row["User Count"])))
+                    except (ValueError, TypeError):
+                        continue
+                elif name == "ResumeActorFirstResume" and "Timestamp" in row:
+                    try:
+                        first_resume_samples.append((
+                            int(row["Timestamp"]),
+                            float(row.get("Total Request Count") or 0),
+                        ))
+                    except (ValueError, TypeError):
+                        continue
+                elif name == "ResumeActor" and "Timestamp" in row:
+                    try:
+                        warm_resume_samples.append((
+                            int(row["Timestamp"]),
+                            float(row.get("Total Request Count") or 0),
+                        ))
                     except (ValueError, TypeError):
                         continue
     except Exception:
@@ -157,6 +175,19 @@ def get_steady_state_window(
 
     steady = [ts for ts, users in samples if users >= peak * 0.9]
     steady_ts, last_ts = steady[0], steady[-1]
+
+    # When actors_per_user > 1, rounds 1..k-1 after user ramp-up are still cold
+    # first-resumes (ResumeActorFirstResume). Advance steady_ts to the end of
+    # the multi-round cold warm-up (98% of final ResumeActorFirstResume count)
+    # whenever warm ResumeActor calls follow it.
+    final_first = max((c for _, c in first_resume_samples), default=0.0)
+    final_warm = max((c for _, c in warm_resume_samples), default=0.0)
+    if final_first > 1.5 * peak and final_warm > 0:
+        pw_candidates = [
+            ts for ts, c in first_resume_samples if c >= 0.98 * final_first
+        ]
+        if pw_candidates and pw_candidates[0] < last_ts:
+            steady_ts = max(steady_ts, pw_candidates[0])
 
     if start_ts <= steady_ts <= end_ts:
         return steady_ts, min(max(last_ts, steady_ts), end_ts)

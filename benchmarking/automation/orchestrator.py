@@ -510,6 +510,12 @@ def teardown_substrate() -> None:
     run_no_check(["hack/install-ate.sh", "delete", "ate-system"])
     if os.environ.get("ENVELOPE_PRESET") or os.environ.get("SCALE_PROFILE"):
         wipe_worker_disks()
+        # Restart in-cluster Prometheus between large envelope steps after the
+        # previous step's server_summary.json has already been uploaded to GCS,
+        # clearing the emptyDir TSDB head block so multi-step pod churn never
+        # accumulates across steps or triggers a mid-step OOM.
+        run_no_check(["kubectl", "rollout", "restart", "deploy/prometheus", "-n", "benchmarking"])
+        run_no_check(["kubectl", "rollout", "status", "deploy/prometheus", "-n", "benchmarking", "--timeout=300s"])
 
 
 def install_microvm_deps() -> None:
