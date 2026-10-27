@@ -254,8 +254,8 @@ spec:
         - --drain-timeout=5m
         - --objectstore-plugin-socket=/run/objectstore-plugin/node.sock
         - --snapshot-cache-dir=/var/lib/ate/snapshots/.snapshot-cache
-        - --snapshot-upload-delay=24h
-        - --snapshot-detach-delay=48h
+        - --snapshot-upload-delay=48h
+        - --snapshot-detach-delay=72h
         # atelet does no mounts, netlink, device, or namespace operations (those
         # live in the worker pod) — it only reads/writes the
         # /var/lib/ate hostPath as root. CAP_DAC_OVERRIDE is for one thing:
