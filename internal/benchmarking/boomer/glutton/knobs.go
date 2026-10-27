@@ -51,6 +51,12 @@ type gluttonKnobs struct {
 	// MaxPingsPerWake caps the pings sent during one resume/suspend cycle;
 	// values below 1 read as 1.
 	MaxPingsPerWake int `json:"max_pings_per_wake"`
+	// HotActorProb controls actor selection across a VU's slice when >1 actors
+	// per user are configured: 0 (default) uses deterministic round-robin;
+	// negative (-1) selects uniformly at random across all actors; a value in
+	// (0, 1] selects u.actors[0] with probability HotActorProb and uniformly
+	// at random from u.actors[1:] with probability (1 - HotActorProb).
+	HotActorProb float64 `json:"hot_actor_prob"`
 }
 
 var gluttonCodec = dynconfig.Typed[gluttonKnobs]{

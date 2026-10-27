@@ -549,6 +549,23 @@ def _extract_int_flag(flags: Iterable[str], name: str, default: int) -> int:
     return default
 
 
+def _extract_float_flag(flags: Iterable[str], name: str, default: float) -> float:
+    prefix = f"--{name}="
+    flags_list = [str(f) for f in flags]
+    for i, f in enumerate(flags_list):
+        if f.startswith(prefix):
+            try:
+                return float(f[len(prefix):])
+            except ValueError:
+                return default
+        if f == f"--{name}" and i + 1 < len(flags_list):
+            try:
+                return float(flags_list[i + 1])
+            except ValueError:
+                return default
+    return default
+
+
 def deploy_workloads(
     worker_count: int = 1,
     sandbox_class: str = "gvisor",
@@ -783,7 +800,9 @@ def main() -> None:
             flags = test.get("flags", [])
             users = int(test.get("users", 0)) or _extract_int_flag(flags, "users", 0)
             actors_per_user = _extract_int_flag(flags, "actors-per-user", 1)
-            n_participating = min(users, 1_000_000) * actors_per_user if users > 0 else 0
+            hot_actor_prob = _extract_float_flag(flags, "hot-actor-prob", 0.0)
+            eff_apu = 1 if hot_actor_prob != 0.0 else actors_per_user
+            n_participating = min(users, 1_000_000) * eff_apu if users > 0 else 0
             try:
                 deploy_substrate(substrate_args(test))
                 TYPES[ttype].pre_test(test)

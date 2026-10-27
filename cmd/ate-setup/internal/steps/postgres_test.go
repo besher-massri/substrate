@@ -141,8 +141,10 @@ func TestApplyPostgresSize100Overrides(t *testing.T) {
 	for _, want := range []string{
 		"shared_buffers = 256GB",
 		"max_connections = 2000",
-		"max_wal_size = 64GB",
-		"checkpoint_timeout = 30min",
+		"max_wal_size = 192GB",
+		"checkpoint_timeout = 60min",
+		"bgwriter_delay = 10ms",
+		"bgwriter_lru_maxpages = 1000",
 		"ssl = on",
 	} {
 		if !strings.Contains(data["postgresql.conf"], want) {

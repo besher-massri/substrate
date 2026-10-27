@@ -105,6 +105,7 @@ type taskRuntime struct {
 	atespaceErr  error
 	httpSem      chan struct{}
 	userSeq      atomic.Uint64
+	vuSeq        atomic.Uint64
 }
 
 // pickStub selects a ControlClient from cfg.APIStubs in round-robin order by seq,
@@ -233,16 +234,28 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	if n < 1 {
 		n = 1
 	}
+	vuIdx := int(r.vuSeq.Add(1) - 1)
+	hotProb := dynconfig.Get[gluttonKnobs](r.cfg.Dyn).HotActorProb
 	u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
 	bmetrics.UpdateUsers(userClass, 1)
 	var lastCreateErr error
 	for i := 0; i < n; i++ {
+		actorName := "sb-" + uuid.NewString()
+		uncreated := i > 0
+		firstResume := true
+		if i > 0 && hotProb != 0 {
+			coldID := vuIdx*(n-1) + i
+			actorName = "sb-cold-" + strconv.Itoa(coldID)
+			uncreated = coldID > 99_000_000
+			firstResume = false
+		}
 		a := &gluttonActor{
 			cfg:         r.cfg,
 			stub:        r.pickStub(r.userSeq.Add(1)),
 			httpSem:     r.httpSem,
-			actorName:   "sb-" + uuid.NewString(),
-			firstResume: true,
+			actorName:   actorName,
+			uncreated:   uncreated,
+			firstResume: firstResume,
 		}
 		// Ensuring the atespace is idempotent (swallows AlreadyExists), so
 		// doing it once per worker runtime is enough.
@@ -258,8 +271,6 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 				lastCreateErr = err
 				break
 			}
-		} else {
-			a.uncreated = true
 		}
 		u.actors = append(u.actors, a)
 	}
@@ -275,10 +286,11 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 // leaks actors until shutdown — acceptable for benchmark runs that ramp up,
 // hold, then tear down cleanly.
 func (r *taskRuntime) shutdown(ctx context.Context) {
+	hotProb := dynconfig.Get[gluttonKnobs](r.cfg.Dyn).HotActorProb
 	r.users.Range(func(_, val any) bool {
 		u := val.(*gluttonUser)
 		for _, a := range u.actors {
-			if a.uncreated {
+			if a.uncreated || (hotProb != 0 && !a.everResumed) {
 				continue
 			}
 			if a.actorRunning {
@@ -316,12 +328,29 @@ type gluttonUser struct {
 	nextIdx int
 }
 
-// nextActor returns the current actor and advances the round-robin cursor.
-// Returns nil only if the VU started with zero actors (startUser guarantees
-// at least one on success).
+// nextActor returns the next actor for this VU: when HotActorProb is 0 (default),
+// it advances the deterministic round-robin cursor; when HotActorProb != 0, it
+// ensures the initial-set actor (slot 0) is resumed once before drawing either
+// uniformly at random across u.actors (HotActorProb < 0) or with bias
+// HotActorProb on u.actors[0] and (1 - HotActorProb) uniformly across u.actors[1:].
 func (u *gluttonUser) nextActor() *gluttonActor {
 	if len(u.actors) == 0 {
 		return nil
+	}
+	if len(u.actors) > 1 {
+		prob := dynconfig.Get[gluttonKnobs](u.actors[0].cfg.Dyn).HotActorProb
+		if prob != 0 {
+			if !u.actors[0].everResumed {
+				return u.actors[0]
+			}
+			if prob < 0 {
+				return u.actors[rand.IntN(len(u.actors))]
+			}
+			if rand.Float64() < prob {
+				return u.actors[0]
+			}
+			return u.actors[1+rand.IntN(len(u.actors)-1)]
+		}
 	}
 	a := u.actors[u.nextIdx]
 	u.nextIdx = (u.nextIdx + 1) % len(u.actors)
@@ -368,6 +397,7 @@ type gluttonActor struct {
 	actorName    string
 	uncreated    bool
 	firstResume  bool
+	everResumed  bool
 	actorRunning bool
 	ramFilled    bool
 	cpuLoaded    bool
@@ -538,6 +568,7 @@ func (u *gluttonActor) resume(ctx context.Context) error {
 		return err
 	}
 	u.firstResume = false
+	u.everResumed = true
 	u.actorRunning = true
 	u.noteSuccess()
 	return nil

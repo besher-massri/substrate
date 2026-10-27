@@ -345,9 +345,9 @@ func applyPostgresSize10Overrides(objs []*unstructured.Unstructured, confPatch [
 }
 
 // applyPostgresSize100Overrides raises shared_buffers to 256GB, max_connections
-// to 2000, max_wal_size to 64GB, and checkpoint_timeout to 30min on
-// configmap/postgres-config and resizes statefulset/postgres for a dedicated
-// c3d-highmem-180 node under the size100 profile.
+// to 2000, max_wal_size to 192GB, checkpoint_timeout to 60min, and bgwriter
+// pacing on configmap/postgres-config, and resizes statefulset/postgres (plus
+// its data PVC to 1000Gi) for a dedicated c3d-highmem-180 node under size100.
 func applyPostgresSize100Overrides(objs []*unstructured.Unstructured) error {
 	var configMap, statefulSet *unstructured.Unstructured
 	for _, obj := range objs {
@@ -373,9 +373,28 @@ func applyPostgresSize100Overrides(objs []*unstructured.Unstructured) error {
 	}
 	conf = strings.ReplaceAll(conf, "shared_buffers = 35GB", "shared_buffers = 256GB")
 	conf = strings.ReplaceAll(conf, "max_connections = 300", "max_connections = 2000")
-	conf = strings.ReplaceAll(conf, "max_wal_size = 16GB", "max_wal_size = 64GB\n    checkpoint_timeout = 30min")
+	conf = strings.ReplaceAll(conf, "max_wal_size = 16GB", "max_wal_size = 192GB\n    checkpoint_timeout = 60min\n    bgwriter_delay = 10ms\n    bgwriter_lru_maxpages = 1000\n    bgwriter_lru_multiplier = 4.0")
 	if err := unstructured.SetNestedField(configMap.Object, conf, "data", "postgresql.conf"); err != nil {
 		return err
+	}
+
+	if claims, found, err := unstructured.NestedSlice(statefulSet.Object, "spec", "volumeClaimTemplates"); err == nil && found {
+		for i, c := range claims {
+			claim, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _, _ := unstructured.NestedString(claim, "metadata", "name"); name == "data" {
+				if err := unstructured.SetNestedField(claim, "1000Gi", "spec", "resources", "requests", "storage"); err != nil {
+					return fmt.Errorf("while setting size100 storage on %s: %w", kube.Describe(statefulSet), err)
+				}
+				claims[i] = claim
+				if err := unstructured.SetNestedSlice(statefulSet.Object, claims, "spec", "volumeClaimTemplates"); err != nil {
+					return fmt.Errorf("while updating volumeClaimTemplates on %s: %w", kube.Describe(statefulSet), err)
+				}
+				break
+			}
+		}
 	}
 
 	containers, found, err := unstructured.NestedSlice(statefulSet.Object, "spec", "template", "spec", "containers")

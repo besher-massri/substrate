@@ -71,6 +71,7 @@ _FLAGS = {
     "--cpu-cores": int,
     "--cpu-duty-cycle": float,
     "--max-pings-per-wake": int,
+    "--hot-actor-prob": float,
     "--sweperf-template": str,
     "--sweperf-total-steps": int,
     "--sweperf-num-cycles": int,

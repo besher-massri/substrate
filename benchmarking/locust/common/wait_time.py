@@ -63,6 +63,14 @@ def init_wait_time() -> None:
             help="Maximum time in seconds a GluttonUser actor stays resumed between its first ping and suspend (boomer only)",
             include_in_web_ui=True
         )
+        parser.add_argument(
+            "--hot-actor-prob",
+            type=float,
+            default=0.0,
+            env_var="LOCUST_HOT_ACTOR_PROB",
+            help="Hot-actor selection probability across a VU's actor slice: 0 (default) round-robin, <0 uniform random, (0,1] biased toward slot 0 (boomer only)",
+            include_in_web_ui=True
+        )
 
     _initialized = True
 
