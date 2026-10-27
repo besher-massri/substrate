@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -125,9 +126,12 @@ func main() {
 			serverboot.Fatal(ctx, "Invalid --upload-memory-budget", err)
 		}
 		// On GCS every transfer runs on a token scoped to its actor, from the
-		// exchange. S3 has no per-actor credential and keeps the pod's own.
+		// exchange, unless cold shared cache bypass is enabled for scale
+		// benchmarking (where per-actor STS exchange would create unclosed
+		// storage.Client pools per cold actor). S3 has no per-actor credential
+		// and keeps the pod's own.
 		var nodeOpts []objectstoreplugin.NodeOption
-		if !objectstorage.UsesS3() {
+		if !objectstorage.UsesS3() && !useAmbientNodeCredentials() {
 			creds, err := exchangeclient.New(ncfg)
 			if err != nil {
 				serverboot.Fatal(ctx, "Failed to set up the credential exchange client", err)
@@ -227,6 +231,18 @@ func assetScheme() string {
 		return "s3"
 	}
 	return "gs"
+}
+
+// useAmbientNodeCredentials reports whether the node plugin should use the
+// ambient node service account GCS client instead of per-actor STS exchange
+// when uncached shared-snapshot benchmark mode is enabled.
+func useAmbientNodeCredentials() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ATELET_DISABLE_COLD_SHARED_CACHE"))) {
+	case "true", "1", "cold", "all":
+		return true
+	default:
+		return false
+	}
 }
 
 // healthcheck dials the plugin at socket and waits up to timeout for it to

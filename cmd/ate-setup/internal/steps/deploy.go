@@ -729,6 +729,7 @@ var objectstorePluginEnvKeys = []string{
 	"AWS_SECRET_ACCESS_KEY",
 	"AWS_REGION",
 	"GOOGLE_APPLICATION_CREDENTIALS",
+	"ATELET_DISABLE_COLD_SHARED_CACHE",
 }
 
 // applyWorkloadRuntimeAndScaleOverrides mutates decoded workload objects in
@@ -773,7 +774,7 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 		if k == "ATE_SOFT_NODE_AFFINITY" {
 			routerEnv[k] = v
 		}
-		if k == "ATELET_SNAPSHOT_DETACH_DELAY" {
+		if k == "ATELET_SNAPSHOT_DETACH_DELAY" || k == "ATELET_DISABLE_COLD_SHARED_CACHE" {
 			ateletEnv[k] = v
 		}
 	}

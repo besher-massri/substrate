@@ -168,6 +168,37 @@ func TestSnapshotCacheMode(t *testing.T) {
 	}
 }
 
+func TestSnapshotCacheModeForActor(t *testing.T) {
+	orig := *disableColdSharedCache
+	t.Cleanup(func() { *disableColdSharedCache = orig })
+
+	sharedObj := &ateletpb.ObjectStorage{
+		SnapshotUri: testSnapshotURI,
+		Sharing:     ateletpb.SnapshotSharing_SNAPSHOT_SHARING_SHARED,
+	}
+	cases := []struct {
+		name      string
+		flagVal   string
+		actorName string
+		want      cacheMode
+	}{
+		{"default caches hot actor", "", "sb-w1-u0-0-123", cacheModeLink},
+		{"default caches cold actor", "false", "sb-cold-42", cacheModeLink},
+		{"cold mode caches hot actor", "true", "sb-w1-u0-0-123", cacheModeLink},
+		{"cold mode bypasses sb-cold actor", "true", "sb-cold-42", cacheModeOff},
+		{"all mode bypasses hot actor", "all", "sb-w1-u0-0-123", cacheModeOff},
+		{"all mode bypasses cold actor", "all", "sb-cold-42", cacheModeOff},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			*disableColdSharedCache = tc.flagVal
+			if got := snapshotCacheModeForActor(sharedObj, tc.actorName, cacheModeLink); got != tc.want {
+				t.Errorf("snapshotCacheModeForActor(%q, %q) = %v, want %v", tc.flagVal, tc.actorName, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCacheModeFor(t *testing.T) {
 	if got := cacheModeFor(string(atev1alpha1.SandboxClassGvisor)); got != cacheModeLink {
 		t.Errorf("gVisor consumes restore state read-only; want cacheModeLink, got %v", got)
