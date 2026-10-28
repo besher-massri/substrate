@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"slices"
 	"time"
 
@@ -118,15 +117,11 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	actor = assigned
 	volumePublishContexts, err := w.ensureVolumesAttached(leaseCtx, actor, worker, actorTemplate)
 	if err != nil {
-		if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
-			w.revertFailedResumeAssignment(leaseCtx, actorRef, actorTemplate)
-		}
+		w.revertFailedResumeAssignment(leaseCtx, actorRef, actorTemplate)
 		return nil, false, err
 	}
 	if tele, err = w.ensureAteletRestored(leaseCtx, actorRef, actor, actorTemplate, volumePublishContexts); err != nil {
-		if os.Getenv("ATE_SOFT_NODE_AFFINITY") == "true" {
-			w.revertFailedResumeAssignment(leaseCtx, actorRef, actorTemplate)
-		}
+		w.revertFailedResumeAssignment(leaseCtx, actorRef, actorTemplate)
 		return nil, false, err
 	}
 	var running *ateapipb.Actor

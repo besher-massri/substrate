@@ -2217,6 +2217,9 @@ func resetActorDirs(actorUID string) error {
 	if err := resetActorDirsKeepingVolumes(actorUID); err != nil {
 		return err
 	}
+	if err := resetSandboxAssetsDir(actorUID); err != nil {
+		return err
+	}
 	// Do not call RemoveAll on volume directories in case the unmount failed.
 	// We do not want to delete mount content.
 	volumesDir := ateletpath.ExternalVolumeMountsDir(actorUID)
@@ -2269,13 +2272,18 @@ func resetActorDirsKeepingVolumes(actorUID string) error {
 }
 
 // resetSandboxAssetsDir empties the actor's sandbox assets dir for Restore
-// to stage into. Not part of resetActorDirs: the links an activation holds
-// stay while the actor remains resumable on this node, through Checkpoint
-// and its local snapshot, and keep its binaries in the cache meanwhile;
-// Run replaces them through its staging swap. The entries are hard links
-// into the asset cache, so removing them never touches the cached bytes.
-// Owner-only, like the bundle dir: the worker runs the binaries from here
-// as root.
+// to stage into and releases per-actor hardlinks in
+// /var/lib/ate/actors/<actorUID>/sandbox-assets when an actor suspends
+// (Checkpoint) via resetActorDirs. Releasing these links while suspended keeps
+// per-node hardlinks on /var/lib/ate/sandbox-asset-cache bounded by
+// concurrently running actors rather than total suspended+running actors on
+// the node, avoiding the Linux kernel ext4 hardlink limit (EXT4_LINK_MAX =
+// 65,000, syscall.EMLINK). Meanwhile, workerSandboxSyncer's default-runtime
+// links and sandboxAssetCacheMinAge keep the runtime cached on the node, and
+// Checkpoint, Restore, and Terminate all call ensureSandboxAssets before
+// invoking the worker. The entries are hard links into the asset cache, so
+// removing them never touches the cached bytes. Owner-only, like the bundle
+// dir: the worker runs the binaries from here as root.
 func resetSandboxAssetsDir(actorUID string) error {
 	return resetDir("sandbox assets dir", ateletpath.SandboxAssetsDir(actorUID), os.RemoveAll, 0o700)
 }

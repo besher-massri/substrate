@@ -290,10 +290,11 @@ func runLocalSnapshotGC(t *testing.T, fidelity ateletpb.SnapshotFidelity, useDir
 	if _, err := os.Stat(snapshotFile); err != nil {
 		t.Fatalf("pause did not write the local snapshot: %v", err)
 	}
-	// An actor with a local snapshot stays resumable on this node, so it keeps
-	// its staged assets, and with them its binaries in the cache.
-	if _, err := os.Stat(stagedRunsc(actorUID)); err != nil {
-		t.Errorf("paused actor lost its staged runsc: %v", err)
+	// Checkpoint clears per-actor staged sandbox-assets hardlinks so suspended
+	// actors do not exhaust EXT4_LINK_MAX on the node's sandbox-asset-cache;
+	// Restore re-stages them via ensureSandboxAssets.
+	if _, err := os.Stat(stagedRunsc(actorUID)); !os.IsNotExist(err) {
+		t.Errorf("paused actor retained staged runsc: err = %v, want IsNotExist", err)
 	}
 	st := resp.GetState()
 	if got := st.GetLatestLocal(); got.GetSnapshot().GetSnapshotUuid() != snapshotName || got.GetLocalCommitTime() == nil {
