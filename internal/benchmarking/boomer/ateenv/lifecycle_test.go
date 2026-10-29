@@ -336,15 +336,15 @@ func TestRouterGRPCTarget(t *testing.T) {
 	}{
 		{
 			input: "",
-			want:  "dns:///atenet-router.ate-system.svc.cluster.local:80",
+			want:  "dns:///atenet-router.ate-system.svc.cluster.local:443",
 		},
 		{
-			input: "http://atenet-router.ate-system.svc.cluster.local",
-			want:  "dns:///atenet-router.ate-system.svc.cluster.local:80",
+			input: "https://atenet-router.ate-system.svc.cluster.local",
+			want:  "dns:///atenet-router.ate-system.svc.cluster.local:443",
 		},
 		{
-			input: "http://atenet-router.ate-system.svc.cluster.local:8080",
-			want:  "dns:///atenet-router.ate-system.svc.cluster.local:8080",
+			input: "https://atenet-router.ate-system.svc.cluster.local:8443",
+			want:  "dns:///atenet-router.ate-system.svc.cluster.local:8443",
 		},
 		{
 			input: "router.example.internal:9000",
@@ -364,10 +364,10 @@ func TestRouterGRPCTarget(t *testing.T) {
 		})
 	}
 
-	if _, err := routerGRPCTarget("https://atenet-router.ate-system.svc.cluster.local"); err == nil {
-		t.Errorf("routerGRPCTarget(https) succeeded, want error")
+	if _, err := routerGRPCTarget("http://atenet-router.ate-system.svc.cluster.local"); err == nil {
+		t.Errorf("routerGRPCTarget(http) succeeded, want error")
 	}
-	if _, err := routerGRPCTarget("http:///missing-host"); err == nil {
+	if _, err := routerGRPCTarget("https:///missing-host"); err == nil {
 		t.Errorf("routerGRPCTarget(empty host) succeeded, want error")
 	}
 }
@@ -872,6 +872,42 @@ func TestAteEnvShutdown_RespectsContextCancellation(t *testing.T) {
 	}
 	if !slices.Contains(calls, "DeleteActor") {
 		t.Errorf("expected DeleteActor to succeed before ctx expired, got: %v", calls)
+	}
+}
+
+func TestAteEnvEnvelopeGate(t *testing.T) {
+	t.Setenv("ENVELOPE_USE_ATE_ENV", "true")
+	ctrl := &fakeControlClient{}
+	srv := &fakeProcessServer{}
+	rt, fix := newTestRuntime(t, ctrl, srv, dynconfig.LifecycleModePause)
+	rt.cfg.ActorsPerUser = 3
+	rt.execSem = make(chan struct{}, 8)
+
+	// First iteration creates only actor 0 eagerly; actors 1 and 2 remain uncreated.
+	rt.iterate()
+	calls := ctrl.recordedCalls()
+	if got := countCalls(calls, "CreateAtespace"); got != 1 {
+		t.Fatalf("CreateAtespace count = %d, want 1", got)
+	}
+	if got := countCalls(calls, "CreateActor"); got != 1 {
+		t.Fatalf("CreateActor count after 1st iter = %d, want 1 (lazy creation for i > 0)", got)
+	}
+
+	// Second iteration lazily creates actor 1 and runs it.
+	rt.iterate()
+	calls = ctrl.recordedCalls()
+	if got := countCalls(calls, "CreateActor"); got != 2 {
+		t.Fatalf("CreateActor count after 2nd iter = %d, want 2", got)
+	}
+
+	// Shutdown deletes only the 2 created actors (skipping uncreated actor 2) and closes routerConns.
+	rt.shutdown(context.Background())
+	calls = ctrl.recordedCalls()
+	if got := countCalls(calls, "DeleteActor"); got != 2 {
+		t.Fatalf("DeleteActor count on shutdown = %d, want 2 (skipping uncreated actor)", got)
+	}
+	if !fix.closerTracker.isClosed() {
+		t.Errorf("expected pooled routerConn to be closed on shutdown")
 	}
 }
 

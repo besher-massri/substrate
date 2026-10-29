@@ -296,6 +296,11 @@ roleRef:
 RBAC_EOF
   kubectl delete job seed-cold-actors --namespace=benchmarking --ignore-not-found
 
+  local seed_template="benchmark-workloads/glutton"
+  if [[ "${ENVELOPE_USE_ATE_ENV:-false}" == "true" || "${ENVELOPE_USE_ATE_ENV:-}" == "1" ]]; then
+    seed_template="benchmark-workloads/ate-env"
+  fi
+
   hack/run-tool.sh ko apply -f - <<EOF
 apiVersion: batch/v1
 kind: Job
@@ -329,7 +334,7 @@ spec:
         - "--seed-count=${shard_count}"
         - "--seed-concurrency=256"
         - "--seed-atespace=benchmark"
-        - "--seed-template=benchmark-workloads/glutton"
+        - "--seed-template=${seed_template}"
         resources:
           requests:
             cpu: "2"

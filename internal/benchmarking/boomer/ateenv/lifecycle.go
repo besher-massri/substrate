@@ -26,9 +26,12 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/url"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,7 +47,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -59,7 +62,20 @@ const (
 	maxConsecutiveFailures = 3
 	minPingGap             = 200 * time.Millisecond
 	maxPingGap             = 1 * time.Second
+	routerPoolSize         = 64
+	execConcurrencyLimit   = 8192
 )
+
+// envelopeAteEnvEnabled reports whether the global ENVELOPE_USE_ATE_ENV gate is
+// enabled for large-scale envelope benchmarking with the ate-env workload.
+func envelopeAteEnvEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ENVELOPE_USE_ATE_ENV"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
 
 type ateEnvKnobs struct {
 	dynconfig.WaitTime
@@ -67,6 +83,7 @@ type ateEnvKnobs struct {
 	MinLive         dynconfig.Seconds `json:"min_live_time"`
 	MaxLive         dynconfig.Seconds `json:"max_live_time"`
 	MaxPingsPerWake int               `json:"max_pings_per_wake"`
+	HotActorProb    float64           `json:"hot_actor_prob"`
 }
 
 var ateEnvCodec = dynconfig.Typed[ateEnvKnobs]{
@@ -104,20 +121,20 @@ func init() {
 	})
 }
 
-// routerGRPCTarget converts an HTTP/HTTPS router URL into a dns:/// gRPC dial target.
+// routerGRPCTarget converts an HTTPS router URL into a dns:/// gRPC dial target.
 func routerGRPCTarget(rawURL string) (string, error) {
 	if rawURL == "" {
-		rawURL = "http://atenet-router.ate-system.svc.cluster.local"
+		rawURL = "https://atenet-router.ate-system.svc.cluster.local"
 	}
 	if !strings.Contains(rawURL, "://") {
-		rawURL = "http://" + rawURL
+		rawURL = "https://" + rawURL
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", err
 	}
-	if strings.EqualFold(u.Scheme, "https") {
-		return "", fmt.Errorf("router URL %q uses https, which is not supported by the plaintext gRPC dialer", rawURL)
+	if strings.EqualFold(u.Scheme, "http") {
+		return "", fmt.Errorf("router URL %q uses http, which is not supported by the TLS gRPC dialer", rawURL)
 	}
 	host := u.Hostname()
 	if host == "" {
@@ -125,9 +142,29 @@ func routerGRPCTarget(rawURL string) (string, error) {
 	}
 	port := u.Port()
 	if port == "" {
-		port = "80"
+		port = "443"
 	}
 	return "dns:///" + net.JoinHostPort(host, port), nil
+}
+
+// dialRouterProcessClient opens a TLS-authenticated gRPC connection to target
+// using the router pod-identity credentials with HTTP/2 ALPN negotiation.
+func dialRouterProcessClient(target string) (ateenvv1alpha.ProcessServiceClient, io.Closer, error) {
+	tlsCfg, err := boomerutil.RouterTLSConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	tlsCfg = tlsCfg.Clone()
+	tlsCfg.NextProtos = nil
+	conn, err := grpc.NewClient(
+		target,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithDisableServiceConfig(),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ateenvv1alpha.NewProcessServiceClient(conn), conn, nil
 }
 
 // initAteEnv creates a runtime tied to cfg and returns a boomer-compatible task
@@ -141,6 +178,9 @@ func initAteEnv(cfg *userclass.Config) (taskFn func(), shutdown func(context.Con
 		cfg:    cfg,
 		stopCh: make(chan struct{}),
 	}
+	if envelopeAteEnvEnabled() {
+		rt.execSem = make(chan struct{}, execConcurrencyLimit)
+	}
 	return rt.iterate, rt.shutdown
 }
 
@@ -153,6 +193,68 @@ type taskRuntime struct {
 	stopCh            chan struct{}
 	stopping          bool
 	iterWG            sync.WaitGroup
+	atespaceOnce      sync.Once
+	atespaceErr       error
+	routerPoolOnce    sync.Once
+	routerPoolErr     error
+	routerClients     []ateenvv1alpha.ProcessServiceClient
+	routerConns       []io.Closer
+	execSem           chan struct{}
+	userSeq           atomic.Uint64
+	vuSeq             atomic.Uint64
+}
+
+// pickStub selects a ControlClient from cfg.APIStubs in round-robin order by seq,
+// falling back to cfg.APIStub when the pool is unset.
+func (r *taskRuntime) pickStub(seq uint64) ateapipb.ControlClient {
+	if len(r.cfg.APIStubs) > 0 {
+		return r.cfg.APIStubs[seq%uint64(len(r.cfg.APIStubs))]
+	}
+	return r.cfg.APIStub
+}
+
+// pickProcessClient selects a pooled ProcessServiceClient in round-robin order
+// when ENVELOPE_USE_ATE_ENV is enabled.
+func (r *taskRuntime) pickProcessClient(seq uint64) (ateenvv1alpha.ProcessServiceClient, error) {
+	r.routerPoolOnce.Do(func() {
+		if r.dialProcessClient != nil {
+			c, closer, err := r.dialProcessClient()
+			if err != nil {
+				r.routerPoolErr = err
+				return
+			}
+			r.routerClients = []ateenvv1alpha.ProcessServiceClient{c}
+			if closer != nil {
+				r.routerConns = []io.Closer{closer}
+			}
+			return
+		}
+		target, err := routerGRPCTarget(r.cfg.RouterURL)
+		if err != nil {
+			r.routerPoolErr = err
+			return
+		}
+		clients := make([]ateenvv1alpha.ProcessServiceClient, 0, routerPoolSize)
+		conns := make([]io.Closer, 0, routerPoolSize)
+		for range routerPoolSize {
+			c, closer, err := dialRouterProcessClient(target)
+			if err != nil {
+				for _, existing := range conns {
+					_ = existing.Close()
+				}
+				r.routerPoolErr = err
+				return
+			}
+			clients = append(clients, c)
+			conns = append(conns, closer)
+		}
+		r.routerClients = clients
+		r.routerConns = conns
+	})
+	if r.routerPoolErr != nil {
+		return nil, fmt.Errorf("dial router gRPC: %w", r.routerPoolErr)
+	}
+	return r.routerClients[seq%uint64(len(r.routerClients))], nil
 }
 
 func (r *taskRuntime) stopChan() <-chan struct{} {
@@ -270,6 +372,13 @@ func (r *taskRuntime) iterate() {
 		return
 	}
 
+	if actor.isUncreated() {
+		if err := actor.create(ctx); err != nil {
+			return
+		}
+		actor.markCreated()
+	}
+
 	if !actor.isRunning() || dynconfig.Get[ateEnvKnobs](r.cfg.Dyn).LifecycleMode != dynconfig.LifecycleModeNone {
 		if err := actor.resume(ctx); err != nil {
 			if actor.noteFailure(err) {
@@ -327,6 +436,10 @@ func (r *taskRuntime) startUser(ctx context.Context) (*ateEnvUser, error) {
 		n = 1
 	}
 
+	if envelopeAteEnvEnabled() {
+		return r.startUserEnvelope(ctx, n)
+	}
+
 	dialFn := r.dialProcessClient
 	if dialFn == nil {
 		target, err := routerGRPCTarget(r.cfg.RouterURL)
@@ -334,15 +447,7 @@ func (r *taskRuntime) startUser(ctx context.Context) (*ateEnvUser, error) {
 			return nil, err
 		}
 		dialFn = func() (ateenvv1alpha.ProcessServiceClient, io.Closer, error) {
-			conn, err := grpc.NewClient(
-				target,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithDisableServiceConfig(),
-			)
-			if err != nil {
-				return nil, nil, err
-			}
-			return ateenvv1alpha.NewProcessServiceClient(conn), conn, nil
+			return dialRouterProcessClient(target)
 		}
 	}
 
@@ -395,6 +500,63 @@ func (r *taskRuntime) startUser(ctx context.Context) (*ateEnvUser, error) {
 	return u, nil
 }
 
+// startUserEnvelope initializes a virtual user under ENVELOPE_USE_ATE_ENV with
+// shared gRPC connection pools, single-shot atespace creation, and lazy cold
+// actor registration matching GluttonUser's 1M-actor scale path.
+func (r *taskRuntime) startUserEnvelope(ctx context.Context, n int) (*ateEnvUser, error) {
+	seq := r.userSeq.Add(1)
+	client, err := r.pickProcessClient(seq)
+	if err != nil {
+		return nil, err
+	}
+	vuIdx := int(r.vuSeq.Add(1) - 1)
+	hotProb := dynconfig.Get[ateEnvKnobs](r.cfg.Dyn).HotActorProb
+	u := &ateEnvUser{
+		actors: make([]*ateEnvActor, 0, n),
+	}
+	bmetrics.UpdateUsers(userClass, 1)
+	var lastCreateErr error
+	for i := 0; i < n; i++ {
+		actorName := "sb-" + uuid.NewString()
+		uncreated := i > 0
+		firstResume := true
+		if i > 0 && hotProb != 0 {
+			coldID := vuIdx*(n-1) + i
+			actorName = "sb-cold-" + strconv.Itoa(coldID)
+			uncreated = coldID > 99_000_000
+			firstResume = false
+		}
+		a := &ateEnvActor{
+			cfg:           r.cfg,
+			stub:          r.pickStub(seq),
+			execSem:       r.execSem,
+			actorName:     actorName,
+			uncreated:     uncreated,
+			firstResume:   firstResume,
+			processClient: client,
+		}
+		if i == 0 {
+			r.atespaceOnce.Do(func() {
+				r.atespaceErr = a.ensureAtespace(ctx)
+			})
+			if r.atespaceErr != nil {
+				bmetrics.UpdateUsers(userClass, -1)
+				return nil, r.atespaceErr
+			}
+			if err := a.create(ctx); err != nil {
+				lastCreateErr = err
+				break
+			}
+		}
+		u.actors = append(u.actors, a)
+	}
+	if len(u.actors) == 0 {
+		bmetrics.UpdateUsers(userClass, -1)
+		return nil, fmt.Errorf("no actors created: %w", lastCreateErr)
+	}
+	return u, nil
+}
+
 // shutdown stops new iterations, waits for any in-flight iterate() calls to
 // finish (capped at half of ctx's remaining deadline so cleanup still has time
 // to run), hibernates (if still running) and deletes every actor this worker
@@ -416,9 +578,13 @@ func (r *taskRuntime) shutdown(ctx context.Context) {
 	case <-done:
 	case <-waitCtx.Done():
 	}
+	hotProb := dynconfig.Get[ateEnvKnobs](r.cfg.Dyn).HotActorProb
 	r.users.Range(func(_, val any) bool {
 		u := val.(*ateEnvUser)
 		for _, a := range u.snapshotActors() {
+			if a.shouldSkipShutdown(hotProb) {
+				continue
+			}
 			if a.isRunning() {
 				if dynconfig.Get[ateEnvKnobs](r.cfg.Dyn).LifecycleMode == dynconfig.LifecycleModePause {
 					_ = a.pause(ctx)
@@ -434,6 +600,11 @@ func (r *taskRuntime) shutdown(ctx context.Context) {
 		bmetrics.UpdateUsers(userClass, -1)
 		return true
 	})
+	for _, conn := range r.routerConns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
 }
 
 func (r *taskRuntime) dynamicWait() time.Duration {
@@ -459,6 +630,21 @@ func (u *ateEnvUser) nextActor() *ateEnvActor {
 	if len(u.actors) == 0 {
 		return nil
 	}
+	if len(u.actors) > 1 && envelopeAteEnvEnabled() {
+		prob := dynconfig.Get[ateEnvKnobs](u.actors[0].cfg.Dyn).HotActorProb
+		if prob != 0 {
+			if !u.actors[0].hasEverResumed() {
+				return u.actors[0]
+			}
+			if prob < 0 {
+				return u.actors[rand.IntN(len(u.actors))]
+			}
+			if rand.Float64() < prob {
+				return u.actors[0]
+			}
+			return u.actors[1+rand.IntN(len(u.actors)-1)]
+		}
+	}
 	a := u.actors[u.nextIdx]
 	u.nextIdx = (u.nextIdx + 1) % len(u.actors)
 	return a
@@ -476,6 +662,8 @@ func (u *ateEnvUser) replaceActor(ctx context.Context, broken *ateEnvActor) {
 	}
 	replacement := &ateEnvActor{
 		cfg:           broken.cfg,
+		stub:          broken.stub,
+		execSem:       broken.execSem,
 		actorName:     "sb-" + uuid.NewString(),
 		firstResume:   true,
 		processClient: broken.processClient,
@@ -500,8 +688,12 @@ func (u *ateEnvUser) replaceActor(ctx context.Context, broken *ateEnvActor) {
 type ateEnvActor struct {
 	mu                  sync.Mutex
 	cfg                 *userclass.Config
+	stub                ateapipb.ControlClient
+	execSem             chan struct{}
 	actorName           string
+	uncreated           bool
 	firstResume         bool
+	everResumed         bool
 	actorRunning        bool
 	crashed             bool
 	hibernatePending    bool
@@ -509,6 +701,37 @@ type ateEnvActor struct {
 	consecutiveFailures int
 	processClient       ateenvv1alpha.ProcessServiceClient
 	execTimeout         time.Duration
+}
+
+func (u *ateEnvActor) apiStub() ateapipb.ControlClient {
+	if u.stub != nil {
+		return u.stub
+	}
+	return u.cfg.APIStub
+}
+
+func (u *ateEnvActor) isUncreated() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.uncreated
+}
+
+func (u *ateEnvActor) markCreated() {
+	u.mu.Lock()
+	u.uncreated = false
+	u.mu.Unlock()
+}
+
+func (u *ateEnvActor) hasEverResumed() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.everResumed
+}
+
+func (u *ateEnvActor) shouldSkipShutdown(hotProb float64) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.uncreated || (hotProb != 0 && !u.everResumed)
 }
 
 func (u *ateEnvActor) isRunning() bool {
@@ -587,7 +810,7 @@ func (u *ateEnvActor) ref() *ateapipb.ObjectRef {
 
 func (u *ateEnvActor) ensureAtespace(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateAtespace", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapipb.CreateAtespaceRequest{
+		_, err := u.apiStub().CreateAtespace(callCtx, &ateapipb.CreateAtespaceRequest{
 			Atespace: &ateapipb.Atespace{
 				Metadata: &ateapipb.ResourceMetadata{
 					Name: u.cfg.Atespace,
@@ -606,13 +829,24 @@ func (u *ateEnvActor) ensureAtespace(ctx context.Context) error {
 
 func (u *ateEnvActor) create(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
-			Actor: &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: templateName},
-			},
-		}, grpc.Trailer(tr))
-		return err
+		doCreate := func() error {
+			_, err := u.apiStub().CreateActor(callCtx, &ateapipb.CreateActorRequest{
+				Actor: &ateapipb.Actor{
+					Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
+					ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: templateName},
+				},
+			}, grpc.Trailer(tr))
+			if envelopeAteEnvEnabled() {
+				if s, ok := status.FromError(err); ok && s.Code() == codes.AlreadyExists {
+					return nil
+				}
+			}
+			return err
+		}
+		if envelopeAteEnvEnabled() {
+			return boomerutil.RetryOnConflict(callCtx, doCreate)
+		}
+		return doCreate()
 	})
 }
 
@@ -626,7 +860,7 @@ func (u *ateEnvActor) resume(ctx context.Context) error {
 	}
 	err := u.tracedCall(ctx, metricName, func(callCtx context.Context, tr *metadata.MD) error {
 		return boomerutil.RetryOnConflict(callCtx, func() error {
-			_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
+			_, err := u.apiStub().ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
 				Actor: u.ref(),
 			}, grpc.Trailer(tr))
 			return err
@@ -646,6 +880,7 @@ func (u *ateEnvActor) resume(ctx context.Context) error {
 	}
 	u.mu.Lock()
 	u.firstResume = false
+	u.everResumed = true
 	u.actorRunning = true
 	u.mu.Unlock()
 	return nil
@@ -664,11 +899,17 @@ func (u *ateEnvActor) hibernate(ctx context.Context) error {
 
 func (u *ateEnvActor) pause(ctx context.Context) error {
 	err := u.tracedCall(ctx, "SuspendActorAsync", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
-			Actor:   u.ref(),
-			Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
-		}, grpc.Trailer(tr))
-		return err
+		doPause := func() error {
+			_, err := u.apiStub().SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
+				Actor:   u.ref(),
+				Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
+			}, grpc.Trailer(tr))
+			return err
+		}
+		if envelopeAteEnvEnabled() {
+			return boomerutil.RetryOnConflict(callCtx, doPause)
+		}
+		return doPause()
 	})
 	u.mu.Lock()
 	u.actorRunning = false
@@ -679,11 +920,17 @@ func (u *ateEnvActor) pause(ctx context.Context) error {
 
 func (u *ateEnvActor) suspend(ctx context.Context) error {
 	err := u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
-			Actor:   u.ref(),
-			Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
-		}, grpc.Trailer(tr))
-		return err
+		doSuspend := func() error {
+			_, err := u.apiStub().SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
+				Actor:   u.ref(),
+				Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+			}, grpc.Trailer(tr))
+			return err
+		}
+		if envelopeAteEnvEnabled() {
+			return boomerutil.RetryOnConflict(callCtx, doSuspend)
+		}
+		return doSuspend()
 	})
 	u.mu.Lock()
 	u.actorRunning = false
@@ -694,10 +941,16 @@ func (u *ateEnvActor) suspend(ctx context.Context) error {
 
 func (u *ateEnvActor) delete(ctx context.Context) {
 	_ = u.tracedCall(ctx, "DeleteActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapipb.DeleteActorRequest{
-			Actor: u.ref(),
-		}, grpc.Trailer(tr))
-		return err
+		doDelete := func() error {
+			_, err := u.apiStub().DeleteActor(callCtx, &ateapipb.DeleteActorRequest{
+				Actor: u.ref(),
+			}, grpc.Trailer(tr))
+			return err
+		}
+		if envelopeAteEnvEnabled() {
+			return boomerutil.RetryOnConflict(callCtx, doDelete)
+		}
+		return doDelete()
 	})
 }
 
@@ -748,6 +1001,10 @@ func (m metadataCarrier) Keys() []string {
 // execHelloWorld executes "echo hello world" inside the actor container via
 // StartProcess and drains StreamProcessOutput until completion.
 func (u *ateEnvActor) execHelloWorld(ctx context.Context) error {
+	if u.execSem != nil {
+		u.execSem <- struct{}{}
+		defer func() { <-u.execSem }()
+	}
 	timeout := u.execTimeout
 	if timeout <= 0 {
 		timeout = execTimeout

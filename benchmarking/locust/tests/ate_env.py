@@ -23,6 +23,12 @@ sole owner of AteEnvUser load.
 
 import os
 
+if os.environ.get("ENVELOPE_USE_ATE_ENV", "").strip().lower() in ("1", "true", "yes"):
+    import locust.runners
+
+    locust.runners.HEARTBEAT_DEAD_INTERNAL = -120.0
+    locust.runners.HEARTBEAT_INTERVAL = 5.0
+
 if os.environ.get("LOCUST_NO_ATE_ENV_USER") != "1":
     from locust import User, task
     from common.boomer_config import init_boomer_config

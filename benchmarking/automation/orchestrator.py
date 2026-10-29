@@ -279,6 +279,16 @@ def sanitize(name: str) -> str:
 MAX_JOB_NAME_LEN = 63
 
 
+def envelope_use_ate_env() -> bool:
+    """Return True when the global ENVELOPE_USE_ATE_ENV gate is enabled to
+    redirect glutton envelope benchmark entries to the ate_env workload."""
+    return os.environ.get("ENVELOPE_USE_ATE_ENV", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def job_name(name: str, commit: str) -> str:
     """Return a unique Job name for a test run that fits a Kubernetes label.
 
@@ -294,14 +304,18 @@ def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] =
     text = Path(path).read_text()
     for k, v in subs.items():
         text = text.replace("${" + k + "}", str(v))
-    if not extra_args:
+    use_ate_env = envelope_use_ate_env()
+    if not extra_args and not use_ate_env:
         return text
     docs = list(yaml.safe_load_all(text))
     for doc in docs:
         if doc and doc.get("kind") == "Job":
-            doc["spec"]["template"]["spec"]["containers"][0]["args"].extend(
-                str(a) for a in extra_args
-            )
+            container = doc["spec"]["template"]["spec"]["containers"][0]
+            if extra_args:
+                container["args"].extend(str(a) for a in extra_args)
+            if use_ate_env:
+                env_list = container.setdefault("env", [])
+                env_list.append({"name": "ENVELOPE_USE_ATE_ENV", "value": "true"})
     return yaml.safe_dump_all(docs)
 
 
@@ -396,6 +410,8 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
             )
         TYPES[ttype].validate(t)
         if ttype == "locust":
+            if envelope_use_ate_env() and t.get("file") == "/app/tests/glutton.py":
+                t["file"] = "/app/tests/ate_env.py"
             # A malformed --metadata fails here rather than mid-sweep.
             split_metadata_flag(t)
         isolate_block(t)
@@ -635,6 +651,8 @@ def run_test(
     }
     mod = TYPES[test_type(test)]
     tmpl = mod.job_tmpl(manifests_dir)
+    if envelope_use_ate_env() and test.get("file") == "/app/tests/glutton.py":
+        test = {**test, "file": "/app/tests/ate_env.py"}
     subs.update(mod.job_subs(test))
     flags = list(test.get("flags", []))
     # Only the locust runner knows --metadata. It keeps only the last one it

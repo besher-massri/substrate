@@ -422,6 +422,29 @@ class RunMetadataTest(unittest.TestCase):
         job = next(d for d in yaml.safe_load_all(text) if d and d.get("kind") == "Job")
         self.assertEqual(job["spec"]["template"]["spec"]["containers"][0]["args"][-1], md)
 
+    def test_envelope_use_ate_env_gate(self):
+        test = {
+            "name": "step1",
+            "type": "locust",
+            "targetCluster": "dev",
+            "file": "/app/tests/glutton.py",
+            "duration": "1m",
+            "users": 10,
+        }
+        with mock.patch.dict(os.environ, {"ENVELOPE_USE_ATE_ENV": "true"}):
+            orchestrator.validate_and_normalize_tests([test])
+            self.assertEqual(test["file"], "/app/tests/ate_env.py")
+            subs = {"JOB_NAME": "j", "IMAGE": "i", "TAG": "t", "NAME": "n", "DEST": "d"}
+            subs.update(locust.job_subs(test))
+            text = orchestrator.render_template(RunnerSizingTest.TMPL, subs)
+            job = next(d for d in yaml.safe_load_all(text) if d and d.get("kind") == "Job")
+            container = job["spec"]["template"]["spec"]["containers"][0]
+            self.assertIn("/app/tests/ate_env.py", container["args"])
+            self.assertIn(
+                {"name": "ENVELOPE_USE_ATE_ENV", "value": "true"},
+                container.get("env", []),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
