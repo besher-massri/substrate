@@ -186,6 +186,17 @@ func (r *taskRuntime) iterate() {
 			return
 		}
 	}
+	if lpaEnabled() {
+		deadline := time.Now().Add(r.liveWait())
+		actor.runLPAStep(ctx)
+		if remaining := time.Until(deadline); remaining > 0 {
+			time.Sleep(remaining)
+		}
+		if err := actor.hibernate(ctx); err != nil && actor.noteFailure(err) {
+			user.replaceActor(ctx, actor)
+		}
+		return
+	}
 	// Fill before the first suspend so every snapshot from cycle one on
 	// carries the full working set; glutton keeps the allocations across
 	// suspend/resume, so this runs once per actor (retried if it fails).
@@ -414,6 +425,7 @@ type gluttonActor struct {
 	// consecutiveFailures counts replaceIfPersistent failures since the last
 	// success. See noteFailure.
 	consecutiveFailures int
+	lpaStepIdx          int
 	httpSeq             atomic.Uint64
 }
 

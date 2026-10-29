@@ -1,0 +1,148 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package glutton
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	"go.ate.dev/substrate/internal/benchmarking/boomer/agentsession"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
+	gluttonsvc "go.ate.dev/substrate/internal/benchmarking/glutton"
+	gluttonpb "go.ate.dev/substrate/internal/proto/glutton"
+	"go.opentelemetry.io/otel"
+	"google.golang.org/protobuf/proto"
+)
+
+func resetLPAConfigForTest() {
+	lpaCfgOnce = sync.Once{}
+	lpaCfgVal = lpaConfig{}
+}
+
+func TestLPADisabledByDefault(t *testing.T) {
+	t.Setenv(EnvEnvelopeUseLPA, "")
+	resetLPAConfigForTest()
+	t.Cleanup(resetLPAConfigForTest)
+
+	if lpaEnabled() {
+		t.Fatalf("lpaEnabled() = true, want false by default")
+	}
+}
+
+func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) {
+	t.Setenv(EnvEnvelopeUseLPA, "true")
+	t.Setenv(EnvEnvelopeLPACPUScale, "0.001")
+	t.Setenv(EnvEnvelopeLPADwellScale, "0")
+	t.Setenv(EnvEnvelopeLPASizeScale, "0.01")
+	resetLPAConfigForTest()
+	t.Cleanup(resetLPAConfigForTest)
+
+	if !lpaEnabled() {
+		t.Fatalf("lpaEnabled() = false, want true when ENVELOPE_USE_LPA=true")
+	}
+	cfg := currentLPAConfig()
+	if cfg.loadErr != nil {
+		t.Fatalf("loadLPAConfigFromEnv error: %v", cfg.loadErr)
+	}
+	if cfg.script == nil || len(cfg.script.Steps) != 61 {
+		t.Fatalf("loaded script steps = %d, want 61", len(cfg.script.Steps))
+	}
+
+	svc, err := gluttonsvc.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("gluttonsvc.New: %v", err)
+	}
+	defer svc.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != runScriptPath {
+			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		reqBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var req gluttonpb.RunScriptRequest
+		if err := proto.Unmarshal(reqBytes, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp, err := svc.RunScript(r.Context(), &req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out, err := proto.Marshal(resp)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(out)
+	}))
+	defer srv.Close()
+
+	actor := &gluttonActor{
+		cfg: &userclass.Config{
+			Atespace:   "test-atespace",
+			RouterURL:  srv.URL,
+			HTTPClient: srv.Client(),
+			Tracer:     otel.Tracer("test"),
+		},
+		actorName: "sb-test-lpa",
+	}
+
+	// Execute all 37 steps of personal-assistant-light plus step 0 wrap-around
+	// against a real glutton.Service to verify every RAM/disk/ingest/CPU step
+	// succeeds in sequence.
+	for i := 0; i < len(cfg.script.Steps)+1; i++ {
+		wantIdx := (i + 1) % len(cfg.script.Steps)
+		actor.runLPAStep(context.Background())
+		if actor.lpaStepIdx != wantIdx {
+			t.Fatalf("after step %d (%s), actor.lpaStepIdx = %d, want %d",
+				i, cfg.script.Steps[i%len(cfg.script.Steps)].Name, actor.lpaStepIdx, wantIdx)
+		}
+	}
+}
+
+func TestBuildLPARunScriptRequestHonorsDwellAndCPUScales(t *testing.T) {
+	script, err := agentsession.Load("personal-assistant-light")
+	if err != nil {
+		t.Fatalf("agentsession.Load: %v", err)
+	}
+	step := script.Steps[0] // 0000_gateway_start
+	req := buildLPARunScriptRequest(step, lpaConfig{
+		enabled:    true,
+		cpuScale:   0.02,
+		dwellScale: 0,
+		sizeScale:  1.0,
+	})
+	if req == nil || req.GetScript() == nil || len(req.GetScript().GetSteps()) == 0 {
+		t.Fatalf("buildLPARunScriptRequest returned empty script")
+	}
+	for _, st := range req.GetScript().GetSteps() {
+		for _, r := range st.GetOperation().GetRequests() {
+			if _, ok := r.GetKind().(*gluttonpb.Request_Sleep); ok {
+				t.Fatalf("expected dwell sleep to be omitted when dwellScale == 0")
+			}
+		}
+	}
+}

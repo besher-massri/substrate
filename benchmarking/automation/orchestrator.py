@@ -289,6 +289,16 @@ def envelope_use_ate_env() -> bool:
     )
 
 
+def envelope_use_lpa() -> bool:
+    """Return True when the global ENVELOPE_USE_LPA gate is enabled to run
+    the Personal Assistant Light (LPA) multi-step workload inside GluttonUser."""
+    return os.environ.get("ENVELOPE_USE_LPA", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def job_name(name: str, commit: str) -> str:
     """Return a unique Job name for a test run that fits a Kubernetes label.
 
@@ -305,7 +315,8 @@ def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] =
     for k, v in subs.items():
         text = text.replace("${" + k + "}", str(v))
     use_ate_env = envelope_use_ate_env()
-    if not extra_args and not use_ate_env:
+    use_lpa = envelope_use_lpa()
+    if not extra_args and not use_ate_env and not use_lpa:
         return text
     docs = list(yaml.safe_load_all(text))
     for doc in docs:
@@ -316,6 +327,18 @@ def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] =
             if use_ate_env:
                 env_list = container.setdefault("env", [])
                 env_list.append({"name": "ENVELOPE_USE_ATE_ENV", "value": "true"})
+            if use_lpa:
+                env_list = container.setdefault("env", [])
+                env_list.append({"name": "ENVELOPE_USE_LPA", "value": "true"})
+                for env_key in (
+                    "ENVELOPE_LPA_SCRIPT",
+                    "ENVELOPE_LPA_CPU_SCALE",
+                    "ENVELOPE_LPA_DWELL_SCALE",
+                    "ENVELOPE_LPA_SIZE_SCALE",
+                ):
+                    env_val = os.environ.get(env_key, "").strip()
+                    if env_val:
+                        env_list.append({"name": env_key, "value": env_val})
     return yaml.safe_dump_all(docs)
 
 

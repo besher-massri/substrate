@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	randv2 "math/rand/v2"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -139,7 +140,7 @@ func (s *Service) WriteRAM(ctx context.Context, req *gluttonpb.WriteRAMRequest) 
 		s.mu.Lock()
 		existing := s.ram[req.GetKey()]
 		if len(existing) == size {
-			if _, err := rand.Read(existing); err != nil {
+			if err := fillRandomBytes(existing); err != nil {
 				s.mu.Unlock()
 				return nil, status.Errorf(codes.Internal, "generate random bytes: %v", err)
 			}
@@ -164,7 +165,7 @@ func (s *Service) WriteRAM(ctx context.Context, req *gluttonpb.WriteRAMRequest) 
 			s.ram[req.GetKey()] = existing
 			delete(s.ramCursor, req.GetKey())
 		}
-		if _, err := rand.Read(existing[:size]); err != nil {
+		if err := fillRandomBytes(existing[:size]); err != nil {
 			s.mu.Unlock()
 			return nil, status.Errorf(codes.Internal, "generate random bytes: %v", err)
 		}
@@ -198,11 +199,11 @@ func (s *Service) rotateRAM(key string, size int) error {
 	}
 	start := s.ramCursor[key]
 	head := existing[start:min(start+size, len(existing))]
-	if _, err := rand.Read(head); err != nil {
+	if err := fillRandomBytes(head); err != nil {
 		return status.Errorf(codes.Internal, "generate random bytes: %v", err)
 	}
 	if wrapped := size - len(head); wrapped > 0 {
-		if _, err := rand.Read(existing[:wrapped]); err != nil {
+		if err := fillRandomBytes(existing[:wrapped]); err != nil {
 			return status.Errorf(codes.Internal, "generate random bytes: %v", err)
 		}
 	}
@@ -457,9 +458,39 @@ func (s *Service) Ingest(ctx context.Context, req *gluttonpb.IngestRequest) (*gl
 	return &gluttonpb.IngestResponse{Size: info.Size(), Sha256: digest[:]}, nil
 }
 
+// chaChaPool caches crypto/rand-seeded ChaCha8 stream ciphers so WriteRAM and
+// WriteDisk generate uncompressible random bytes in user space without issuing
+// getrandom(2) syscalls on every buffer fill.
+var chaChaPool = sync.Pool{
+	New: func() any {
+		var seed [32]byte
+		if _, err := rand.Read(seed[:]); err != nil {
+			return nil
+		}
+		return randv2.NewChaCha8(seed)
+	},
+}
+
+// fillRandomBytes fills buf with random bytes from a pooled ChaCha8 stream
+// cipher seeded from crypto/rand, falling back to crypto/rand.Read if seeding
+// fails.
+func fillRandomBytes(buf []byte) error {
+	if len(buf) == 0 {
+		return nil
+	}
+	if v := chaChaPool.Get(); v != nil {
+		rng := v.(*randv2.ChaCha8)
+		_, _ = rng.Read(buf)
+		chaChaPool.Put(rng)
+		return nil
+	}
+	_, err := rand.Read(buf)
+	return err
+}
+
 func randomBytes(n int) ([]byte, error) {
 	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
+	if err := fillRandomBytes(buf); err != nil {
 		return nil, err
 	}
 	return buf, nil
@@ -477,14 +508,14 @@ func streamRandomBytes(w io.Writer, total int64) error {
 	if total <= 0 {
 		return nil
 	}
-	buf := make([]byte, streamRandomBytesChunk)
+	buf := make([]byte, min(total, int64(streamRandomBytesChunk)))
 	var written int64
 	for written < total {
 		chunk := buf
 		if remaining := total - written; remaining < int64(len(chunk)) {
 			chunk = buf[:remaining]
 		}
-		if _, err := rand.Read(chunk); err != nil {
+		if err := fillRandomBytes(chunk); err != nil {
 			return fmt.Errorf("generate random bytes: %w", err)
 		}
 		n, err := w.Write(chunk)

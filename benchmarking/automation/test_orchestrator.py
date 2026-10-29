@@ -445,6 +445,40 @@ class RunMetadataTest(unittest.TestCase):
                 container.get("env", []),
             )
 
+    def test_envelope_use_lpa_gate(self):
+        test = {
+            "name": "step1-lpa",
+            "type": "locust",
+            "targetCluster": "dev",
+            "file": "/app/tests/glutton.py",
+            "duration": "1m",
+            "users": 10,
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ENVELOPE_USE_LPA": "true",
+                "ENVELOPE_LPA_CPU_SCALE": "0.02",
+                "ENVELOPE_LPA_SIZE_SCALE": "1.0",
+            },
+        ):
+            orchestrator.validate_and_normalize_tests([test])
+            self.assertEqual(test["file"], "/app/tests/glutton.py")
+            subs = {"JOB_NAME": "j", "IMAGE": "i", "TAG": "t", "NAME": "n", "DEST": "d"}
+            subs.update(locust.job_subs(test))
+            text = orchestrator.render_template(RunnerSizingTest.TMPL, subs)
+            job = next(d for d in yaml.safe_load_all(text) if d and d.get("kind") == "Job")
+            container = job["spec"]["template"]["spec"]["containers"][0]
+            self.assertIn("/app/tests/glutton.py", container["args"])
+            self.assertIn(
+                {"name": "ENVELOPE_USE_LPA", "value": "true"},
+                container.get("env", []),
+            )
+            self.assertIn(
+                {"name": "ENVELOPE_LPA_CPU_SCALE", "value": "0.02"},
+                container.get("env", []),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
