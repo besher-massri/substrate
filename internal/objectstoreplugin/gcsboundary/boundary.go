@@ -42,6 +42,15 @@ const (
 // count, between one and ten, see
 // https://docs.cloud.google.com/iam/docs/downscoping-short-lived-credentials.
 func FromGrants(grants []actorscope.Grant) ([]downscope.AccessBoundaryRule, error) {
+	return FromGrantsWithActorPrefixLen(grants, 0)
+}
+
+// FromGrantsWithActorPrefixLen builds the rules like FromGrants, but when
+// actorPrefixLen > 0, any ReadWrite actor prefix (.../actors/<uid>/) is
+// truncated to the first actorPrefixLen characters of <uid> without a trailing
+// slash (.../actors/<uid[:actorPrefixLen]>) so actors sharing that hex shard
+// prefix can share a downscoped CAB rule.
+func FromGrantsWithActorPrefixLen(grants []actorscope.Grant, actorPrefixLen int) ([]downscope.AccessBoundaryRule, error) {
 	var rules []downscope.AccessBoundaryRule
 	for _, g := range grants {
 		bucket, path, err := splitGCS(g.Prefix)
@@ -54,6 +63,9 @@ func FromGrants(grants []actorscope.Grant) ([]downscope.AccessBoundaryRule, erro
 			role = roleObjectViewer
 		case actorscope.ReadWrite:
 			role = roleObjectAdmin
+			if actorPrefixLen > 0 {
+				path = shardActorObjectPath(path, actorPrefixLen)
+			}
 		default:
 			return nil, fmt.Errorf("grant on %s has unknown access %v", g.Prefix, g.Access)
 		}
@@ -66,6 +78,26 @@ func FromGrants(grants []actorscope.Grant) ([]downscope.AccessBoundaryRule, erro
 		})
 	}
 	return rules, nil
+}
+
+// shardActorObjectPath truncates the actor UID segment of an object path
+// ending in "/actors/<uid>/" to its first prefixLen characters (without a
+// trailing slash) so startsWith matches every actor UID in that prefix shard.
+func shardActorObjectPath(path string, prefixLen int) string {
+	if prefixLen <= 0 {
+		return path
+	}
+	trimmed := strings.TrimSuffix(path, "/")
+	const marker = "/actors/"
+	idx := strings.LastIndex(trimmed, marker)
+	if idx < 0 {
+		return path
+	}
+	actorID := trimmed[idx+len(marker):]
+	if len(actorID) <= prefixLen || strings.Contains(actorID, "/") {
+		return path
+	}
+	return trimmed[:idx+len(marker)+prefixLen]
 }
 
 // splitGCS returns the bucket and object path of a gs:// prefix, the path with

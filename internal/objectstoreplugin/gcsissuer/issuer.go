@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -55,18 +57,37 @@ const (
 	// defaultCacheSize bounds the per-actor cache. A miss costs an exchange,
 	// never correctness.
 	defaultCacheSize = 100_000
+	// defaultROCacheSize bounds the shared boundary-rule cache (used when
+	// cold actors restore from a shared template tag or when actor prefixes
+	// are sharded by hex prefix).
+	defaultROCacheSize = 10_000
+	// defaultActorPrefixLen is the default hex prefix shard length used for
+	// ReadWrite actor snapshot prefixes so STS token minting stays within
+	// project rate limits.
+	defaultActorPrefixLen = 1
 	// stsTimeout bounds one exchange. The downscope package does not take a
 	// per-call context, so the client's timeout is the only bound.
 	stsTimeout = 30 * time.Second
 )
 
 // Issuer exchanges the pod's credential for per-actor downscoped tokens and
-// caches them by actor UID.
+// caches them by actor UID (and by boundary rules for shared tag or prefix-sharded grants).
 type Issuer struct {
-	source oauth2.TokenSource
-	client *http.Client
-	now    func() time.Time
-	cache  *lru.Cache
+	source         oauth2.TokenSource
+	client         *http.Client
+	now            func() time.Time
+	actorPrefixLen int
+
+	mu       sync.Mutex
+	cache    *lru.Cache
+	roCache  *lru.Cache
+	inflight map[string]*inflightMint
+}
+
+type inflightMint struct {
+	done chan struct{}
+	tok  credential.Token
+	err  error
 }
 
 // entry is a cached token with the grants it was minted for, so a request can
@@ -94,14 +115,23 @@ func WithCacheSize(n int) Option {
 	return func(i *Issuer) { i.cache = lru.New(max(n, 1)) }
 }
 
+// WithActorPrefixLen configures the hex prefix shard length for ReadWrite
+// actor snapshot prefixes (0 disables prefix sharding and uses full actor UIDs).
+func WithActorPrefixLen(n int) Option {
+	return func(i *Issuer) { i.actorPrefixLen = max(n, 0) }
+}
+
 // New returns an Issuer whose source credential is the default credential
 // chain, unless an option replaces it. The credential keeps refreshing for the
 // Issuer's whole life, so ctx is detached from cancellation.
 func New(ctx context.Context, opts ...Option) (*Issuer, error) {
 	i := &Issuer{
-		client: &http.Client{Timeout: stsTimeout},
-		now:    time.Now,
-		cache:  lru.New(defaultCacheSize),
+		client:         &http.Client{Timeout: stsTimeout},
+		now:            time.Now,
+		actorPrefixLen: defaultActorPrefixLen,
+		cache:          lru.New(defaultCacheSize),
+		roCache:        lru.New(defaultROCacheSize),
+		inflight:       make(map[string]*inflightMint),
 	}
 	for _, o := range opts {
 		o(i)
@@ -135,7 +165,10 @@ func New(ctx context.Context, opts ...Option) (*Issuer, error) {
 // completed suspend, and the cached token still covers that, a hit. They
 // widen when a never-suspended actor is repointed to another storage
 // location, and the cached token lacks it, a mint. So the common path costs
-// nothing and a repoint never hands out a token GCS would refuse.
+// nothing and a repoint never hands out a token GCS would refuse. When all
+// requested grants are ReadOnly (such as a cold restore from a shared template
+// tag) or when actorPrefixLen > 0 shards ReadWrite actor prefixes, the token
+// is also cached by its canonical access boundary rules in roCache.
 //
 // A grant set the access boundary cannot express fails with codes.Internal.
 // Every other failure is an STS or network error and carries no code.
@@ -145,21 +178,106 @@ func (i *Issuer) Issue(ctx context.Context, actorUID string, grants []actorscope
 		// token, but an actor with no grants must get nothing.
 		return credential.Token{}, status.Error(codes.Internal, "actor has no storage grants")
 	}
+	rules, err := gcsboundary.FromGrantsWithActorPrefixLen(grants, i.actorPrefixLen)
+	if err != nil {
+		return credential.Token{}, status.Errorf(codes.Internal, "while building the access boundary: %v", err)
+	}
+	_, isRO := roGrantsKey(grants)
+	shareByRules := isRO || i.actorPrefixLen > 0
+	rKey := rulesCacheKey(rules)
+
 	if !force {
+		i.mu.Lock()
 		if v, ok := i.cache.Get(actorUID); ok {
 			if e := v.(entry); covers(e.grants, grants) && e.token.Expiry.Sub(i.now()) >= minServeLifetime {
+				i.mu.Unlock()
 				return e.token, nil
 			}
 		}
+		if shareByRules && i.roCache != nil {
+			if v, ok := i.roCache.Get(rKey); ok {
+				if e := v.(entry); e.token.Expiry.Sub(i.now()) >= minServeLifetime {
+					i.mu.Unlock()
+					return e.token, nil
+				}
+			}
+			if call, ok := i.inflight[rKey]; ok {
+				i.mu.Unlock()
+				select {
+				case <-call.done:
+					if call.err == nil && call.tok.Expiry.Sub(i.now()) >= minServeLifetime {
+						i.mu.Lock()
+						i.cache.Add(actorUID, entry{token: call.tok, grants: slices.Clone(grants)})
+						i.mu.Unlock()
+					}
+					return call.tok, call.err
+				case <-ctx.Done():
+					return credential.Token{}, ctx.Err()
+				}
+			}
+			call := &inflightMint{done: make(chan struct{})}
+			i.inflight[rKey] = call
+			i.mu.Unlock()
+			tok, err := i.mintRules(ctx, rules)
+			call.tok, call.err = tok, err
+			i.mu.Lock()
+			delete(i.inflight, rKey)
+			if err == nil && tok.Expiry.Sub(i.now()) >= minServeLifetime {
+				ent := entry{token: tok, grants: slices.Clone(grants)}
+				i.cache.Add(actorUID, ent)
+				i.roCache.Add(rKey, ent)
+			}
+			close(call.done)
+			i.mu.Unlock()
+			return tok, err
+		}
+		i.mu.Unlock()
 	}
-	tok, err := i.mint(ctx, grants)
+	tok, err := i.mintRules(ctx, rules)
 	if err != nil {
 		return credential.Token{}, err
 	}
 	if tok.Expiry.Sub(i.now()) >= minServeLifetime {
-		i.cache.Add(actorUID, entry{token: tok, grants: slices.Clone(grants)})
+		ent := entry{token: tok, grants: slices.Clone(grants)}
+		i.mu.Lock()
+		i.cache.Add(actorUID, ent)
+		if shareByRules && i.roCache != nil {
+			i.roCache.Add(rKey, ent)
+		}
+		i.mu.Unlock()
 	}
 	return tok, nil
+}
+
+// rulesCacheKey returns a canonical cache key for a slice of access boundary
+// rules so requests producing identical rules share the same cached token.
+func rulesCacheKey(rules []downscope.AccessBoundaryRule) string {
+	parts := make([]string, len(rules))
+	for idx, r := range rules {
+		var expr string
+		if r.Condition != nil {
+			expr = r.Condition.Expression
+		}
+		parts[idx] = r.AvailableResource + "\x00" + strings.Join(r.AvailablePermissions, ",") + "\x00" + expr
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, "\x01")
+}
+
+// roGrantsKey returns a canonical cache key and true when every grant in
+// grants is ReadOnly, or ("", false) when any grant permits writes.
+func roGrantsKey(grants []actorscope.Grant) (string, bool) {
+	for _, g := range grants {
+		if g.Access != actorscope.ReadOnly {
+			return "", false
+		}
+	}
+	parts := make([]string, len(grants))
+	for idx, g := range grants {
+		parts[idx] = g.Prefix.String()
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, "\x00"), true
 }
 
 // covers reports whether a token minted with the cached grants can serve a
@@ -177,11 +295,9 @@ func covers(cached, requested []actorscope.Grant) bool {
 	return true
 }
 
-func (i *Issuer) mint(ctx context.Context, grants []actorscope.Grant) (credential.Token, error) {
-	rules, err := gcsboundary.FromGrants(grants)
-	if err != nil {
-		return credential.Token{}, status.Errorf(codes.Internal, "while building the access boundary: %v", err)
-	}
+// mintRules exchanges the root token at STS using the pre-validated access
+// boundary rules.
+func (i *Issuer) mintRules(ctx context.Context, rules []downscope.AccessBoundaryRule) (credential.Token, error) {
 	// The downscope package reads its HTTP client from the context but sends
 	// the STS request without one, so the caller's deadline is attached by the
 	// transport instead.

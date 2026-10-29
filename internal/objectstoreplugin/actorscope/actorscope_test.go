@@ -132,6 +132,15 @@ func TestFromActor(t *testing.T) {
 			actor: actorWith(gen(1, ownerTag, pending, tagURI)),
 			want:  []Grant{actorGrant},
 		},
+		{
+			name: "resuming from completed tag only grants read-only tag prefix",
+			actor: func() *ateapipb.Actor {
+				a := actorWith(gen(1, ownerTag, completed, tagURI))
+				a.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
+				return a
+			}(),
+			want: []Grant{tagGrant},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := FromActor(tc.actor)

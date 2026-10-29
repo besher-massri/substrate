@@ -235,15 +235,10 @@ func assetScheme() string {
 
 // useAmbientNodeCredentials reports whether the node plugin should use the
 // ambient node service account GCS client instead of per-actor STS exchange
-// when large-scale cluster mode or uncached shared-snapshot benchmark mode is
-// enabled.
+// when OBJECTSTORE_PLUGIN_AMBIENT_CREDENTIALS is explicitly enabled.
 func useAmbientNodeCredentials() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("OBJECTSTORE_PLUGIN_AMBIENT_CREDENTIALS"))) {
 	case "true", "1":
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ATELET_DISABLE_COLD_SHARED_CACHE"))) {
-	case "true", "1", "cold", "all":
 		return true
 	default:
 		return false

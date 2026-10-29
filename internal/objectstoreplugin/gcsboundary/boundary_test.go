@@ -91,3 +91,29 @@ func TestFromGrants_EscapesTheCELLiteral(t *testing.T) {
 		t.Errorf("celEscape = %s", got)
 	}
 }
+
+func TestFromGrantsWithActorPrefixLen(t *testing.T) {
+	grants := []actorscope.Grant{
+		{Prefix: prefix(t, "gs://snaps/ate-demo/atespaces/team-a/actors/9f1e-abcd"), Access: actorscope.ReadWrite},
+		{Prefix: prefix(t, "gs://snaps/ate-demo/atespaces/ate-golden/tags/7a3c"), Access: actorscope.ReadOnly},
+	}
+	b, err := FromGrantsWithActorPrefixLen(grants, 1)
+	if err != nil {
+		t.Fatalf("FromGrantsWithActorPrefixLen: %v", err)
+	}
+	want := []downscope.AccessBoundaryRule{
+		{
+			AvailableResource:    "//storage.googleapis.com/projects/_/buckets/snaps",
+			AvailablePermissions: []string{"inRole:roles/storage.objectAdmin"},
+			Condition:            &downscope.AvailabilityCondition{Expression: "resource.name.startsWith('projects/_/buckets/snaps/objects/ate-demo/atespaces/team-a/actors/9')"},
+		},
+		{
+			AvailableResource:    "//storage.googleapis.com/projects/_/buckets/snaps",
+			AvailablePermissions: []string{"inRole:roles/storage.objectViewer"},
+			Condition:            &downscope.AvailabilityCondition{Expression: "resource.name.startsWith('projects/_/buckets/snaps/objects/ate-demo/atespaces/ate-golden/tags/7a3c/')"},
+		},
+	}
+	if diff := cmp.Diff(want, b); diff != "" {
+		t.Errorf("rules (-want +got):\n%s", diff)
+	}
+}

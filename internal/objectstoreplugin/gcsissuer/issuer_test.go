@@ -98,7 +98,7 @@ func newTestIssuer(t *testing.T, sts *fakeSTS, src oauth2.TokenSource, now func(
 	t.Cleanup(srv.Close)
 	target, _ := url.Parse(srv.URL)
 	client := &http.Client{Transport: redirect{sts: sts, target: target}}
-	i, err := New(t.Context(), WithTokenSource(src), WithHTTPClient(client), WithClock(now), WithCacheSize(2))
+	i, err := New(t.Context(), WithTokenSource(src), WithHTTPClient(client), WithClock(now), WithCacheSize(2), WithActorPrefixLen(0))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -182,6 +182,25 @@ func TestIssue_CachesPerActorUntilNearExpiry(t *testing.T) {
 	}
 	if sts.calls != 3 {
 		t.Fatalf("a token with under %v left should be re-minted, STS calls = %d", minServeLifetime, sts.calls)
+	}
+}
+
+func TestIssue_SharesReadOnlyTagTokenAcrossActors(t *testing.T) {
+	now := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	sts := &fakeSTS{t: t}
+	i := newTestIssuer(t, sts, staticSource(now.Add(time.Hour)), func() time.Time { return now })
+
+	tagOnly := []actorscope.Grant{roGrant}
+	first, err := i.Issue(t.Context(), "cold-1", tagOnly, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := i.Issue(t.Context(), "cold-2", tagOnly, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sts.calls != 1 || second != first {
+		t.Fatalf("read-only tag restore across 2 cold actors made %d STS calls (want 1) or returned different tokens", sts.calls)
 	}
 }
 
@@ -296,7 +315,7 @@ func TestWithCacheSize_ZeroIsBounded(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(sts.handler))
 	t.Cleanup(srv.Close)
 	target, _ := url.Parse(srv.URL)
-	i, err := New(t.Context(), WithTokenSource(staticSource(now.Add(time.Hour))), WithHTTPClient(&http.Client{Transport: redirect{sts: sts, target: target}}), WithClock(func() time.Time { return now }), WithCacheSize(0))
+	i, err := New(t.Context(), WithTokenSource(staticSource(now.Add(time.Hour))), WithHTTPClient(&http.Client{Transport: redirect{sts: sts, target: target}}), WithClock(func() time.Time { return now }), WithCacheSize(0), WithActorPrefixLen(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,6 +326,31 @@ func TestWithCacheSize_ZeroIsBounded(t *testing.T) {
 	}
 	if i.cache.Len() != 1 {
 		t.Fatalf("cache len = %d, want 1", i.cache.Len())
+	}
+}
+
+func TestIssue_SharesBucketedActorPrefixAcrossActors(t *testing.T) {
+	now := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	sts := &fakeSTS{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(sts.handler))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	i, err := New(t.Context(), WithTokenSource(staticSource(now.Add(time.Hour))), WithHTTPClient(&http.Client{Transport: redirect{sts: sts, target: target}}), WithClock(func() time.Time { return now }), WithActorPrefixLen(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g1 := []actorscope.Grant{{Prefix: prefix("gs://snaps/root/atespaces/team-a/actors/9f1e-1111"), Access: actorscope.ReadWrite}}
+	g2 := []actorscope.Grant{{Prefix: prefix("gs://snaps/root/atespaces/team-a/actors/9a22-2222"), Access: actorscope.ReadWrite}}
+	first, err := i.Issue(t.Context(), "9f1e-1111", g1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := i.Issue(t.Context(), "9a22-2222", g2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sts.calls != 1 || second != first {
+		t.Fatalf("same 1-hex-char shard across 2 actors made %d STS calls (want 1) or returned different tokens", sts.calls)
 	}
 }
 

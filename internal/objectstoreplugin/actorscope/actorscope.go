@@ -62,9 +62,10 @@ type Grant struct {
 //
 //   - Every durable URI names the storage location it sits under. For each
 //     location seen, the actor gets ReadWrite on its own prefix there,
-//     <location>/atespaces/<atespace>/actors/<uid>. So the grant exists from
-//     the first generation on, before the actor has uploaded anything, and
-//     a repointed actor keeps both locations.
+//     <location>/atespaces/<atespace>/actors/<uid>, except while the actor is
+//     in ACTOR_STATE_RESUMING from a completed TAG-owned snapshot alone (where
+//     Restore only reads the shared tag and never writes to the actor's own
+//     prefix).
 //   - Each TAG-owned generation with a COMPLETED durable URI grants ReadOnly
 //     on the tag's prefix. That is the golden or tag the actor was created
 //     from, listed until the actor's own first snapshot completes.
@@ -84,6 +85,7 @@ func FromActor(actor *ateapipb.Actor) ([]Grant, error) {
 			grants = append(grants, g)
 		}
 	}
+	resumingFromTagOnly := isResumingFromCompletedTagOnly(actor.GetStatus())
 	for _, gen := range actor.GetStatus().GetSnapshots() {
 		durable := gen.GetDurableSnapshot()
 		uri := durable.GetObject().GetSnapshotUri()
@@ -98,7 +100,9 @@ func FromActor(actor *ateapipb.Actor) ([]Grant, error) {
 		if err != nil {
 			return nil, fmt.Errorf("snapshot generation %d of actor %s/%s: %w", gen.GetGeneration(), meta.GetAtespace(), meta.GetName(), err)
 		}
-		add(own, ReadWrite)
+		if !resumingFromTagOnly {
+			add(own, ReadWrite)
+		}
 		switch gen.GetOwner() {
 		case ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR:
 			// Its own prefix is already granted above.
@@ -119,4 +123,29 @@ func FromActor(actor *ateapipb.Actor) ([]Grant, error) {
 		return grants[i].Prefix.String() < grants[j].Prefix.String()
 	})
 	return grants, nil
+}
+
+// isResumingFromCompletedTagOnly reports whether status is in
+// ACTOR_STATE_RESUMING and every durable snapshot generation on the actor is a
+// completed TAG-owned snapshot. During that restore, atelet only downloads the
+// shared tag snapshot and never writes to the actor's own prefix, so granting
+// ReadOnly on the tag prefix alone enforces least privilege and allows
+// gcsissuer to share the read-only tag CAB token across cold restores.
+func isResumingFromCompletedTagOnly(status *ateapipb.ActorStatus) bool {
+	if status.GetState() != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+		return false
+	}
+	hasCompletedTag := false
+	for _, gen := range status.GetSnapshots() {
+		durable := gen.GetDurableSnapshot()
+		if durable.GetObject().GetSnapshotUri() == "" {
+			continue
+		}
+		if gen.GetOwner() != ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG ||
+			durable.GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED {
+			return false
+		}
+		hasCompletedTag = true
+	}
+	return hasCompletedTag
 }

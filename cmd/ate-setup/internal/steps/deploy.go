@@ -782,9 +782,6 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 	if size100 && apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] == "" {
 		apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] = "64"
 	}
-	if size100 && pluginEnv["OBJECTSTORE_PLUGIN_AMBIENT_CREDENTIALS"] == "" {
-		pluginEnv["OBJECTSTORE_PLUGIN_AMBIENT_CREDENTIALS"] = "true"
-	}
 
 	for _, obj := range objs {
 		kind := obj.GetKind()

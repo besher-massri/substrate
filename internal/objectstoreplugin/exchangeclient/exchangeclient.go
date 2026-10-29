@@ -30,7 +30,6 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/oauth2"
-	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -61,8 +60,9 @@ type Config struct {
 
 // Source implements objectstoreplugin.Credentials for GCS.
 type Source struct {
-	exchange exchangepb.CredentialExchangeClient
-	conn     io.Closer
+	exchange      exchangepb.CredentialExchangeClient
+	conn          io.Closer
+	transportPool *objectstorage.GCSTransportPool
 	// newClient builds the storage client a token is used through.
 	newClient func(ctx context.Context, tok credential.Token) (objectstorage.ObjectStorage, error)
 	now       func() time.Time
@@ -71,6 +71,10 @@ type Source struct {
 	// closes a client that leaves the cache. A transfer still using it
 	// finishes on it, and its connections close on their own once idle.
 	cache *lru.Cache
+	// tokenClients maps an access token string to the storage client built for
+	// it so actors receiving the same shared-tag ReadOnly CAB token on a node
+	// share the same client wrapper.
+	tokenClients *lru.Cache
 }
 
 // entry is a token the exchange returned for one JWT and the storage client
@@ -94,25 +98,39 @@ func New(cfg Config) (*Source, error) {
 	if err != nil {
 		return nil, fmt.Errorf("exchangeclient: while creating the exchange client: %w", err)
 	}
-	s := newSource(exchangepb.NewCredentialExchangeClient(conn), newGCSClient)
+	transportPool := objectstorage.NewGCSTransportPool()
+	s := newSource(exchangepb.NewCredentialExchangeClient(conn), newGCSClientWithPool(transportPool))
 	s.conn = conn
+	s.transportPool = transportPool
 	return s, nil
 }
 
 func newSource(exchange exchangepb.CredentialExchangeClient, newClient func(context.Context, credential.Token) (objectstorage.ObjectStorage, error)) *Source {
-	return &Source{exchange: exchange, newClient: newClient, now: time.Now, cache: lru.New(defaultCacheSize)}
+	return &Source{
+		exchange:     exchange,
+		newClient:    newClient,
+		now:          time.Now,
+		cache:        lru.New(defaultCacheSize),
+		tokenClients: lru.New(defaultCacheSize),
+	}
 }
 
-// newGCSClient builds a client that authenticates with tok alone. It outlives
-// the request that built it, so it must not carry that request's
-// cancellation.
-func newGCSClient(ctx context.Context, tok credential.Token) (objectstorage.ObjectStorage, error) {
-	source := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok.AccessToken, Expiry: tok.Expiry})
-	return objectstorage.NewGCSClient(context.WithoutCancel(ctx), option.WithTokenSource(source))
+// newGCSClientWithPool returns a client builder that authenticates with tok
+// alone while sharing the warm HTTP/2 transports in pool across all 1 + 8
+// pooled storage.Client instances.
+func newGCSClientWithPool(pool *objectstorage.GCSTransportPool) func(context.Context, credential.Token) (objectstorage.ObjectStorage, error) {
+	return func(ctx context.Context, tok credential.Token) (objectstorage.ObjectStorage, error) {
+		source := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok.AccessToken, Expiry: tok.Expiry})
+		return objectstorage.NewGCSClientWithTransportPool(context.WithoutCancel(ctx), pool, source)
+	}
 }
 
-// Close closes the connection to the exchange.
+// Close closes the connection to the exchange and any idle pooled HTTP/2
+// connections.
 func (s *Source) Close() error {
+	if s.transportPool != nil {
+		s.transportPool.CloseIdleConnections()
+	}
 	if s.conn == nil {
 		return nil
 	}
@@ -147,14 +165,28 @@ func (s *Source) Client(ctx context.Context, actorJWT string, force bool) (objec
 	if tok.AccessToken == "" {
 		return nil, status.Error(codes.Internal, "the exchange returned no access token")
 	}
-	client, err := s.newClient(ctx, tok)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "while building the actor's storage client: %v", err)
+	var client objectstorage.ObjectStorage
+	if !force && s.tokenClients != nil {
+		if v, ok := s.tokenClients.Get(tok.AccessToken); ok {
+			if e := v.(*entry); e.token.Expiry.Sub(s.now()) >= credential.MinServeLifetime {
+				client = e.client
+			}
+		}
+	}
+	if client == nil {
+		client, err = s.newClient(ctx, tok)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "while building the actor's storage client: %v", err)
+		}
 	}
 	// A token minted inside the source credential's end-of-hour window is
 	// shorter than the floor. It serves this transfer and is not kept.
 	if tok.Expiry.Sub(s.now()) >= credential.MinServeLifetime {
-		s.cache.Add(actorJWT, &entry{token: tok, client: client})
+		ent := &entry{token: tok, client: client}
+		s.cache.Add(actorJWT, ent)
+		if s.tokenClients != nil {
+			s.tokenClients.Add(tok.AccessToken, ent)
+		}
 	}
 	return client, nil
 }

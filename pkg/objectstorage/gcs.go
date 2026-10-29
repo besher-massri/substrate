@@ -21,13 +21,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"os"
 	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/googleapis/gax-go/v2"
+	"golang.org/x/net/http2"
+	"golang.org/x/oauth2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
+	htransport "google.golang.org/api/transport/http"
 )
 
 // describeGCSError describes a GCS API error in err's chain for
@@ -77,6 +83,113 @@ func NewGCSClient(ctx context.Context, opts ...option.ClientOption) (ObjectStora
 	}
 	setRetry(client)
 	return &gcsClient{client: client, pool: newPool(ctx, opts)}, nil
+}
+
+// GCSTransportPool holds reusable base HTTP/2 transports (1 primary transport
+// plus uploadPoolSize pooled transports) so per-actor GCS clients can attach
+// their own scoped OAuth2 token sources while sharing the node's warm TCP/TLS
+// connection pools to storage.googleapis.com.
+type GCSTransportPool struct {
+	primary *http.Transport
+	pool    []*http.Transport
+}
+
+// NewGCSTransportPool allocates 1 + uploadPoolSize HTTP/2 base transports
+// configured with the same connection pool and HTTP/2 read-idle settings as
+// google.golang.org/api/transport/http.
+func NewGCSTransportPool() *GCSTransportPool {
+	p := &GCSTransportPool{
+		primary: newGCSBaseTransport(),
+		pool:    make([]*http.Transport, uploadPoolSize),
+	}
+	for i := range p.pool {
+		p.pool[i] = newGCSBaseTransport()
+	}
+	return p
+}
+
+// CloseIdleConnections closes any idle connections across all transports in the pool.
+func (p *GCSTransportPool) CloseIdleConnections() {
+	if p == nil {
+		return
+	}
+	if p.primary != nil {
+		p.primary.CloseIdleConnections()
+	}
+	for _, tr := range p.pool {
+		if tr != nil {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
+// newGCSBaseTransport builds a base *http.Transport matching the GCS SDK's
+// defaultBaseTransport settings (MaxIdleConnsPerHost=100, HTTP/2 ReadIdleTimeout=31s).
+func newGCSBaseTransport() *http.Transport {
+	var tr *http.Transport
+	if def, ok := http.DefaultTransport.(*http.Transport); ok && def != nil {
+		tr = def.Clone()
+	} else {
+		tr = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	tr.MaxIdleConnsPerHost = 100
+	if h2, err := http2.ConfigureTransports(tr); err == nil {
+		h2.ReadIdleTimeout = 31 * time.Second
+	}
+	return tr
+}
+
+// newStorageClientOnBaseTransport wraps base with a per-actor OAuth2 transport
+// and OpenTelemetry instrumentation via htransport.NewTransport, then builds a
+// storage.Client with RetryAlways.
+func newStorageClientOnBaseTransport(ctx context.Context, base http.RoundTripper, ts oauth2.TokenSource) (*storage.Client, error) {
+	rt, err := htransport.NewTransport(ctx, base,
+		option.WithScopes(storage.ScopeFullControl, "https://www.googleapis.com/auth/cloud-platform"),
+		option.WithTokenSource(ts),
+	)
+	if err != nil {
+		return nil, err
+	}
+	c, err := storage.NewClient(ctx, option.WithHTTPClient(&http.Client{Transport: rt}))
+	if err != nil {
+		return nil, err
+	}
+	setRetry(c)
+	return c, nil
+}
+
+// NewGCSClientWithTransportPool returns a GCS-backed ObjectStorage that
+// authenticates every request with ts while reusing all 1 + uploadPoolSize
+// warm HTTP/2 connection pools in pool. When pool is nil or
+// STORAGE_EMULATOR_HOST is set, it falls back to NewGCSClient.
+func NewGCSClientWithTransportPool(ctx context.Context, pool *GCSTransportPool, ts oauth2.TokenSource) (ObjectStorage, error) {
+	if pool == nil || os.Getenv("STORAGE_EMULATOR_HOST") != "" {
+		return NewGCSClient(ctx, option.WithTokenSource(ts))
+	}
+	client, err := newStorageClientOnBaseTransport(ctx, pool.primary, ts)
+	if err != nil {
+		return nil, err
+	}
+	clients := make([]*storage.Client, 0, len(pool.pool))
+	for _, base := range pool.pool {
+		c, err := newStorageClientOnBaseTransport(ctx, base, ts)
+		if err != nil {
+			break
+		}
+		clients = append(clients, c)
+	}
+	return &gcsClient{client: client, pool: clients}, nil
 }
 
 // setRetry makes every operation on c retry transient errors (408, 429, 5xx)
