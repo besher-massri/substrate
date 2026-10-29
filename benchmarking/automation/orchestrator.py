@@ -319,7 +319,43 @@ def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] =
     return yaml.safe_dump_all(docs)
 
 
+def disable_gmp_kubelet_scraping() -> None:
+    """Disable GKE Managed Service for Prometheus (GMP) kubelet/cAdvisor
+    scraping and filter out per-actor sandbox sub-cgroups in
+    gmp-public/operatorconfig/config so large-scale runs do not flood
+    Cloud Monitoring / Monarch single-target ranges (b/579137627).
+    Benchmark telemetry reads from the in-cluster benchmarking/prometheus
+    instance rather than GMP.
+    """
+    patch_payload = json.dumps(
+        {
+            "collection": {
+                "kubeletScraping": None,
+                "filter": {
+                    "matchOneOf": [
+                        '{__name__=~"container_pressure_.*|container_memory_working_set_bytes|container_cpu_usage_seconds_total",id!~".*/(sb-[^/]+|cri-containerd-[^/]+\\\\.scope/.+|ate-actors/.+)"}'
+                    ]
+                },
+            }
+        }
+    )
+    run_no_check(
+        [
+            "kubectl",
+            "-n",
+            "gmp-public",
+            "patch",
+            "operatorconfig",
+            "config",
+            "--type=merge",
+            "-p",
+            patch_payload,
+        ]
+    )
+
+
 def wait_for_no_active_runners(timeout: int = 300) -> None:
+    disable_gmp_kubelet_scraping()
     start = time.time()
     while time.time() - start < timeout:
         r = subprocess.run(
