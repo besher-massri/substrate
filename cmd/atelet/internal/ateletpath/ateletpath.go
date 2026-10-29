@@ -76,8 +76,18 @@ func ActorPath(actorUID string) string {
 
 // ActorSnapshotPath is the actor's snapshot staging directory, which may be on
 // a different filesystem from ActorPath. Checkpoints rename files between its
-// subdirectories, so they must stay on one filesystem.
+// subdirectories, so they must stay on one filesystem. Directories are sharded
+// by a two-character prefix of actorUID so a node hosting tens of thousands of
+// local snapshots on tmpfs does not contend on a single flat parent directory
+// inode lock.
 func ActorSnapshotPath(actorUID string) string {
+	if len(actorUID) >= 2 {
+		return filepath.Join(
+			nodepath.SnapshotsDir,
+			actorUID[:2],
+			actorUID,
+		)
+	}
 	return filepath.Join(
 		nodepath.SnapshotsDir,
 		actorUID,

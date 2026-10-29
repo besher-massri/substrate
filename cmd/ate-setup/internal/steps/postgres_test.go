@@ -139,7 +139,9 @@ func TestApplyPostgresSize100Overrides(t *testing.T) {
 	cm := findObject(objs, "ConfigMap", "postgres-config")
 	data, _, _ := unstructured.NestedStringMap(cm.Object, "data")
 	for _, want := range []string{
-		"shared_buffers = 256GB",
+		"shared_buffers = 512GB",
+		"effective_cache_size = 800GB",
+		"maintenance_work_mem = 16GB",
 		"max_connections = 2000",
 		"max_wal_size = 192GB",
 		"checkpoint_timeout = 60min",

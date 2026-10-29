@@ -344,7 +344,8 @@ func applyPostgresSize10Overrides(objs []*unstructured.Unstructured, confPatch [
 	return nil
 }
 
-// applyPostgresSize100Overrides raises shared_buffers to 256GB, max_connections
+// applyPostgresSize100Overrides raises shared_buffers to 512GB,
+// effective_cache_size to 800GB, maintenance_work_mem to 16GB, max_connections
 // to 2000, max_wal_size to 192GB, checkpoint_timeout to 60min, and bgwriter
 // pacing on configmap/postgres-config, and resizes statefulset/postgres (plus
 // its data PVC to 1000Gi) for a dedicated c3d-highmem-180 node under size100.
@@ -371,7 +372,9 @@ func applyPostgresSize100Overrides(objs []*unstructured.Unstructured) error {
 	if err != nil || conf == "" {
 		return fmt.Errorf("%s carries no postgresql.conf to resize for size100", kube.Describe(configMap))
 	}
-	conf = strings.ReplaceAll(conf, "shared_buffers = 35GB", "shared_buffers = 256GB")
+	conf = strings.ReplaceAll(conf, "shared_buffers = 35GB", "shared_buffers = 512GB")
+	conf = strings.ReplaceAll(conf, "effective_cache_size = 100GB", "effective_cache_size = 800GB")
+	conf = strings.ReplaceAll(conf, "maintenance_work_mem = 2GB", "maintenance_work_mem = 16GB")
 	conf = strings.ReplaceAll(conf, "max_connections = 300", "max_connections = 2000")
 	conf = strings.ReplaceAll(conf, "max_wal_size = 16GB", "max_wal_size = 192GB\n    checkpoint_timeout = 60min\n    bgwriter_delay = 10ms\n    bgwriter_lru_maxpages = 1000\n    bgwriter_lru_multiplier = 4.0")
 	if err := unstructured.SetNestedField(configMap.Object, conf, "data", "postgresql.conf"); err != nil {

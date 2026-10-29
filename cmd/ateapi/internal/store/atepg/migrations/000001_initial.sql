@@ -29,7 +29,7 @@ CREATE TABLE actors (
     version   bigint NOT NULL,
     proto     bytea NOT NULL,
     PRIMARY KEY (atespace, name)
-);
+) WITH (fillfactor = 75);
 
 CREATE TABLE actor_egress_policies (
     atespace    text NOT NULL,
@@ -70,7 +70,7 @@ CREATE TABLE workers (
     uid      text NOT NULL UNIQUE,
     version  bigint NOT NULL,
     proto    bytea NOT NULL
-);
+) WITH (fillfactor = 75);
 
 -- One row per Actor, keyed by Actor UID because an Actor has at most one
 -- Worker. Kept separate from workers so Worker reads, writes, and watch events
