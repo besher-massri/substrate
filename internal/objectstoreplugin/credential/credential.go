@@ -27,6 +27,8 @@ type Token struct {
 
 // MinServeLifetime is the least remaining lifetime a cached Token is served
 // with, on both sides of the exchange, so a transfer never starts on a token
-// about to expire. There is no mid-transfer refresh. A token with less left is
-// still returned to the caller that asked for it, but not cached.
-const MinServeLifetime = 20 * time.Minute
+// about to expire. It is set to 10s (well below the GKE/GCE metadata server's
+// early-refresh window and the 60s EarlyTokenRefresh buffer on the root token
+// source) so that when cached downscoped tokens reach MinServeLifetime, the
+// underlying root token has already rotated to a fresh 1-hour expiry.
+const MinServeLifetime = 10 * time.Second

@@ -165,7 +165,7 @@ func TestClient_DropsTheRefusedEntryWhenTheForcedTokenIsShort(t *testing.T) {
 	if _, err := s.Client(t.Context(), "jwt", false); err != nil {
 		t.Fatal(err)
 	}
-	exchange.token, exchange.expiry = "short", now.Add(credential.MinServeLifetime-time.Minute)
+	exchange.token, exchange.expiry = "short", now.Add(credential.MinServeLifetime-time.Second)
 	if client, err := s.Client(t.Context(), "jwt", true); err != nil || tokenOf(client) != "short" {
 		t.Fatalf("forced client = %v, %v, want one on the short token", client, err)
 	}
@@ -192,7 +192,7 @@ func TestClient_EvictsTheOldestJWTWhenFull(t *testing.T) {
 
 func TestClient_UsesButDoesNotCacheAShortToken(t *testing.T) {
 	now := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)
-	exchange := &fakeExchange{token: "short", expiry: now.Add(credential.MinServeLifetime - time.Minute)}
+	exchange := &fakeExchange{token: "short", expiry: now.Add(credential.MinServeLifetime - time.Second)}
 	s, _ := newTestSource(exchange, now)
 	for range 2 {
 		client, err := s.Client(t.Context(), "jwt", false)

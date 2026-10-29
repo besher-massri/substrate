@@ -359,7 +359,7 @@ func TestIssue_DoesNotCacheAShortLivedToken(t *testing.T) {
 	// left. It is returned, so the transfer can try, but not cached.
 	now := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
 	sts := &fakeSTS{t: t}
-	i := newTestIssuer(t, sts, staticSource(now.Add(minServeLifetime-time.Minute)), func() time.Time { return now })
+	i := newTestIssuer(t, sts, staticSource(now.Add(minServeLifetime-time.Second)), func() time.Time { return now })
 	for range 2 {
 		tok, err := i.Issue(t.Context(), "9f1e", testGrants, false)
 		if err != nil {

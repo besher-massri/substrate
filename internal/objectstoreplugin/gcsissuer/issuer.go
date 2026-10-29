@@ -68,6 +68,10 @@ const (
 	// stsTimeout bounds one exchange. The downscope package does not take a
 	// per-call context, so the client's timeout is the only bound.
 	stsTimeout = 30 * time.Second
+	// earlyRootTokenRefresh ensures the root token source refreshes from the
+	// GKE/GCE metadata server before cached downscoped tokens reach
+	// minServeLifetime (10s).
+	earlyRootTokenRefresh = 60 * time.Second
 )
 
 // Issuer exchanges the pod's credential for per-actor downscoped tokens and
@@ -138,7 +142,8 @@ func New(ctx context.Context, opts ...Option) (*Issuer, error) {
 	}
 	if i.source == nil {
 		creds, err := google.FindDefaultCredentialsWithParams(context.WithoutCancel(ctx), google.CredentialsParams{
-			Scopes: []string{cloudPlatformScope},
+			Scopes:            []string{cloudPlatformScope},
+			EarlyTokenRefresh: earlyRootTokenRefresh,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("while loading the default credential: %w", err)

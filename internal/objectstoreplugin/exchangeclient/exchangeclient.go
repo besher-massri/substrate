@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -66,6 +67,7 @@ type Source struct {
 	// newClient builds the storage client a token is used through.
 	newClient func(ctx context.Context, tok credential.Token) (objectstorage.ObjectStorage, error)
 	now       func() time.Time
+	mu        sync.Mutex
 	// cache maps an actor JWT to its entry: the token the exchange returned
 	// for that JWT and the storage client built with the token. Nothing
 	// closes a client that leaves the cache. A transfer still using it
@@ -150,13 +152,20 @@ func (s *Source) Client(ctx context.Context, actorJWT string, force bool) (objec
 		return nil, status.Error(codes.InvalidArgument, "actor_jwt is required on GCS")
 	}
 	if !force {
+		s.mu.Lock()
 		if v, ok := s.cache.Get(actorJWT); ok {
 			if e := v.(*entry); e.token.Expiry.Sub(s.now()) >= credential.MinServeLifetime {
+				s.mu.Unlock()
 				return e.client, nil
 			}
 		}
+		s.cache.Remove(actorJWT)
+		s.mu.Unlock()
+	} else {
+		s.mu.Lock()
+		s.cache.Remove(actorJWT)
+		s.mu.Unlock()
 	}
-	s.cache.Remove(actorJWT)
 	resp, err := s.exchange.ExchangeActorJwt(ctx, &exchangepb.ExchangeActorJwtRequest{ActorJwt: actorJWT, Force: force})
 	if err != nil {
 		return nil, err
@@ -167,11 +176,13 @@ func (s *Source) Client(ctx context.Context, actorJWT string, force bool) (objec
 	}
 	var client objectstorage.ObjectStorage
 	if !force && s.tokenClients != nil {
+		s.mu.Lock()
 		if v, ok := s.tokenClients.Get(tok.AccessToken); ok {
 			if e := v.(*entry); e.token.Expiry.Sub(s.now()) >= credential.MinServeLifetime {
 				client = e.client
 			}
 		}
+		s.mu.Unlock()
 	}
 	if client == nil {
 		client, err = s.newClient(ctx, tok)
@@ -183,10 +194,12 @@ func (s *Source) Client(ctx context.Context, actorJWT string, force bool) (objec
 	// shorter than the floor. It serves this transfer and is not kept.
 	if tok.Expiry.Sub(s.now()) >= credential.MinServeLifetime {
 		ent := &entry{token: tok, client: client}
+		s.mu.Lock()
 		s.cache.Add(actorJWT, ent)
 		if s.tokenClients != nil {
 			s.tokenClients.Add(tok.AccessToken, ent)
 		}
+		s.mu.Unlock()
 	}
 	return client, nil
 }
