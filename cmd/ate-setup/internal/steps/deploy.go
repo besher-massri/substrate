@@ -730,6 +730,7 @@ var objectstorePluginEnvKeys = []string{
 	"AWS_REGION",
 	"GOOGLE_APPLICATION_CREDENTIALS",
 	"ATELET_DISABLE_COLD_SHARED_CACHE",
+	"OBJECTSTORE_PLUGIN_AMBIENT_CREDENTIALS",
 }
 
 // applyWorkloadRuntimeAndScaleOverrides mutates decoded workload objects in
@@ -780,6 +781,9 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 	}
 	if size100 && apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] == "" {
 		apiEnv["ATE_API_POSTGRES_POOL_MAX_CONNS"] = "64"
+	}
+	if size100 && pluginEnv["OBJECTSTORE_PLUGIN_AMBIENT_CREDENTIALS"] == "" {
+		pluginEnv["OBJECTSTORE_PLUGIN_AMBIENT_CREDENTIALS"] = "true"
 	}
 
 	for _, obj := range objs {

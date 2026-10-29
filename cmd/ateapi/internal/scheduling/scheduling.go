@@ -89,6 +89,13 @@ type workerNodeLookup interface {
 	WorkersByNode(node string) ([]*ateapipb.Worker, error)
 }
 
+// workerSlotIdleTracker is an optional interface implemented by caches that
+// record when a worker last had an actor slot released, allowing equal-load
+// ties to prefer workers whose free slots have been idle longest.
+type workerSlotIdleTracker interface {
+	WorkerLastSlotFreedNano(name string) int64
+}
+
 type scheduler struct {
 	source WorkerSource
 	// intn returns a uniformly distributed random value in [0,n).
@@ -124,12 +131,20 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 		return nil, fmt.Errorf("while listing workers: %w", err)
 	}
 
+	var idleTracker workerSlotIdleTracker
+	if len(constraints.RequiredNodes) == 0 {
+		idleTracker, _ = s.source.(workerSlotIdleTracker)
+	}
+
 	var candidates []candidate
 	for _, worker := range workers {
 		if !s.Applies(worker, constraints) {
 			continue
 		}
 		if cand, ok := checkRoom(worker, constraints.Limits); ok {
+			if idleTracker != nil {
+				cand.lastSlotFreedNano = idleTracker.WorkerLastSlotFreedNano(worker.GetMetadata().GetName())
+			}
 			candidates = append(candidates, cand)
 		}
 	}
@@ -146,10 +161,20 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 	if j >= i {
 		j++
 	}
-	if lessLoaded(&candidates[j], &candidates[i]) {
-		return candidates[j].worker, nil
+	best := &candidates[i]
+	if lessLoaded(&candidates[j], best) {
+		best = &candidates[j]
 	}
-	return candidates[i].worker, nil
+	if idleTracker != nil && len(candidates) > 2 {
+		samples := min(8, len(candidates))
+		for k := 2; k < samples; k++ {
+			idx := s.intn(len(candidates))
+			if lessLoaded(&candidates[idx], best) {
+				best = &candidates[idx]
+			}
+		}
+	}
+	return best.worker, nil
 }
 
 // workersForSchedule returns the workers to consider for constraints, using a
@@ -184,6 +209,9 @@ type candidate struct {
 	// resUtil is the worker's dominant compute-resource utilization in [0,1],
 	// or -1 if not yet computed.
 	resUtil float64
+	// lastSlotFreedNano is the UnixNano timestamp of the most recent actor-slot
+	// release on this worker, or 0 if unknown / never released.
+	lastSlotFreedNano int64
 }
 
 func (c *candidate) resourceUtilization() float64 {
@@ -196,7 +224,8 @@ func (c *candidate) resourceUtilization() float64 {
 // lessLoaded compares dominant utilization — the higher of actor-slot
 // utilization (allocated/capacity) and compute-resource utilization — so either
 // dimension can mark a worker as hot. Ties fall back to actor-slot utilization,
-// then to remaining actor slots.
+// then to remaining actor slots, then to older slot-release timestamp so
+// unpinned placements prefer slots that have been idle longest.
 func lessLoaded(a, b *candidate) bool {
 	aAlloc := int64(a.worker.GetStatus().GetAllocated().GetActors())
 	bAlloc := int64(b.worker.GetStatus().GetAllocated().GetActors())
@@ -215,7 +244,11 @@ func lessLoaded(a, b *candidate) bool {
 		return lhs < rhs
 	}
 
-	return aCap-aAlloc > bCap-bAlloc
+	if aFree, bFree := aCap-aAlloc, bCap-bAlloc; aFree != bFree {
+		return aFree > bFree
+	}
+
+	return a.lastSlotFreedNano < b.lastSlotFreedNano
 }
 
 // workerResourceUtilization returns the highest allocated/capacity ratio across

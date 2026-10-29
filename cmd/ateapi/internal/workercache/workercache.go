@@ -42,10 +42,11 @@ type Cache struct {
 	store          workerListWatcher
 	relistInterval time.Duration
 
-	mu       sync.RWMutex
-	workers  map[string]*ateapipb.Worker
-	byNode   map[string][]*ateapipb.Worker
-	handlers []func(*ateapipb.Worker)
+	mu            sync.RWMutex
+	workers       map[string]*ateapipb.Worker
+	byNode        map[string][]*ateapipb.Worker
+	lastSlotFreed map[string]int64
+	handlers      []func(*ateapipb.Worker)
 
 	ready atomic.Bool
 }
@@ -86,6 +87,7 @@ func New(store workerListWatcher, relistInterval time.Duration) *Cache {
 		relistInterval: relistInterval,
 		workers:        make(map[string]*ateapipb.Worker),
 		byNode:         make(map[string][]*ateapipb.Worker),
+		lastSlotFreed:  make(map[string]int64),
 	}
 }
 
@@ -172,7 +174,20 @@ func (c *Cache) Forget(name string) {
 	if old, ok := c.workers[name]; ok {
 		c.removeFromNodeLocked(name, old.GetNodeName())
 		delete(c.workers, name)
+		delete(c.lastSlotFreed, name)
 	}
+}
+
+// WorkerLastSlotFreedNano returns the UnixNano timestamp of the most recent
+// actor-slot release observed for worker name, or 0 if no slot release has
+// been recorded since the worker entered the cache. This allows the scheduler
+// to break equal-load ties in favor of workers whose free slots have been idle
+// longest, avoiding immediate slot theft from an actor in a brief suspend-resume
+// turn gap on that node.
+func (c *Cache) WorkerLastSlotFreedNano(name string) int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastSlotFreed[name]
 }
 
 // removeFromNodeLocked removes the worker with the given key from node's entry
@@ -332,12 +347,16 @@ func (c *Cache) applyEvent(event store.WorkerEvent) {
 		if existing, ok := c.workers[key]; ok {
 			c.removeFromNodeLocked(key, existing.GetNodeName())
 			delete(c.workers, key)
+			delete(c.lastSlotFreed, key)
 		}
 	case store.WorkerEventCreated, store.WorkerEventUpdated:
 		existing, ok := c.workers[key]
 		if !ok || event.Worker.GetMetadata().GetVersion() >= existing.GetMetadata().GetVersion() {
 			if ok && existing.GetNodeName() != event.Worker.GetNodeName() {
 				c.removeFromNodeLocked(key, existing.GetNodeName())
+			}
+			if ok && event.Worker.GetStatus().GetAllocated().GetActors() < existing.GetStatus().GetAllocated().GetActors() {
+				c.lastSlotFreed[key] = time.Now().UnixNano()
 			}
 			c.workers[key] = event.Worker
 			c.putByNodeLocked(key, event.Worker)

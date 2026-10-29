@@ -128,7 +128,7 @@ func (p *Persistence) writeAndAppendEventOnce(ctx context.Context, eventType sto
 
 const (
 	// Bound worker-event delivery latency in the absence of an xmin stall.
-	outboxPollInterval = 50 * time.Millisecond
+	outboxPollInterval = 15 * time.Millisecond
 
 	// Cap rows fetched per poll; a burst beyond it carries over to the next poll
 	// (events are delayed, never dropped).
