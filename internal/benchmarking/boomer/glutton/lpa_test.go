@@ -34,6 +34,7 @@ import (
 func resetLPAConfigForTest() {
 	lpaCfgOnce = sync.Once{}
 	lpaCfgVal = lpaConfig{}
+	globalLPAPhaseSeq.Store(0)
 }
 
 func TestLPADisabledByDefault(t *testing.T) {
@@ -64,6 +65,9 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 	if cfg.script == nil || len(cfg.script.Steps) != 61 {
 		t.Fatalf("loaded script steps = %d, want 61", len(cfg.script.Steps))
 	}
+	if len(cfg.validStartSteps) != 58 {
+		t.Fatalf("len(cfg.validStartSteps) = %d, want 58 (all 60 daily steps except 43 and 44)", len(cfg.validStartSteps))
+	}
 
 	svc, err := gluttonsvc.New(t.TempDir())
 	if err != nil {
@@ -71,6 +75,7 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 	}
 	defer svc.Close()
 
+	var serverErr error
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != runScriptPath {
 			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
@@ -88,6 +93,7 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 		}
 		resp, err := svc.RunScript(r.Context(), &req)
 		if err != nil {
+			serverErr = err
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -111,15 +117,40 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 		actorName: "sb-test-lpa",
 	}
 
-	// Execute all 61 steps of personal-assistant-light plus step 0 wrap-around
-	// against a real glutton.Service to verify every RAM/disk/ingest/CPU step
-	// succeeds in sequence.
-	for i := 0; i < len(cfg.script.Steps)+1; i++ {
-		wantIdx := (i + 1) % len(cfg.script.Steps)
+	// Execute step 0 (bootstrap) plus all 60 daily steps (1..60) and verify
+	// step 60 wraps around to step 1 (0300_dreaming) rather than re-running
+	// step 0 (0000_gateway_start).
+	for i := 0; i <= len(cfg.script.Steps); i++ {
+		wantIdx := i + 1
+		if i == len(cfg.script.Steps)-1 {
+			wantIdx = 1
+		} else if i == len(cfg.script.Steps) {
+			wantIdx = 2
+		}
 		actor.runLPAStep(context.Background())
+		if serverErr != nil {
+			t.Fatalf("RunScript failed at iteration %d: %v", i, serverErr)
+		}
 		if int(actor.lpaStepIdx) != wantIdx {
-			t.Fatalf("after step %d (%s), actor.lpaStepIdx = %d, want %d",
-				i, cfg.script.Steps[i%len(cfg.script.Steps)].Name, actor.lpaStepIdx, wantIdx)
+			t.Fatalf("after iteration %d, actor.lpaStepIdx = %d, want %d", i, actor.lpaStepIdx, wantIdx)
+		}
+	}
+
+	// Verify that actors staggered across all 58 valid post-bootstrap entry
+	// points execute their initial post-bootstrap step cleanly after step 0.
+	globalLPAPhaseSeq.Store(0)
+	for k, wantStart := range cfg.validStartSteps {
+		a := &gluttonActor{
+			cfg:       actor.cfg,
+			actorName: "sb-test-stagger",
+		}
+		a.runLPAStep(context.Background()) // step 0
+		if a.lpaStepIdx != wantStart {
+			t.Fatalf("staggered actor %d lpaStepIdx after step 0 = %d, want %d", k, a.lpaStepIdx, wantStart)
+		}
+		a.runLPAStep(context.Background()) // initial staggered step
+		if serverErr != nil {
+			t.Fatalf("staggered actor %d failed on step %d (%s): %v", k, wantStart, cfg.script.Steps[wantStart].Name, serverErr)
 		}
 	}
 }
