@@ -72,6 +72,7 @@ type lpaConfig struct {
 	sizeScale  float64
 	script     *agentsession.Script
 	ingestBuf  []byte
+	stepBodies [][]byte
 	loadErr    error
 }
 
@@ -81,7 +82,9 @@ var (
 )
 
 // loadLPAConfigFromEnv parses the ENVELOPE_USE_LPA environment variables and
-// loads the configured agentsession script when enabled.
+// loads the configured agentsession script when enabled, pre-marshaling each
+// step's RunScriptRequest protobuf once so concurrent VUs share the immutable
+// request byte slices without per-request heap allocations.
 func loadLPAConfigFromEnv() lpaConfig {
 	enabled := strings.EqualFold(strings.TrimSpace(os.Getenv(EnvEnvelopeUseLPA)), "true")
 	if !enabled {
@@ -97,8 +100,22 @@ func loadLPAConfigFromEnv() lpaConfig {
 
 	script, err := agentsession.Load(scriptName)
 	var ingestBuf []byte
+	var stepBodies [][]byte
 	if err == nil && script != nil {
 		ingestBuf = agentsession.MakeIngestBuf(script.Steps)
+		stepBodies = make([][]byte, len(script.Steps))
+		for i, step := range script.Steps {
+			req := step.ToRunScriptRequest(cpuScale, dwellScale, sizeScale, ingestBuf)
+			if req == nil {
+				continue
+			}
+			b, mErr := proto.Marshal(req)
+			if mErr != nil {
+				err = mErr
+				break
+			}
+			stepBodies[i] = b
+		}
 	}
 	return lpaConfig{
 		enabled:    true,
@@ -108,6 +125,7 @@ func loadLPAConfigFromEnv() lpaConfig {
 		sizeScale:  sizeScale,
 		script:     script,
 		ingestBuf:  ingestBuf,
+		stepBodies: stepBodies,
 		loadErr:    err,
 	}
 }
@@ -161,26 +179,33 @@ func (u *gluttonActor) runLPAStep(ctx context.Context) {
 		return
 	}
 
-	idx := u.lpaStepIdx % len(cfg.script.Steps)
+	idx := int(u.lpaStepIdx) % len(cfg.script.Steps)
 	step := cfg.script.Steps[idx]
 	stepMetric := "Step_" + step.Name
 
-	scriptReq := buildLPARunScriptRequest(step, cfg)
-	if scriptReq == nil {
+	var body []byte
+	if idx < len(cfg.stepBodies) {
+		body = cfg.stepBodies[idx]
+	} else {
+		scriptReq := buildLPARunScriptRequest(step, cfg)
+		if scriptReq != nil {
+			var err error
+			body, err = proto.Marshal(scriptReq)
+			if err != nil {
+				bmetrics.RecordFailure("http", "LPAStep", userClass, 0, err.Error())
+				bmetrics.RecordFailure("step", stepMetric, userClass, 0, err.Error())
+				return
+			}
+		}
+	}
+	if len(body) == 0 {
 		u.ping(ctx)
-		u.lpaStepIdx = (idx + 1) % len(cfg.script.Steps)
+		u.lpaStepIdx = uint16((idx + 1) % len(cfg.script.Steps))
 		return
 	}
 
 	ctx, span := u.cfg.Tracer.Start(ctx, "LPAStep")
 	defer span.End()
-
-	body, err := proto.Marshal(scriptReq)
-	if err != nil {
-		bmetrics.RecordFailure("http", "LPAStep", userClass, 0, err.Error())
-		bmetrics.RecordFailure("step", stepMetric, userClass, 0, err.Error())
-		return
-	}
 
 	start := time.Now()
 	httpResp, respBody, err := u.doHTTPPost(ctx, runScriptPath, body)
@@ -207,7 +232,7 @@ func (u *gluttonActor) runLPAStep(ctx context.Context) {
 		return
 	}
 
-	u.lpaStepIdx = (idx + 1) % len(cfg.script.Steps)
+	u.lpaStepIdx = uint16((idx + 1) % len(cfg.script.Steps))
 	boomerutil.LogSampledTrace(span, "LPAStep", clientLatency, boomerutil.SourceClient, nil)
 	bmetrics.RecordSuccess("http", "LPAStep", userClass, clientLatency, int64(len(respBody)))
 	bmetrics.RecordSuccess("step", stepMetric, userClass, clientLatency, 0)

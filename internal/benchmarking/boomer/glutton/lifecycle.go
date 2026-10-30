@@ -424,10 +424,13 @@ type gluttonActor struct {
 	deleted bool
 	// consecutiveFailures counts replaceIfPersistent failures since the last
 	// success. See noteFailure.
-	consecutiveFailures int
-	lpaStepIdx          int
-	httpSeq             atomic.Uint64
+	consecutiveFailures uint8
+	lpaStepIdx          uint16
 }
+
+// globalHTTPSeq distributes HTTP requests evenly across all configured
+// HTTPClients transport shards regardless of which actor issues the request.
+var globalHTTPSeq atomic.Uint64
 
 func (u *gluttonActor) apiStub() ateapipb.ControlClient {
 	if u.stub != nil {
@@ -472,7 +475,7 @@ func (u *gluttonActor) doHTTPPost(ctx context.Context, path string, body []byte)
 // so retries and concurrent VUs spread across independent transport shards.
 func (u *gluttonActor) httpClient() *http.Client {
 	if u.cfg != nil && len(u.cfg.HTTPClients) > 0 {
-		idx := u.httpSeq.Add(1) % uint64(len(u.cfg.HTTPClients))
+		idx := globalHTTPSeq.Add(1) % uint64(len(u.cfg.HTTPClients))
 		return u.cfg.HTTPClients[idx]
 	}
 	return u.cfg.HTTPClient
@@ -488,12 +491,12 @@ func (u *gluttonActor) noteFailure(err error) bool {
 		return false
 	}
 	u.consecutiveFailures++
-	if u.consecutiveFailures < maxConsecutiveFailures {
+	if int(u.consecutiveFailures) < maxConsecutiveFailures {
 		return false
 	}
 	slog.Warn("glutton actor failed repeatedly; replacing it",
 		slog.String("actor", u.actorName),
-		slog.Int("consecutive_failures", u.consecutiveFailures),
+		slog.Int("consecutive_failures", int(u.consecutiveFailures)),
 		slog.String("err", err.Error()))
 	return true
 }

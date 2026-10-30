@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"go.ate.dev/substrate/internal/benchmarking/boomer/agentsession"
 	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
@@ -110,15 +111,33 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 		actorName: "sb-test-lpa",
 	}
 
-	// Execute all 37 steps of personal-assistant-light plus step 0 wrap-around
+	// Execute all 61 steps of personal-assistant-light plus step 0 wrap-around
 	// against a real glutton.Service to verify every RAM/disk/ingest/CPU step
 	// succeeds in sequence.
 	for i := 0; i < len(cfg.script.Steps)+1; i++ {
 		wantIdx := (i + 1) % len(cfg.script.Steps)
 		actor.runLPAStep(context.Background())
-		if actor.lpaStepIdx != wantIdx {
+		if int(actor.lpaStepIdx) != wantIdx {
 			t.Fatalf("after step %d (%s), actor.lpaStepIdx = %d, want %d",
 				i, cfg.script.Steps[i%len(cfg.script.Steps)].Name, actor.lpaStepIdx, wantIdx)
+		}
+	}
+}
+
+func TestGluttonActorStructSizeAndHTTPShardDistribution(t *testing.T) {
+	if sz := unsafe.Sizeof(gluttonActor{}); sz > 64 {
+		t.Fatalf("unsafe.Sizeof(gluttonActor{}) = %d, want <= 64 bytes", sz)
+	}
+	clients := []*http.Client{{}, {}, {}, {}}
+	cfg := &userclass.Config{HTTPClients: clients}
+	seen := make(map[*http.Client]int)
+	for i := 0; i < 40; i++ {
+		a := &gluttonActor{cfg: cfg}
+		seen[a.httpClient()]++
+	}
+	for idx, c := range clients {
+		if seen[c] != 10 {
+			t.Fatalf("shard %d selected %d times across 40 first-call actors, want 10", idx, seen[c])
 		}
 	}
 }
