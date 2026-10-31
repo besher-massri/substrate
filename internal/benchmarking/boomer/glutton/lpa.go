@@ -85,10 +85,11 @@ var (
 )
 
 // validPostBootstrapStartSteps returns the 1-based step indices (1..len(reqs)-1)
-// whose RAM and disk read/rotate operations are satisfied by the initial keys
-// populated during step 0 (0000_gateway_start). Actors completing step 0 are
-// staggered across these valid entry points so a 1M-actor fleet does not hit
-// multi-MiB ingest steps (such as 0505_catalog_refresh) in a single lockstep wave.
+// from which an actor can execute a complete full cycle of post-bootstrap steps
+// (startIdx..len(reqs)-1 followed by 1..startIdx-1) using the initial RAM and
+// disk keys populated during step 0 plus keys created along the cycle. Actors
+// completing step 0 are staggered across these valid entry points so a 1M-actor
+// fleet does not hit multi-MiB ingest steps in a single lockstep wave.
 func validPostBootstrapStartSteps(reqs []*gluttonpb.RunScriptRequest) []uint16 {
 	if len(reqs) <= 1 || reqs[0] == nil {
 		return nil
@@ -110,49 +111,52 @@ func validPostBootstrapStartSteps(reqs []*gluttonpb.RunScriptRequest) []uint16 {
 		}
 	}
 
-	valid := make([]uint16, 0, len(reqs)-1)
-	for i := 1; i < len(reqs); i++ {
-		if reqs[i] == nil {
-			valid = append(valid, uint16(i))
-			continue
-		}
-		ram := make(map[string]bool, len(ram0)+4)
+	n := len(reqs) - 1
+	valid := make([]uint16, 0, n)
+	for startIdx := 1; startIdx < len(reqs); startIdx++ {
+		ram := make(map[string]bool, len(ram0)+8)
 		for k, v := range ram0 {
 			ram[k] = v
 		}
-		disk := make(map[string]bool, len(disk0)+4)
+		disk := make(map[string]bool, len(disk0)+8)
 		for k, v := range disk0 {
 			disk[k] = v
 		}
 		ok := true
-		for _, st := range reqs[i].GetScript().GetSteps() {
-			for _, r := range st.GetOperation().GetRequests() {
-				switch k := r.GetKind().(type) {
-				case *gluttonpb.Request_WriteRam:
-					if k.WriteRam.GetWriteMode() == gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
-						if !ram[k.WriteRam.GetKey()] {
+		for offset := 0; offset < n && ok; offset++ {
+			stepIdx := 1 + (startIdx-1+offset)%n
+			if reqs[stepIdx] == nil {
+				continue
+			}
+			for _, st := range reqs[stepIdx].GetScript().GetSteps() {
+				for _, r := range st.GetOperation().GetRequests() {
+					switch k := r.GetKind().(type) {
+					case *gluttonpb.Request_WriteRam:
+						if k.WriteRam.GetWriteMode() == gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
+							if !ram[k.WriteRam.GetKey()] {
+								ok = false
+							}
+						} else {
+							ram[k.WriteRam.GetKey()] = true
+						}
+					case *gluttonpb.Request_ReadRam:
+						if !ram[k.ReadRam.GetKey()] {
 							ok = false
 						}
-					} else {
-						ram[k.WriteRam.GetKey()] = true
-					}
-				case *gluttonpb.Request_ReadRam:
-					if !ram[k.ReadRam.GetKey()] {
-						ok = false
-					}
-				case *gluttonpb.Request_WriteDisk:
-					disk[k.WriteDisk.GetKey()] = true
-				case *gluttonpb.Request_Ingest:
-					disk[k.Ingest.GetKey()] = true
-				case *gluttonpb.Request_ReadDisk:
-					if !disk[k.ReadDisk.GetKey()] {
-						ok = false
+					case *gluttonpb.Request_WriteDisk:
+						disk[k.WriteDisk.GetKey()] = true
+					case *gluttonpb.Request_Ingest:
+						disk[k.Ingest.GetKey()] = true
+					case *gluttonpb.Request_ReadDisk:
+						if !disk[k.ReadDisk.GetKey()] {
+							ok = false
+						}
 					}
 				}
 			}
 		}
 		if ok {
-			valid = append(valid, uint16(i))
+			valid = append(valid, uint16(startIdx))
 		}
 	}
 	return valid

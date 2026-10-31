@@ -155,6 +155,95 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 	}
 }
 
+func TestLPAAllScriptsValidStartStepsFullTwoLapSimulation(t *testing.T) {
+	cases := []struct {
+		scriptName    string
+		wantSteps     int
+		wantValidLen  int
+	}{
+		{scriptName: "personal-assistant-light", wantSteps: 61, wantValidLen: 58},
+		{scriptName: "coding-session", wantSteps: 20, wantValidLen: 3},
+		{scriptName: "personal-assistant", wantSteps: 61, wantValidLen: 58},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.scriptName, func(t *testing.T) {
+			t.Setenv(EnvEnvelopeUseLPA, "true")
+			t.Setenv(EnvEnvelopeLPAScript, tc.scriptName)
+			t.Setenv(EnvEnvelopeLPACPUScale, "0")
+			t.Setenv(EnvEnvelopeLPADwellScale, "0")
+			t.Setenv(EnvEnvelopeLPASizeScale, "0.001")
+			resetLPAConfigForTest()
+			t.Cleanup(resetLPAConfigForTest)
+
+			cfg := currentLPAConfig()
+			if cfg.loadErr != nil {
+				t.Fatalf("loadLPAConfigFromEnv(%s): %v", tc.scriptName, cfg.loadErr)
+			}
+			if cfg.script == nil || len(cfg.script.Steps) != tc.wantSteps {
+				t.Fatalf("%s steps = %d, want %d", tc.scriptName, len(cfg.script.Steps), tc.wantSteps)
+			}
+			if len(cfg.validStartSteps) != tc.wantValidLen {
+				t.Fatalf("%s len(validStartSteps) = %d (%v), want %d", tc.scriptName, len(cfg.validStartSteps), cfg.validStartSteps, tc.wantValidLen)
+			}
+
+			for k, wantStart := range cfg.validStartSteps {
+				svc, err := gluttonsvc.New(t.TempDir())
+				if err != nil {
+					t.Fatalf("gluttonsvc.New: %v", err)
+				}
+				var serverErr error
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					reqBytes, _ := io.ReadAll(r.Body)
+					var req gluttonpb.RunScriptRequest
+					if err := proto.Unmarshal(reqBytes, &req); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					resp, err := svc.RunScript(r.Context(), &req)
+					if err != nil {
+						serverErr = err
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+					out, _ := proto.Marshal(resp)
+					w.Header().Set("Content-Type", "application/x-protobuf")
+					_, _ = w.Write(out)
+				}))
+
+				globalLPAPhaseSeq.Store(uint64(k))
+				a := &gluttonActor{
+					cfg: &userclass.Config{
+						Atespace:   "test-atespace",
+						RouterURL:  srv.URL,
+						HTTPClient: srv.Client(),
+						Tracer:     otel.Tracer("test"),
+					},
+					actorName: "sb-test-2lap",
+				}
+				totalTurns := 1 + 2*(len(cfg.script.Steps)-1)
+				for turn := 0; turn < totalTurns; turn++ {
+					stepBefore := a.lpaStepIdx
+					a.runLPAStep(context.Background())
+					if serverErr != nil {
+						srv.Close()
+						svc.Close()
+						t.Fatalf("%s start=%d failed at turn %d (step %d %s): %v",
+							tc.scriptName, wantStart, turn, stepBefore, cfg.script.Steps[stepBefore].Name, serverErr)
+					}
+					if turn == 0 && a.lpaStepIdx != wantStart {
+						srv.Close()
+						svc.Close()
+						t.Fatalf("%s after step 0 got lpaStepIdx=%d, want %d", tc.scriptName, a.lpaStepIdx, wantStart)
+					}
+				}
+				srv.Close()
+				svc.Close()
+			}
+		})
+	}
+}
+
 func TestGluttonActorStructSizeAndHTTPShardDistribution(t *testing.T) {
 	if sz := unsafe.Sizeof(gluttonActor{}); sz > 64 {
 		t.Fatalf("unsafe.Sizeof(gluttonActor{}) = %d, want <= 64 bytes", sz)
