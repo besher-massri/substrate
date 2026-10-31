@@ -285,6 +285,10 @@ func normalizeLPARunScriptRequests(reqs []*gluttonpb.RunScriptRequest) {
 		}
 	}
 
+	if len(disk0) == 0 {
+		return
+	}
+
 	needRamSeed := make(map[string]bool)
 	needDiskSeed := make(map[string]bool)
 	for i := 1; i < len(reqs); i++ {

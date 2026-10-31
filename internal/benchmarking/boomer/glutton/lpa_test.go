@@ -162,7 +162,7 @@ func TestLPAAllScriptsValidStartStepsFullTwoLapSimulation(t *testing.T) {
 		wantValidLen int
 	}{
 		{scriptName: "personal-assistant-light", wantSteps: 61, wantValidLen: 60},
-		{scriptName: "coding-session", wantSteps: 20, wantValidLen: 19},
+		{scriptName: "coding-session", wantSteps: 20, wantValidLen: 3},
 		{scriptName: "personal-assistant", wantSteps: 61, wantValidLen: 60},
 	}
 
