@@ -65,8 +65,8 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 	if cfg.script == nil || len(cfg.script.Steps) != 61 {
 		t.Fatalf("loaded script steps = %d, want 61", len(cfg.script.Steps))
 	}
-	if len(cfg.validStartSteps) != 58 {
-		t.Fatalf("len(cfg.validStartSteps) = %d, want 58 (all 60 daily steps except 43 and 44)", len(cfg.validStartSteps))
+	if len(cfg.validStartSteps) != 60 {
+		t.Fatalf("len(cfg.validStartSteps) = %d, want 60 (all 60 daily steps)", len(cfg.validStartSteps))
 	}
 
 	svc, err := gluttonsvc.New(t.TempDir())
@@ -157,13 +157,13 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 
 func TestLPAAllScriptsValidStartStepsFullTwoLapSimulation(t *testing.T) {
 	cases := []struct {
-		scriptName    string
-		wantSteps     int
-		wantValidLen  int
+		scriptName   string
+		wantSteps    int
+		wantValidLen int
 	}{
-		{scriptName: "personal-assistant-light", wantSteps: 61, wantValidLen: 58},
-		{scriptName: "coding-session", wantSteps: 20, wantValidLen: 3},
-		{scriptName: "personal-assistant", wantSteps: 61, wantValidLen: 58},
+		{scriptName: "personal-assistant-light", wantSteps: 61, wantValidLen: 60},
+		{scriptName: "coding-session", wantSteps: 20, wantValidLen: 19},
+		{scriptName: "personal-assistant", wantSteps: 61, wantValidLen: 60},
 	}
 
 	for _, tc := range cases {
@@ -172,9 +172,23 @@ func TestLPAAllScriptsValidStartStepsFullTwoLapSimulation(t *testing.T) {
 			t.Setenv(EnvEnvelopeLPAScript, tc.scriptName)
 			t.Setenv(EnvEnvelopeLPACPUScale, "0")
 			t.Setenv(EnvEnvelopeLPADwellScale, "0")
-			t.Setenv(EnvEnvelopeLPASizeScale, "0.001")
+			t.Setenv(EnvEnvelopeLPASizeScale, "1.0")
 			resetLPAConfigForTest()
 			t.Cleanup(resetLPAConfigForTest)
+
+			fullCfg := currentLPAConfig()
+			if fullCfg.loadErr != nil {
+				t.Fatalf("loadLPAConfigFromEnv(%s, sizeScale=1.0): %v", tc.scriptName, fullCfg.loadErr)
+			}
+			for stepIdx, body := range fullCfg.stepBodies {
+				if len(body) >= 8*1024 {
+					t.Fatalf("%s step %d (%s) serialized protobuf size = %d bytes, want < 8192 bytes",
+						tc.scriptName, stepIdx, fullCfg.script.Steps[stepIdx].Name, len(body))
+				}
+			}
+
+			t.Setenv(EnvEnvelopeLPASizeScale, "0.001")
+			resetLPAConfigForTest()
 
 			cfg := currentLPAConfig()
 			if cfg.loadErr != nil {

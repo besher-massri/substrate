@@ -61,6 +61,13 @@ const (
 	defaultLPADwellScale = 0.0
 	defaultLPASizeScale  = 1.0
 	runScriptPath        = "/runscript"
+
+	// maxLPAReadDiskDataBytes caps the file size returned over HTTP by
+	// READ_MODE_DATA in LPA mode. Files larger than 256 KiB use
+	// READ_MODE_DIGEST_ONLY so the sandbox still reads every byte from disk and
+	// computes its full SHA-256 digest without saturating the load-generator
+	// VM's NIC on multi-megabyte file responses.
+	maxLPAReadDiskDataBytes int32 = 256 * 1024
 )
 
 // lpaConfig holds the parsed environment configuration and embedded script for
@@ -184,6 +191,165 @@ func nextLPAStepIndex(idx int, cfg lpaConfig) uint16 {
 	return 1
 }
 
+// normalizeLPARunScriptRequests transforms the per-step RunScriptRequests of an
+// LPA script so a 1M-actor fleet executes 100% of each step's guest RAM and
+// disk I/O inside the sandbox without saturating the load-generator VM's NIC:
+//  1. Converts Request_Ingest operations into equivalent Request_WriteDisk
+//     operations of the exact same Key and byte Size (len(Payload)), writing
+//     the full file size inside /tmp.
+//  2. Converts Request_ReadDisk operations with READ_MODE_DATA into
+//     READ_MODE_DIGEST_ONLY when the key's written file size exceeds
+//     maxLPAReadDiskDataBytes (256 KiB), so every byte is still read from disk
+//     and SHA-256 hashed inside the sandbox while smaller payloads (such as
+//     context_window) continue to return their full bytes over HTTP.
+//  3. Appends initial WriteRam and WriteDisk seed operations to bootstrap
+//     step 0 (reqs[0]) for any RAM or disk key that is read or
+//     OVERWRITE_ROTATEd in steps 1..N-1 before being written, unlocking all
+//     post-bootstrap steps (1..N-1) as valid staggered entry points.
+func normalizeLPARunScriptRequests(reqs []*gluttonpb.RunScriptRequest) {
+	if len(reqs) == 0 {
+		return
+	}
+
+	firstRamSize := make(map[string]string)
+	firstRamOrder := make([]string, 0, 8)
+	firstDiskSize := make(map[string]int32)
+	firstDiskOrder := make([]string, 0, 16)
+	maxDiskSize := make(map[string]int32)
+
+	for _, req := range reqs {
+		for _, st := range req.GetScript().GetSteps() {
+			for _, r := range st.GetOperation().GetRequests() {
+				if k, ok := r.GetKind().(*gluttonpb.Request_Ingest); ok {
+					key := k.Ingest.GetKey()
+					sz := int32(len(k.Ingest.GetPayload()))
+					r.Kind = &gluttonpb.Request_WriteDisk{
+						WriteDisk: &gluttonpb.WriteDiskRequest{
+							Key:       key,
+							Size:      sz,
+							WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE,
+						},
+					}
+				}
+				switch k := r.GetKind().(type) {
+				case *gluttonpb.Request_WriteRam:
+					if k.WriteRam.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
+						key := k.WriteRam.GetKey()
+						if _, exists := firstRamSize[key]; !exists && key != "" {
+							firstRamSize[key] = k.WriteRam.GetSize()
+							firstRamOrder = append(firstRamOrder, key)
+						}
+					}
+				case *gluttonpb.Request_WriteDisk:
+					key := k.WriteDisk.GetKey()
+					sz := k.WriteDisk.GetSize()
+					if _, exists := firstDiskSize[key]; !exists && key != "" {
+						firstDiskSize[key] = sz
+						firstDiskOrder = append(firstDiskOrder, key)
+					}
+					if sz > maxDiskSize[key] {
+						maxDiskSize[key] = sz
+					}
+				}
+			}
+		}
+	}
+
+	for _, req := range reqs {
+		for _, st := range req.GetScript().GetSteps() {
+			for _, r := range st.GetOperation().GetRequests() {
+				if k, ok := r.GetKind().(*gluttonpb.Request_ReadDisk); ok {
+					if k.ReadDisk.GetReadMode() == gluttonpb.ReadMode_READ_MODE_DATA && maxDiskSize[k.ReadDisk.GetKey()] > maxLPAReadDiskDataBytes {
+						k.ReadDisk.ReadMode = gluttonpb.ReadMode_READ_MODE_DIGEST_ONLY
+					}
+				}
+			}
+		}
+	}
+
+	if reqs[0] == nil || reqs[0].GetScript() == nil {
+		return
+	}
+	ram0 := make(map[string]bool)
+	disk0 := make(map[string]bool)
+	for _, st := range reqs[0].GetScript().GetSteps() {
+		for _, r := range st.GetOperation().GetRequests() {
+			switch k := r.GetKind().(type) {
+			case *gluttonpb.Request_WriteRam:
+				if k.WriteRam.GetWriteMode() != gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
+					ram0[k.WriteRam.GetKey()] = true
+				}
+			case *gluttonpb.Request_WriteDisk:
+				disk0[k.WriteDisk.GetKey()] = true
+			}
+		}
+	}
+
+	needRamSeed := make(map[string]bool)
+	needDiskSeed := make(map[string]bool)
+	for i := 1; i < len(reqs); i++ {
+		for _, st := range reqs[i].GetScript().GetSteps() {
+			for _, r := range st.GetOperation().GetRequests() {
+				switch k := r.GetKind().(type) {
+				case *gluttonpb.Request_WriteRam:
+					if k.WriteRam.GetWriteMode() == gluttonpb.WriteMode_WRITE_MODE_OVERWRITE_ROTATE {
+						needRamSeed[k.WriteRam.GetKey()] = true
+					}
+				case *gluttonpb.Request_ReadRam:
+					needRamSeed[k.ReadRam.GetKey()] = true
+				case *gluttonpb.Request_ReadDisk:
+					needDiskSeed[k.ReadDisk.GetKey()] = true
+				}
+			}
+		}
+	}
+
+	for _, key := range firstRamOrder {
+		if needRamSeed[key] && !ram0[key] {
+			reqs[0].Script.Steps = append(reqs[0].Script.Steps, &gluttonpb.Step{
+				Kind: &gluttonpb.Step_Operation{
+					Operation: &gluttonpb.Operation{
+						Requests: []*gluttonpb.Request{
+							{
+								Kind: &gluttonpb.Request_WriteRam{
+									WriteRam: &gluttonpb.WriteRAMRequest{
+										Key:       key,
+										Size:      firstRamSize[key],
+										WriteMode: gluttonpb.WriteMode_WRITE_MODE_OVERWRITE,
+									},
+								},
+							},
+						},
+					},
+				},
+			})
+			ram0[key] = true
+		}
+	}
+	for _, key := range firstDiskOrder {
+		if needDiskSeed[key] && !disk0[key] {
+			reqs[0].Script.Steps = append(reqs[0].Script.Steps, &gluttonpb.Step{
+				Kind: &gluttonpb.Step_Operation{
+					Operation: &gluttonpb.Operation{
+						Requests: []*gluttonpb.Request{
+							{
+								Kind: &gluttonpb.Request_WriteDisk{
+									WriteDisk: &gluttonpb.WriteDiskRequest{
+										Key:       key,
+										Size:      firstDiskSize[key],
+										WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE,
+									},
+								},
+							},
+						},
+					},
+				},
+			})
+			disk0[key] = true
+		}
+	}
+}
+
 // loadLPAConfigFromEnv parses the ENVELOPE_USE_LPA environment variables and
 // loads the configured agentsession script when enabled, pre-marshaling each
 // step's RunScriptRequest protobuf once so concurrent VUs share the immutable
@@ -210,8 +376,10 @@ func loadLPAConfigFromEnv() lpaConfig {
 		stepBodies = make([][]byte, len(script.Steps))
 		stepReqs := make([]*gluttonpb.RunScriptRequest, len(script.Steps))
 		for i, step := range script.Steps {
-			req := step.ToRunScriptRequest(cpuScale, dwellScale, sizeScale, ingestBuf)
-			stepReqs[i] = req
+			stepReqs[i] = step.ToRunScriptRequest(cpuScale, dwellScale, sizeScale, ingestBuf)
+		}
+		normalizeLPARunScriptRequests(stepReqs)
+		for i, req := range stepReqs {
 			if req == nil {
 				continue
 			}
