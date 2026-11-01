@@ -340,6 +340,9 @@ func TestApplyWorkloadRuntimeAndScaleOverrides(t *testing.T) {
 	}
 	applyWorkloadRuntimeAndScaleOverrides(objs100m, true, false, append(environ, "ATE_SOFT_NODE_AFFINITY=true"))
 	router100m := findObject(objs100m, "Deployment", "atenet-router")
+	if replicas, _, _ := unstructured.NestedInt64(router100m.Object, "spec", "replicas"); replicas != 64 {
+		t.Errorf("highScale100m atenet-router replicas = %d, want 64", replicas)
+	}
 	routerContainers, _, _ := unstructured.NestedSlice(router100m.Object, "spec", "template", "spec", "containers")
 	var envoyCmd []string
 	for _, raw := range routerContainers {
@@ -348,7 +351,7 @@ func TestApplyWorkloadRuntimeAndScaleOverrides(t *testing.T) {
 			envoyCmd, _, _ = unstructured.NestedStringSlice(c, "command")
 		}
 	}
-	if !slices.Contains(envoyCmd, "--concurrency") || !slices.Contains(envoyCmd, "4") {
-		t.Errorf("highScale100m envoy command = %v, want --concurrency 4", envoyCmd)
+	if !slices.Contains(envoyCmd, "--concurrency") || !slices.Contains(envoyCmd, "16") {
+		t.Errorf("highScale100m envoy command = %v, want --concurrency 16", envoyCmd)
 	}
 }

@@ -351,8 +351,26 @@ def spawn_remote_boomer_workers(
                 },
             ),
             spec=client.V1PodSpec(
-                restart_policy="Never",
+                restart_policy="OnFailure",
                 service_account_name=service_account,
+                affinity=client.V1Affinity(
+                    node_affinity=client.V1NodeAffinity(
+                        preferred_during_scheduling_ignored_during_execution=[
+                            client.V1PreferredSchedulingTerm(
+                                weight=100,
+                                preference=client.V1NodeSelectorTerm(
+                                    match_expressions=[
+                                        client.V1NodeSelectorRequirement(
+                                            key="node.kubernetes.io/instance-type",
+                                            operator="In",
+                                            values=["c3d-standard-180"],
+                                        )
+                                    ]
+                                ),
+                            )
+                        ]
+                    )
+                ),
                 tolerations=[
                     client.V1Toleration(
                         key="ate.dev/benchmarking",
@@ -397,7 +415,7 @@ def spawn_remote_boomer_workers(
                         ],
                         volume_mounts=volume_mounts,
                         resources=client.V1ResourceRequirements(
-                            requests={"cpu": "4", "memory": "8Gi"}
+                            requests={"cpu": "8", "memory": "12Gi"}
                         ),
                     )
                 ],

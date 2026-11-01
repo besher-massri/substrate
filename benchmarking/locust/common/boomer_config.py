@@ -114,7 +114,7 @@ def _payload(parsed_options) -> dict[str, float | int | str | None]:
 
 
 def serve_config_headless(environment, port: int) -> None:
-    """Serve /boomer-config on 127.0.0.1:`port` for a headless run.
+    """Serve /boomer-config on 0.0.0.0:`port` for a headless run.
 
     A headless master has no Flask app, thus init_boomer_config registers no
     route and runner.py gives boomer the values one time, through
@@ -126,9 +126,9 @@ def serve_config_headless(environment, port: int) -> None:
     The handler reads the parsed options at each request, thus it gives the
     value of the step that runs, and not the value of the command line.
 
-    boomer and locust are in one container in a headless run, thus the
-    address of the loopback interface is sufficient and the endpoint is not
-    on the network.
+    Binds 0.0.0.0 so both the local boomer-worker subprocess (127.0.0.1) and
+    any distributed helper boomer-worker Pods (connecting via master Pod IP)
+    can fetch /boomer-config.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -148,9 +148,9 @@ def serve_config_headless(environment, port: int) -> None:
             # message, in the middle of the output of the run.
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info(f"Serving /boomer-config on 127.0.0.1:{port} for boomer workers")
+    logger.info(f"Serving /boomer-config on 0.0.0.0:{port} for boomer workers")
 
 
 def init_boomer_config() -> None:

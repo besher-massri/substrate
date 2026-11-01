@@ -815,11 +815,30 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 			})
 
 		case kind == "Deployment" && name == "atenet-router":
+			highScale := size100 && strings.EqualFold(envMap["ATE_SOFT_NODE_AFFINITY"], "true")
 			if size100 {
 				replicas := int64(8)
-				if strings.EqualFold(envMap["ATE_SOFT_NODE_AFFINITY"], "true") {
-					replicas = 24
+				if highScale {
+					replicas = 64
 					unstructured.RemoveNestedField(obj.Object, "spec", "template", "spec", "nodeSelector")
+					_ = unstructured.SetNestedMap(obj.Object, map[string]any{
+						"nodeAffinity": map[string]any{
+							"preferredDuringSchedulingIgnoredDuringExecution": []any{
+								map[string]any{
+									"weight": int64(100),
+									"preference": map[string]any{
+										"matchExpressions": []any{
+											map[string]any{
+												"key":      "node.kubernetes.io/instance-type",
+												"operator": "In",
+												"values":   []any{"c3d-standard-180"},
+											},
+										},
+									},
+								},
+							},
+						},
+					}, "spec", "template", "spec", "affinity")
 					_ = unstructured.SetNestedSlice(obj.Object, []any{
 						map[string]any{
 							"key":      "ate.dev/workloadType",
@@ -855,14 +874,20 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 				_ = unstructured.SetNestedField(obj.Object, replicas, "spec", "replicas")
 			}
 			mutatePodContainers(obj, func(cname string, c map[string]any) {
-				if size100 {
+				if highScale {
+					setContainerResources(c, "8", "4Gi", "24", "16Gi")
+				} else if size100 {
 					setContainerResources(c, "4", "4Gi", "8", "16Gi")
 				}
 				if cname == "atenet-router" {
 					mergeContainerEnv(c, routerEnv)
 				}
 				if cname == "envoy" && size100 {
-					setContainerCommandConcurrency(c, "4")
+					if highScale {
+						setContainerCommandConcurrency(c, "16")
+					} else {
+						setContainerCommandConcurrency(c, "4")
+					}
 				}
 			})
 
