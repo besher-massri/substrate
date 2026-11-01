@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/scheduling"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -48,6 +49,7 @@ func (w *ActorWorkflow) detachFromFullNode(ctx context.Context, actorRef resourc
 	ctx, done := stepSpan(ctx, "DetachFromFullNode")
 	defer func() { err = done(err) }()
 
+	start := time.Now()
 	node := actor.GetStatus().GetAssignedNode()
 	// Assignment may have retried on a newer version than actor.
 	if actor, err = w.loadPinnedActor(ctx, actorRef, actor.GetMetadata().GetUid(), node); err != nil {
@@ -58,6 +60,7 @@ func (w *ActorWorkflow) detachFromFullNode(ctx context.Context, actorRef resourc
 	constraints.RequiredRuntime = hardware.Requirement{}
 	if _, err := w.scheduler.Schedule(ctx, constraints); err != nil {
 		if errors.Is(err, scheduling.ErrNoCapacity) {
+			w.instruments.recordSchedulerAssignment(ctx, time.Since(start), ateattr.SchedulerOutcomeNoCapacity, "", "", constraints.SandboxClass, assignErr)
 			return nil, assignErr
 		}
 		return nil, err

@@ -29,11 +29,11 @@ const (
 	// filesystem capacity at or above which atelet evicts the oldest idle
 	// local snapshots in LRU order. Below this watermark, zero pressure
 	// evictions occur and the normal detach timer governs.
-	DefaultMemoryPressureHighWatermark = 0.22
+	DefaultMemoryPressureHighWatermark = 0.25
 	// DefaultMemoryPressureLowWatermark is the target fraction of the local
 	// snapshot filesystem capacity to which a pressure-eviction sweep trims
 	// idle local snapshots once usage reaches the high watermark.
-	DefaultMemoryPressureLowWatermark = 0.16
+	DefaultMemoryPressureLowWatermark = 0.18
 	// DefaultMemoryPressureInterval is how often atelet checks the local
 	// snapshot filesystem usage for memory pressure.
 	DefaultMemoryPressureInterval = 2 * time.Second

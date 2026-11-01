@@ -474,7 +474,10 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	pool := ""
 	class := ""
 	defer func() {
-		if schedulerRecordable(err) {
+		// Suppress recording a pinned-node capacity miss when ResumeActor will
+		// immediately fall back to detachFromFullNode and retry unpinned;
+		// detachFromFullNode records no_capacity when no node in the cluster has room.
+		if schedulerRecordable(err) && !shouldDetachFromNode(actor, err) {
 			w.instruments.recordSchedulerAssignment(ctx, time.Since(start), outcome, poolNamespace, pool, class, err)
 		}
 	}()
