@@ -202,6 +202,23 @@ func (t *Tracker) CommitPromoted(actorUID string, snap SnapshotRef) *ateletpb.Ac
 	return t.durableStateLocked(a)
 }
 
+// RecordRestoredDurable records snap, a snapshot that Restore just fetched
+// from object storage to start the actor on this node, as the actor's
+// LatestDurable baseline if no newer durable snapshot is already recorded,
+// while preserving Started = true. If a later deferred local checkpoint of
+// the actor is pruned under emergency tmpfs memory pressure before being
+// uploaded to object storage, Restore can fall back to LatestDurable.
+func (t *Tracker) RecordRestoredDurable(actorUID string, snap SnapshotRef) {
+	t.lock(actorUID)
+	defer t.unlock(actorUID)
+	a := t.findOrAddLocked(actorUID)
+	if !a.uploadNeeded(snap) {
+		return
+	}
+	a.LatestDurable = snap.clone()
+	t.saveLocked(a)
+}
+
 // BeginStart records that a Run or Restore is starting the actor on this node,
 // once any background detach of the actor in progress has finished, and
 // returns the func to call when the start ends, whether or not it succeeded.

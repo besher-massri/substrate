@@ -26,15 +26,14 @@ import (
 
 const (
 	// DefaultMemoryPressureHighWatermark is the fraction of the local snapshot
-	// filesystem capacity at or above which atelet evicts the oldest
-	// already-durable idle local snapshots in LRU order. Below this watermark,
-	// zero pressure evictions occur and the normal detach timer governs.
-	DefaultMemoryPressureHighWatermark = 0.65
+	// filesystem capacity at or above which atelet evicts the oldest idle
+	// local snapshots in LRU order. Below this watermark, zero pressure
+	// evictions occur and the normal detach timer governs.
+	DefaultMemoryPressureHighWatermark = 0.55
 	// DefaultMemoryPressureLowWatermark is the target fraction of the local
 	// snapshot filesystem capacity to which a pressure-eviction sweep trims
-	// already-durable idle local snapshots once usage reaches the high
-	// watermark.
-	DefaultMemoryPressureLowWatermark = 0.50
+	// idle local snapshots once usage reaches the high watermark.
+	DefaultMemoryPressureLowWatermark = 0.40
 	// DefaultMemoryPressureInterval is how often atelet checks the local
 	// snapshot filesystem usage for memory pressure.
 	DefaultMemoryPressureInterval = 5 * time.Second
@@ -91,18 +90,19 @@ func WithDiskUsageFunc(fn DiskUsageFunc) Option {
 	}
 }
 
-// evictionCandidate represents an idle actor whose LatestLocal snapshot is
-// already durable in object storage and can be detached immediately to free
-// local tmpfs/disk space.
+// evictionCandidate represents an idle actor whose LatestLocal snapshot can be
+// evicted under local snapshot filesystem memory pressure to reclaim tmpfs or
+// disk space.
 type evictionCandidate struct {
 	actorUID   string
 	snapUUID   string
 	commitTime time.Time
+	tier       int
 }
 
 // runMemoryPressureEvictor periodically checks the filesystem usage of
-// nodepath.SnapshotsDir and triggers LRU eviction of already-durable idle
-// local snapshots whenever usage reaches pressureHighWatermark.
+// nodepath.SnapshotsDir and triggers LRU eviction of idle local snapshots
+// whenever usage reaches pressureHighWatermark.
 func (t *Tracker) runMemoryPressureEvictor() {
 	ticker := t.clock.NewTicker(t.pressureInterval)
 	defer ticker.Stop()
@@ -118,10 +118,12 @@ func (t *Tracker) runMemoryPressureEvictor() {
 
 // evictUnderMemoryPressureOnce inspects the filesystem backing
 // nodepath.SnapshotsDir and, if usage is at or above pressureHighWatermark,
-// schedules immediate background detaches of the oldest already-durable idle
-// local snapshots (ordered by LatestLocal.CommitTime ascending) until enough
-// bytes are queued for eviction to bring usage down to pressureLowWatermark.
-// It returns the number of actors queued for immediate detach.
+// evicts the oldest idle local snapshots in LRU order (prioritizing
+// already-durable snapshots in tier 0, then undurable snapshots with a durable
+// baseline in tier 1, then remaining undurable snapshots in tier 2, ordered by
+// LatestLocal.CommitTime ascending within each tier) until enough bytes are
+// reclaimed or queued for eviction to bring usage down to pressureLowWatermark.
+// It returns the number of actors evicted or queued for immediate detach.
 func (t *Tracker) evictUnderMemoryPressureOnce() int {
 	if t.store == nil || t.diskUsage == nil || t.pressureHighWatermark <= 0 {
 		return 0
@@ -152,11 +154,12 @@ func (t *Tracker) evictUnderMemoryPressureOnce() int {
 			return 0
 		}
 		a := t.findLocked(actorUID)
-		if isEligibleForPressureEviction(a, now) {
+		if tier, ok := pressureEvictionTier(a, now); ok {
 			candidates = append(candidates, evictionCandidate{
 				actorUID:   actorUID,
 				snapUUID:   a.LatestLocal.uuid(),
 				commitTime: a.LatestLocal.CommitTime,
+				tier:       tier,
 			})
 		}
 		t.unlock(actorUID)
@@ -166,6 +169,9 @@ func (t *Tracker) evictUnderMemoryPressureOnce() int {
 	}
 
 	slices.SortFunc(candidates, func(a, b evictionCandidate) int {
+		if c := cmp.Compare(a.tier, b.tier); c != 0 {
+			return c
+		}
 		if c := a.commitTime.Compare(b.commitTime); c != 0 {
 			return c
 		}
@@ -186,12 +192,23 @@ func (t *Tracker) evictUnderMemoryPressureOnce() int {
 			break
 		}
 		a := t.findLocked(cand.actorUID)
-		if isEligibleForPressureEviction(a, now) && a.LatestLocal.uuid() == cand.snapUUID {
-			a.DetachAt = now
-			t.saveLocked(a)
-			t.requeueLocked(a)
-			freedBytes += snapBytes
-			evictedCount++
+		if tier, ok := pressureEvictionTier(a, now); ok && a.LatestLocal.uuid() == cand.snapUUID {
+			if tier == 0 {
+				a.DetachAt = now
+				t.saveLocked(a)
+				t.requeueLocked(a)
+				freedBytes += snapBytes
+				evictedCount++
+			} else if err := PruneLocalCheckpoints(t.ctx, cand.actorUID); err == nil {
+				t.clearLatestLocalLocked(a)
+				if !a.keepUploading() {
+					a.UndurableSince = time.Time{}
+				}
+				t.saveLocked(a)
+				t.requeueLocked(a)
+				freedBytes += snapBytes
+				evictedCount++
+			}
 		}
 		t.unlock(cand.actorUID)
 	}
@@ -209,21 +226,28 @@ func (t *Tracker) evictUnderMemoryPressureOnce() int {
 	return evictedCount
 }
 
-// isEligibleForPressureEviction reports whether actor a is idle, unheld, has
-// no operation in progress, has a local snapshot that is already durable in
-// object storage, and is not already due for immediate detach.
-func isEligibleForPressureEviction(a *actorSnapshots, now time.Time) bool {
-	if a == nil || a.Started || a.hold != holdNone || a.op != nil {
-		return false
-	}
-	if a.LatestLocal == nil || a.LatestDurable == nil || !sameUUID(a.LatestLocal, a.LatestDurable) {
-		return false
+// pressureEvictionTier reports whether actor a is idle, unheld, has no
+// operation in progress, has a local snapshot with a scheduled future detach,
+// and returns its eviction priority tier:
+//   - tier 0: LatestLocal is already durable in object storage.
+//   - tier 1: LatestLocal is not yet durable, but LatestDurable holds an
+//     earlier durable baseline snapshot that Restore can fall back to.
+//   - tier 2: LatestLocal is not yet durable and LatestDurable is nil.
+func pressureEvictionTier(a *actorSnapshots, now time.Time) (tier int, ok bool) {
+	if a == nil || a.Started || a.hold != holdNone || a.op != nil || a.LatestLocal == nil {
+		return 0, false
 	}
 	due, ok := a.detachDue()
-	if !ok {
-		return false
+	if !ok || !due.After(now) {
+		return 0, false
 	}
-	return due.After(now)
+	if a.LatestDurable != nil && sameUUID(a.LatestLocal, a.LatestDurable) {
+		return 0, true
+	}
+	if a.LatestDurable != nil {
+		return 1, true
+	}
+	return 2, true
 }
 
 // collectKnownActorUIDs returns a deduplicated list of actor UIDs currently

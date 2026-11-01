@@ -156,14 +156,14 @@ func TestMemoryPressureAboveHighWatermarkEvictsOldestDurableIdleFirstDownToLowWa
 	}
 }
 
-func TestMemoryPressureSkipsStartedHeldAndUndurableActors(t *testing.T) {
+func TestMemoryPressureSkipsStartedAndHeldActorsAndPrioritizesTiers(t *testing.T) {
 	useTempNodeDirs(t)
 	store := newFakeSnapshotStore()
 	tr := newStoreTracker(t, store,
-		WithMemoryPressureWatermarks(0.65, 0.50),
+		WithMemoryPressureWatermarks(0.55, 0.50),
 		WithMemoryPressureInterval(5*time.Second),
 		WithDiskUsageFunc(func(string) (uint64, uint64, error) {
-			return 8 << 20, 10 << 20, nil
+			return 6 << 20, 10 << 20, nil
 		}),
 	)
 	tr.Start()
@@ -186,16 +186,17 @@ func TestMemoryPressureSkipsStartedHeldAndUndurableActors(t *testing.T) {
 	}
 	defer endCheckpoint()
 
-	// 3. Undurable actor (t0+2m, LatestDurable == nil) - must NOT be evicted.
+	// 3. Undurable actor in tier 2 (t0+2m, LatestDurable == nil) - evicted only after tier 0 and tier 1.
 	if err := os.MkdirAll(ateletpath.ActorPath("actor-undurable"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	writeTestLocalSnapshotFile(t, "actor-undurable", "snap-undurable", 1<<20)
 	tr.CommitLocal("actor-undurable", testRef("snap-undurable", 1, t0.Add(2*time.Minute)))
 
-	// 4. Eligible durable idle actor (t0+3m) - MUST be evicted.
+	// 4. Eligible durable idle actor in tier 0 (t0+3m) - MUST be evicted first despite newer CommitTime than tier 2.
 	commitDurableIdleActor(t, tr, "actor-eligible", "snap-eligible", t0.Add(3*time.Minute), 1<<20)
 
+	// 5 MiB used - 4 MiB target = 1 MiB to free -> only 1 actor (tier 0 actor-eligible) is evicted.
 	if got := tr.evictUnderMemoryPressureOnce(); got != 1 {
 		t.Fatalf("evictUnderMemoryPressureOnce() = %d, want 1 (only actor-eligible)", got)
 	}
@@ -214,6 +215,54 @@ func TestMemoryPressureSkipsStartedHeldAndUndurableActors(t *testing.T) {
 		if got := uuidOf(tr.State(tc.actorUID).GetLatestLocal()); got != tc.snapUUID {
 			t.Errorf("State(%q).LatestLocal = %q, want %q untouched", tc.actorUID, got, tc.snapUUID)
 		}
+	}
+}
+
+func TestMemoryPressureEvictsUndurableDeferredCheckpointsWithDurableBaselineInLRUOrder(t *testing.T) {
+	useTempNodeDirs(t)
+	store := newFakeSnapshotStore()
+	tr := newStoreTracker(t, store,
+		WithUploadDelay(48*time.Hour),
+		WithDetachDelay(72*time.Hour),
+		WithMemoryPressureWatermarks(0.55, 0.40),
+		WithMemoryPressureInterval(5*time.Second),
+		WithDiskUsageFunc(func(string) (uint64, uint64, error) {
+			return 6 << 20, 10 << 20, nil
+		}),
+	)
+	tr.Start()
+
+	t0 := tr.clock.Now()
+	for i := 1; i <= 3; i++ {
+		actorUID := fmt.Sprintf("cold-actor-%d", i)
+		snapUUID := fmt.Sprintf("snap-gen2-%d", i)
+		if err := os.MkdirAll(ateletpath.ActorPath(actorUID), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Simulate Restore from golden snapshot (gen 1), then deferred Checkpoint (gen 2).
+		tr.RecordRestoredDurable(actorUID, testRef("golden-gen1", 1, time.Time{}))
+		writeTestLocalSnapshotFile(t, actorUID, snapUUID, 1<<20)
+		tr.CommitLocal(actorUID, testRef(snapUUID, 2, t0.Add(time.Duration(i)*time.Minute)))
+	}
+
+	// 6 MiB used - 4 MiB target = 2 MiB to free -> 2 oldest cold actors (cold-actor-1, cold-actor-2) evicted.
+	if got := tr.evictUnderMemoryPressureOnce(); got != 2 {
+		t.Fatalf("evictUnderMemoryPressureOnce() = %d, want 2", got)
+	}
+	for _, actorUID := range []string{"cold-actor-1", "cold-actor-2"} {
+		st := tr.State(actorUID)
+		if st.GetLatestLocal() != nil {
+			t.Errorf("State(%q).LatestLocal = %v, want nil after pressure prune", actorUID, st.GetLatestLocal())
+		}
+		if got := uuidOf(st.GetLatestDurable()); got != "golden-gen1" {
+			t.Errorf("State(%q).LatestDurable = %q, want golden-gen1 retained for fallback restore", actorUID, got)
+		}
+		if _, err := os.Stat(ateletpath.LocalCheckpointsDir(actorUID)); !os.IsNotExist(err) {
+			t.Errorf("LocalCheckpointsDir(%q) stat err = %v, want not exist", actorUID, err)
+		}
+	}
+	if got := uuidOf(tr.State("cold-actor-3").GetLatestLocal()); got != "snap-gen2-3" {
+		t.Errorf("State(cold-actor-3).LatestLocal = %q, want snap-gen2-3 kept", got)
 	}
 }
 

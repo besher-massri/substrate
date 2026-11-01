@@ -1703,6 +1703,17 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		}
 		manifest, err := s.fetchManifestCached(ctx, actor, durable.GetSnapshotUri(), snapshotCacheModeForActor(durable, req.GetActorName(), cacheModeLink))
 		if status.Code(err) == codes.NotFound {
+			if fallback := s.snapshots.State(actorUID).GetLatestDurable().GetSnapshot().GetObject(); fallback != nil && fallback.GetSnapshotUri() != "" && fallback.GetSnapshotUri() != durable.GetSnapshotUri() {
+				slog.InfoContext(ctx, "Local snapshot was evicted under memory pressure before upload; restoring from latest durable baseline snapshot",
+					slog.String("actor_uid", actorUID),
+					slog.String("evicted_snapshot_uuid", req.GetSnapshot().GetSnapshotUuid()),
+					slog.String("fallback_uri", fallback.GetSnapshotUri()),
+				)
+				durable = fallback
+				manifest, err = s.fetchManifestCached(ctx, actor, durable.GetSnapshotUri(), snapshotCacheModeForActor(durable, req.GetActorName(), cacheModeLink))
+			}
+		}
+		if status.Code(err) == codes.NotFound {
 			return nil, apierror.NotFound("snapshot %q has no usable local copy and no uploaded copy: %w",
 				req.GetSnapshot().GetSnapshotUuid(), localErr)
 		}
@@ -1840,6 +1851,19 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	}
 
 	if !directLocal {
+		// Record the restored durable snapshot as the actor's baseline on this
+		// node so if a subsequent deferred local checkpoint is pruned under
+		// emergency tmpfs memory pressure before upload, Restore can fall back
+		// to this durable snapshot.
+		s.snapshots.RecordRestoredDurable(actorUID, snapshottracker.SnapshotRef{
+			Snapshot: &ateletpb.Snapshot{
+				SnapshotUuid: req.GetSnapshot().GetSnapshotUuid(),
+				Generation:   req.GetSnapshot().GetGeneration(),
+				Fidelity:     req.GetSnapshot().GetFidelity(),
+				Object:       durable,
+			},
+			Actor: actorRef,
+		})
 		// This restore downloaded a snapshot from object storage rather than
 		// using a node-local copy, so any earlier local snapshot for this actor
 		// on this node is superseded and can be reclaimed immediately.
