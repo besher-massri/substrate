@@ -132,9 +132,12 @@ var (
 	snapshotUploadTimeout     = pflag.Duration("snapshot-upload-timeout", snapshottracker.DefaultUploadTimeout, "How long one snapshot upload, background or part of a detach, may run before atelet cancels and retries it, on top of the time the snapshot takes at --snapshot-upload-est-throughput-mib. Each consecutive failure doubles the next attempt's timeout, to at most 8 times the first's. 0 turns the timeout off.")
 	snapshotUploadEstMiBps    = pflag.Int("snapshot-upload-est-throughput-mib", snapshottracker.DefaultUploadEstThroughput>>20, "Estimated snapshot upload throughput, in MiB per second of the snapshot's allocated size: each upload attempt may run --snapshot-upload-timeout plus the time the snapshot takes at this rate. 0 adds no time for the snapshot's size.")
 	snapshotUploadWorkers     = pflag.Int("snapshot-upload-workers", snapshottracker.DefaultUploadWorkers, "How many background snapshot uploads atelet runs at once.")
-	snapshotDetachWorkers     = pflag.Int("snapshot-detach-workers", snapshottracker.DefaultDetachWorkers, "How many background detaches atelet runs at once.")
-	snapshotReportWorkers     = pflag.Int("snapshot-report-workers", snapshottracker.DefaultReportWorkers, "How many background snapshot state reports atelet runs at once. 0 disables background reporting.")
-	snapshotReportGiveUpAfter = pflag.Duration("snapshot-report-give-up-after", snapshottracker.DefaultReportGiveUpAfter, "How long after a background upload or detach atelet keeps retrying a failed snapshot state report before giving up on it.")
+	snapshotDetachWorkers         = pflag.Int("snapshot-detach-workers", snapshottracker.DefaultDetachWorkers, "How many background detaches atelet runs at once.")
+	snapshotReportWorkers         = pflag.Int("snapshot-report-workers", snapshottracker.DefaultReportWorkers, "How many background snapshot state reports atelet runs at once. 0 disables background reporting.")
+	snapshotReportGiveUpAfter     = pflag.Duration("snapshot-report-give-up-after", snapshottracker.DefaultReportGiveUpAfter, "How long after a background upload or detach atelet keeps retrying a failed snapshot state report before giving up on it.")
+	snapshotPressureHighWatermark = pflag.Float64("snapshot-pressure-high-watermark", snapshottracker.DefaultMemoryPressureHighWatermark, "Fraction of the local snapshot filesystem capacity in [0, 1] at or above which atelet evicts the oldest already-durable idle local snapshots in LRU order. 0 disables memory-pressure eviction.")
+	snapshotPressureLowWatermark  = pflag.Float64("snapshot-pressure-low-watermark", snapshottracker.DefaultMemoryPressureLowWatermark, "Target fraction of the local snapshot filesystem capacity in [0, 1] to which atelet trims already-durable idle local snapshots once usage reaches --snapshot-pressure-high-watermark.")
+	snapshotPressureInterval      = pflag.Duration("snapshot-pressure-interval", snapshottracker.DefaultMemoryPressureInterval, "How often atelet checks local snapshot filesystem usage for memory pressure. 0 disables memory-pressure eviction.")
 )
 
 const snapshotDetachDelayEnv = "ATELET_SNAPSHOT_DETACH_DELAY"
@@ -422,7 +425,10 @@ func main() {
 		snapshottracker.WithInstruments(trackerInstruments),
 		snapshottracker.WithReporter(&trackerReporter{workers: workerService}),
 		snapshottracker.WithReportWorkers(*snapshotReportWorkers),
-		snapshottracker.WithReportGiveUpAfter(*snapshotReportGiveUpAfter))
+		snapshottracker.WithReportGiveUpAfter(*snapshotReportGiveUpAfter),
+		snapshottracker.WithMemoryPressureWatermarks(*snapshotPressureHighWatermark, *snapshotPressureLowWatermark),
+		snapshottracker.WithMemoryPressureInterval(*snapshotPressureInterval),
+		snapshottracker.WithDiskUsageFunc(snapshottracker.DefaultDiskUsage))
 	// The runtimes this node's workers advertise, read by Run and Restore.
 	// Loaded from disk before anything serves, so a runtime a worker
 	// registered before a restart resolves at once; the worker sandbox
@@ -640,6 +646,18 @@ func validateSnapshotDelayFlags() error {
 	}
 	if *snapshotReportGiveUpAfter <= 0 {
 		return fmt.Errorf("--snapshot-report-give-up-after %v must be > 0", *snapshotReportGiveUpAfter)
+	}
+	if *snapshotPressureHighWatermark < 0 || *snapshotPressureHighWatermark > 1 {
+		return fmt.Errorf("--snapshot-pressure-high-watermark %v must be between 0 and 1", *snapshotPressureHighWatermark)
+	}
+	if *snapshotPressureLowWatermark < 0 || *snapshotPressureLowWatermark > 1 {
+		return fmt.Errorf("--snapshot-pressure-low-watermark %v must be between 0 and 1", *snapshotPressureLowWatermark)
+	}
+	if *snapshotPressureHighWatermark > 0 && *snapshotPressureLowWatermark >= *snapshotPressureHighWatermark {
+		return fmt.Errorf("--snapshot-pressure-low-watermark %v must be < --snapshot-pressure-high-watermark %v", *snapshotPressureLowWatermark, *snapshotPressureHighWatermark)
+	}
+	if *snapshotPressureInterval < 0 {
+		return fmt.Errorf("--snapshot-pressure-interval %v must be >= 0", *snapshotPressureInterval)
 	}
 	return nil
 }

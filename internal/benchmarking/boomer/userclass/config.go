@@ -59,4 +59,10 @@ type Config struct {
 	SpawnConcurrency int
 	// ActorDeadline is the per-actor timeout covering CreateActor + ResumeActor + Ping (spawn benchmark).
 	ActorDeadline time.Duration
+	// WorkerIndex is the 0-based index of this boomer-worker instance when
+	// running multiple distributed workers (0 <= WorkerIndex < WorkerCount).
+	WorkerIndex int
+	// WorkerCount is the total number of distributed boomer-worker instances
+	// sharing the user pool. Zero or negative is treated as 1.
+	WorkerCount int
 }

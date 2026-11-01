@@ -316,7 +316,8 @@ def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] =
         text = text.replace("${" + k + "}", str(v))
     use_ate_env = envelope_use_ate_env()
     use_lpa = envelope_use_lpa()
-    if not extra_args and not use_ate_env and not use_lpa:
+    boomer_workers = os.environ.get("BOOMER_WORKERS", "").strip()
+    if not extra_args and not use_ate_env and not use_lpa and not boomer_workers:
         return text
     docs = list(yaml.safe_load_all(text))
     for doc in docs:
@@ -339,6 +340,9 @@ def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] =
                     env_val = os.environ.get(env_key, "").strip()
                     if env_val:
                         env_list.append({"name": env_key, "value": env_val})
+            if boomer_workers:
+                env_list = container.setdefault("env", [])
+                env_list.append({"name": "BOOMER_WORKERS", "value": boomer_workers})
     return yaml.safe_dump_all(docs)
 
 

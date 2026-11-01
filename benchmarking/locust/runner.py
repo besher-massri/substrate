@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -153,6 +154,16 @@ def parse_args() -> argparse.Namespace:
         help="Per-actor timeout in seconds (forwarded to boomer-worker).",
     )
     p.add_argument(
+        "--boomer-workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of distributed boomer-worker instances to run (1 local + "
+            "N-1 helper pods spread across distinct nodes; also configurable "
+            "via BOOMER_WORKERS env var). Defaults to 1."
+        ),
+    )
+    p.add_argument(
         "--cluster-facts",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -244,6 +255,194 @@ def test_file(files: str) -> str:
 
 def needs_boomer(files: str) -> bool:
     return os.path.basename(test_file(files)) not in PYTHON_TESTS
+
+
+def resolve_boomer_workers(args: argparse.Namespace) -> int:
+    """Return the number of boomer-worker instances to launch (>= 1)."""
+    if getattr(args, "boomer_workers", None) is not None and args.boomer_workers >= 1:
+        return int(args.boomer_workers)
+    raw = os.environ.get("BOOMER_WORKERS", "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val >= 1:
+                return val
+        except ValueError:
+            pass
+    return 1
+
+
+def spawn_remote_boomer_workers(
+    worker_count: int,
+    boomer_base_args: list[str],
+    test_name: str,
+    logs: TextIO,
+) -> tuple[str, list[str]]:
+    """Spawn helper Pods in Kubernetes for worker indices 1..worker_count-1.
+
+    Each helper Pod mounts the same projected service-DNS and pod-identity
+    certificates as the runner Pod, spreads across distinct nodes via
+    topologySpreadConstraints on kubernetes.io/hostname, and connects back to
+    the Locust master running inside this runner Pod on port 5557/5560.
+    """
+    namespace = os.environ.get("POD_NAMESPACE", "").strip() or "benchmarking"
+    if worker_count <= 1:
+        return namespace, []
+
+    from kubernetes import client, config
+
+    try:
+        config.load_incluster_config()
+    except Exception:
+        config.load_kube_config()
+
+    v1 = client.CoreV1Api()
+    master_ip = os.environ.get("POD_IP", "").strip() or socket.gethostbyname(socket.gethostname())
+    runner_pod_name = os.environ.get("POD_NAME", "").strip() or f"boomer-{int(time.time())}"
+    runner_image = os.environ.get("RUNNER_IMAGE", "").strip()
+
+    volumes = None
+    volume_mounts = None
+    service_account = "benchmark-runner"
+    base_env = []
+    try:
+        runner_pod = v1.read_namespaced_pod(name=runner_pod_name, namespace=namespace, _request_timeout=10)
+        volumes = runner_pod.spec.volumes
+        service_account = runner_pod.spec.service_account_name or service_account
+        if runner_pod.spec.containers:
+            c0 = runner_pod.spec.containers[0]
+            runner_image = runner_image or c0.image
+            volume_mounts = c0.volume_mounts
+    except Exception as e:
+        tee(logs, f"Warning: could not inspect runner pod {runner_pod_name}: {e}")
+
+    for k, v in os.environ.items():
+        if k.startswith(("ENVELOPE_", "GLUTTON_", "OTEL_", "BOOMER_")) and k not in (
+            "BOOMER_WORKER_INDEX",
+            "BOOMER_WORKER_COUNT",
+        ):
+            base_env.append(client.V1EnvVar(name=k, value=v))
+    base_env.append(client.V1EnvVar(name="BOOMER_TEST_NAME", value=test_name))
+
+    created_pods: list[str] = []
+    prefix = runner_pod_name[:48].rstrip("-")
+    for idx in range(1, worker_count):
+        pod_name = f"{prefix}-w{idx}"
+        worker_args = list(boomer_base_args) + [
+            "--master-host",
+            master_ip,
+            "--master-port",
+            "5557",
+            "--master-web-port",
+            str(BOOMER_CONFIG_PORT),
+            "--worker-index",
+            str(idx),
+            "--worker-count",
+            str(worker_count),
+        ]
+        pod_manifest = client.V1Pod(
+            metadata=client.V1ObjectMeta(
+                name=pod_name,
+                namespace=namespace,
+                labels={
+                    "app": "substrate-benchmark-runner",
+                    "boomer-role": "worker",
+                    "master-pod": runner_pod_name[:63],
+                },
+            ),
+            spec=client.V1PodSpec(
+                restart_policy="Never",
+                service_account_name=service_account,
+                tolerations=[
+                    client.V1Toleration(
+                        key="ate.dev/benchmarking",
+                        operator="Equal",
+                        value="true",
+                        effect="NoSchedule",
+                    ),
+                    client.V1Toleration(
+                        key="ate.dev/workloadType",
+                        operator="Equal",
+                        value="ate-control-plane",
+                        effect="NoSchedule",
+                    ),
+                    client.V1Toleration(
+                        key="ate.dev/sandboxClass",
+                        operator="Exists",
+                        effect="NoSchedule",
+                    ),
+                ],
+                topology_spread_constraints=[
+                    client.V1TopologySpreadConstraint(
+                        max_skew=1,
+                        topology_key="kubernetes.io/hostname",
+                        when_unsatisfiable="ScheduleAnyway",
+                        label_selector=client.V1LabelSelector(
+                            match_labels={"app": "substrate-benchmark-runner"}
+                        ),
+                    )
+                ],
+                containers=[
+                    client.V1Container(
+                        name="boomer-worker",
+                        image=runner_image,
+                        image_pull_policy="IfNotPresent",
+                        command=[BOOMER_BINARY],
+                        args=worker_args,
+                        env=base_env,
+                        ports=[
+                            client.V1ContainerPort(
+                                name="boomer-metrics", container_port=8001
+                            )
+                        ],
+                        volume_mounts=volume_mounts,
+                        resources=client.V1ResourceRequirements(
+                            requests={"cpu": "4", "memory": "8Gi"}
+                        ),
+                    )
+                ],
+                volumes=volumes,
+            ),
+        )
+        try:
+            v1.create_namespaced_pod(
+                namespace=namespace, body=pod_manifest, _request_timeout=15
+            )
+            created_pods.append(pod_name)
+            tee(logs, f"Spawned remote boomer-worker pod {pod_name} (index {idx}/{worker_count} -> master {master_ip})")
+        except Exception as e:
+            tee(logs, f"Error spawning remote boomer-worker pod {pod_name}: {e}")
+            raise
+    return namespace, created_pods
+
+
+def cleanup_remote_boomer_workers(
+    namespace: str, pod_names: list[str], logs: TextIO
+) -> None:
+    """Delete any helper boomer-worker Pods spawned by spawn_remote_boomer_workers."""
+    if not pod_names:
+        return
+    try:
+        from kubernetes import client, config
+
+        try:
+            config.load_incluster_config()
+        except Exception:
+            config.load_kube_config()
+        v1 = client.CoreV1Api()
+        for name in pod_names:
+            try:
+                v1.delete_namespaced_pod(
+                    name=name,
+                    namespace=namespace,
+                    grace_period_seconds=30,
+                    _request_timeout=10,
+                )
+                tee(logs, f"Deleted remote boomer-worker pod {name}")
+            except Exception as e:
+                tee(logs, f"Warning: failed to delete remote boomer-worker pod {name}: {e}")
+    except Exception as e:
+        tee(logs, f"Warning: could not initialize k8s client for boomer-worker cleanup: {e}")
 
 
 def pair_flags(locust_extra: list[str]) -> list[str]:
@@ -362,6 +561,7 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
     siphoned into traces.txt as a deduped one-per-line list.
     """
     with_boomer = needs_boomer(args.file)
+    worker_count = resolve_boomer_workers(args) if with_boomer else 1
 
     locust_cmd = [
         sys.executable, "-m", "locust",
@@ -376,9 +576,11 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
         "--csv-full-history",
     ]
     if with_boomer:
-        # Master mode so boomer can connect as a worker on localhost:5557.
-        # --expect-workers=1 makes locust wait for boomer before starting.
-        locust_cmd += ["--master", "--expect-workers", "1"]
+        # Master mode so boomer can connect as a worker on port 5557.
+        # --expect-workers=N makes locust wait for all boomer workers before starting.
+        locust_cmd += ["--master", "--expect-workers", str(worker_count)]
+        if worker_count > 1:
+            locust_cmd += ["--master-bind-host", "0.0.0.0"]
         # Serve /boomer-config for the worker. --config-json gives boomer the
         # values one time, at its start, thus a run that changes a value while
         # it runs needs the endpoint. A load shape is one such run.
@@ -402,24 +604,31 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
     ))
 
     boomer_proc = None
+    remote_ns = "benchmarking"
+    remote_pods: list[str] = []
     if with_boomer:
-        boomer_cmd = [BOOMER_BINARY, "--user-class", Path(test_file(args.file)).stem]
+        boomer_base_args = ["--user-class", Path(test_file(args.file)).stem]
         cfg_json = build_config_json(args.locust_extra)
         if cfg_json:
-            boomer_cmd += ["--config-json", cfg_json]
+            boomer_base_args += ["--config-json", cfg_json]
         if args.actors_per_user is not None:
-            boomer_cmd += ["--actors-per-user", str(args.actors_per_user)]
+            boomer_base_args += ["--actors-per-user", str(args.actors_per_user)]
         if args.total_actors is not None:
-            boomer_cmd += ["--total-actors", str(args.total_actors)]
+            boomer_base_args += ["--total-actors", str(args.total_actors)]
         if args.spawn_concurrency is not None:
-            boomer_cmd += ["--spawn-concurrency", str(args.spawn_concurrency)]
+            boomer_base_args += ["--spawn-concurrency", str(args.spawn_concurrency)]
         if args.actor_deadline is not None:
-            boomer_cmd += ["--actor-deadline", str(args.actor_deadline)]
+            boomer_base_args += ["--actor-deadline", str(args.actor_deadline)]
+
         # Read the endpoint again at each spawn message. Thus a value that
         # changes while the run continues, such as the sample rate of a load
         # shape, reaches boomer at the change. boomer's --master-host default
         # is the loopback address, where the server above listens.
-        boomer_cmd += ["--master-web-port", str(BOOMER_CONFIG_PORT)]
+        boomer_cmd = [BOOMER_BINARY] + list(boomer_base_args) + [
+            "--master-web-port", str(BOOMER_CONFIG_PORT),
+            "--worker-index", "0",
+            "--worker-count", str(worker_count),
+        ]
         tee(logs, f"Running: {' '.join(boomer_cmd)}")
         boomer_env = {**os.environ, "BOOMER_TEST_NAME": str(args.name or "")}
         boomer_proc = subprocess.Popen(
@@ -435,26 +644,33 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
             args=("boomer", boomer_proc.stdout, logs, traces),
             daemon=True,
         ))
+        if worker_count > 1:
+            remote_ns, remote_pods = spawn_remote_boomer_workers(
+                worker_count, boomer_base_args, str(args.name or ""), logs
+            )
 
     for t in pumps:
         t.start()
 
-    locust_exit = locust_proc.wait()
-    tee(logs, f"Locust exited with code {locust_exit}")
+    try:
+        locust_exit = locust_proc.wait()
+        tee(logs, f"Locust exited with code {locust_exit}")
 
-    if boomer_proc is not None:
-        # Locust finishing means the test window is over; let boomer drain
-        # its actor cleanup before tearing it down hard. The boomer process
-        # suspends+deletes every actor it created on SIGTERM.
-        tee(logs, "Stopping boomer...")
-        boomer_proc.send_signal(signal.SIGTERM)
-        try:
-            boomer_proc.wait(timeout=90)
-        except subprocess.TimeoutExpired:
-            tee(logs, "Boomer did not exit within 90s; killing")
-            boomer_proc.kill()
-            boomer_proc.wait()
-        tee(logs, f"Boomer exited with code {boomer_proc.returncode}")
+        if boomer_proc is not None:
+            # Locust finishing means the test window is over; let boomer drain
+            # its actor cleanup before tearing it down hard. The boomer process
+            # suspends+deletes every actor it created on SIGTERM.
+            tee(logs, "Stopping boomer...")
+            boomer_proc.send_signal(signal.SIGTERM)
+            try:
+                boomer_proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                tee(logs, "Boomer did not exit within 90s; killing")
+                boomer_proc.kill()
+                boomer_proc.wait()
+            tee(logs, f"Boomer exited with code {boomer_proc.returncode}")
+    finally:
+        cleanup_remote_boomer_workers(remote_ns, remote_pods, logs)
 
     for t in pumps:
         t.join(timeout=5)

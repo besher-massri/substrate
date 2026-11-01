@@ -816,7 +816,43 @@ func applyWorkloadRuntimeAndScaleOverrides(objs []*unstructured.Unstructured, si
 
 		case kind == "Deployment" && name == "atenet-router":
 			if size100 {
-				_ = unstructured.SetNestedField(obj.Object, int64(8), "spec", "replicas")
+				replicas := int64(8)
+				if strings.EqualFold(envMap["ATE_SOFT_NODE_AFFINITY"], "true") {
+					replicas = 24
+					unstructured.RemoveNestedField(obj.Object, "spec", "template", "spec", "nodeSelector")
+					_ = unstructured.SetNestedSlice(obj.Object, []any{
+						map[string]any{
+							"key":      "ate.dev/workloadType",
+							"operator": "Equal",
+							"value":    "ate-control-plane",
+							"effect":   "NoSchedule",
+						},
+						map[string]any{
+							"key":      "ate.dev/benchmarking",
+							"operator": "Equal",
+							"value":    "true",
+							"effect":   "NoSchedule",
+						},
+						map[string]any{
+							"key":      "ate.dev/sandboxClass",
+							"operator": "Exists",
+							"effect":   "NoSchedule",
+						},
+					}, "spec", "template", "spec", "tolerations")
+					_ = unstructured.SetNestedSlice(obj.Object, []any{
+						map[string]any{
+							"maxSkew":           int64(1),
+							"topologyKey":       "kubernetes.io/hostname",
+							"whenUnsatisfiable": "ScheduleAnyway",
+							"labelSelector": map[string]any{
+								"matchLabels": map[string]any{
+									"app": "atenet-router",
+								},
+							},
+						},
+					}, "spec", "template", "spec", "topologySpreadConstraints")
+				}
+				_ = unstructured.SetNestedField(obj.Object, replicas, "spec", "replicas")
 			}
 			mutatePodContainers(obj, func(cname string, c map[string]any) {
 				if size100 {

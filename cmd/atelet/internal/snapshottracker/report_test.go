@@ -603,6 +603,7 @@ func TestTrackerBacksOffReportQueueOnServerFailure(t *testing.T) {
 		t.Helper()
 		tr := newIdleTestTracker(t, store)
 		tr.reporting.reporter = reporter
+		tr.reporting.workers = 1
 		// Short of giveUpAfter so the second actor's upload step does not
 		// expire the first actor's report window.
 		tr.uploadDelay = 2 * time.Minute

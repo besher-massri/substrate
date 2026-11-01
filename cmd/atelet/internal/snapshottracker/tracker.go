@@ -192,6 +192,19 @@ type Tracker struct {
 	// reporting holds the queue and settings for reporting snapshot state
 	// changes to the control plane.
 	reporting reportQueue
+	// pressureHighWatermark is the fraction of nodepath.SnapshotsDir capacity
+	// at or above which runMemoryPressureEvictor schedules LRU detaches of
+	// already-durable idle local snapshots down to pressureLowWatermark.
+	pressureHighWatermark float64
+	// pressureLowWatermark is the target fraction of nodepath.SnapshotsDir
+	// capacity to evict down to once usage reaches pressureHighWatermark.
+	pressureLowWatermark float64
+	// pressureInterval is how often runMemoryPressureEvictor checks disk
+	// usage on nodepath.SnapshotsDir.
+	pressureInterval time.Duration
+	// diskUsage returns (usedBytes, totalBytes) for a filesystem path. Nil
+	// disables background memory-pressure eviction.
+	diskUsage DiskUsageFunc
 	// workersDone counts the workers, and the detaches Detach calls started,
 	// still running.
 	workersDone sync.WaitGroup
@@ -308,20 +321,28 @@ func WithReportGiveUpAfter(d time.Duration) Option {
 // on clk. Its workers run once Start is called, until ctx ends. A nil store
 // schedules no uploads or detaches.
 func New(ctx context.Context, store Store, clk clock.WithTicker, opts ...Option) *Tracker {
+	var defaultDiskUsage DiskUsageFunc
+	if _, ok := clk.(clock.RealClock); ok {
+		defaultDiskUsage = DefaultDiskUsage
+	}
 	t := &Tracker{
-		ctx:                 ctx,
-		store:               store,
-		clock:               clk,
-		uploadDelay:         DefaultUploadDelay,
-		detachDelay:         DefaultDetachDelay,
-		uploadTimeout:       DefaultUploadTimeout,
-		uploadEstThroughput: DefaultUploadEstThroughput,
-		withTimeout:         context.WithTimeout,
-		retries:             workqueue.NewTypedItemExponentialFailureRateLimiter[string](snapshotRetryDelay, maxSnapshotRetryDelay),
-		workers:             [numOpKinds]int{opUpload: DefaultUploadWorkers, opDetach: DefaultDetachWorkers},
-		reporting:           newReportQueue(clk),
-		locks:               actorlock.New(),
-		actors:              map[string]*actorSnapshots{},
+		ctx:                   ctx,
+		store:                 store,
+		clock:                 clk,
+		uploadDelay:           DefaultUploadDelay,
+		detachDelay:           DefaultDetachDelay,
+		uploadTimeout:         DefaultUploadTimeout,
+		uploadEstThroughput:   DefaultUploadEstThroughput,
+		withTimeout:           context.WithTimeout,
+		retries:               workqueue.NewTypedItemExponentialFailureRateLimiter[string](snapshotRetryDelay, maxSnapshotRetryDelay),
+		workers:               [numOpKinds]int{opUpload: DefaultUploadWorkers, opDetach: DefaultDetachWorkers},
+		reporting:             newReportQueue(clk),
+		pressureHighWatermark: DefaultMemoryPressureHighWatermark,
+		pressureLowWatermark:  DefaultMemoryPressureLowWatermark,
+		pressureInterval:      DefaultMemoryPressureInterval,
+		diskUsage:             defaultDiskUsage,
+		locks:                 actorlock.New(),
+		actors:                map[string]*actorSnapshots{},
 	}
 	for k := range t.queues {
 		t.queues[k] = workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Clock: clk})

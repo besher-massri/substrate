@@ -58,7 +58,7 @@ const (
 	// uploads and detaches run at once on a node by default. Each kind has a
 	// queue and workers of its own, so neither waits behind the other.
 	DefaultUploadWorkers = 2
-	DefaultDetachWorkers = 2
+	DefaultDetachWorkers = 8
 )
 
 // opKind is what an operation on an actor's snapshots does.
@@ -172,6 +172,9 @@ func (t *Tracker) Start() {
 		for range t.reporting.workers {
 			t.workersDone.Go(t.runReporter)
 		}
+	}
+	if t.store != nil && t.diskUsage != nil && t.pressureInterval > 0 && t.pressureHighWatermark > 0 {
+		t.workersDone.Go(t.runMemoryPressureEvictor)
 	}
 }
 

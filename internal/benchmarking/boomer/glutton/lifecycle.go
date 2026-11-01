@@ -245,7 +245,10 @@ func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
 	if n < 1 {
 		n = 1
 	}
-	vuIdx := int(r.vuSeq.Add(1) - 1)
+	localVUIdx := int(r.vuSeq.Add(1) - 1)
+	workerCount := max(r.cfg.WorkerCount, 1)
+	workerIdx := max(r.cfg.WorkerIndex, 0) % workerCount
+	vuIdx := localVUIdx*workerCount + workerIdx
 	hotProb := dynconfig.Get[gluttonKnobs](r.cfg.Dyn).HotActorProb
 	u := &gluttonUser{actors: make([]*gluttonActor, 0, n)}
 	bmetrics.UpdateUsers(userClass, 1)
@@ -449,7 +452,7 @@ func (u *gluttonActor) doHTTPPost(ctx context.Context, path string, body []byte)
 		u.httpSem <- struct{}{}
 		defer func() { <-u.httpSem }()
 		var cancel context.CancelFunc
-		reqCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		reqCtx, cancel = context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
 	}
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u.cfg.RouterURL+path, bytes.NewReader(body))

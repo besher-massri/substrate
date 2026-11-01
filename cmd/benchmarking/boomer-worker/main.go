@@ -72,10 +72,27 @@ func main() {
 		seedConcurrency         = flag.Int("seed-concurrency", 256, "Number of concurrent CreateActor gRPC streams per pod when --seed-cold-actors > 0.")
 		seedAtespace            = flag.String("seed-atespace", "benchmark", "Target atespace for --seed-cold-actors.")
 		seedTemplate            = flag.String("seed-template", "benchmark-workloads/glutton", "Target ActorTemplate (atespace/name) for --seed-cold-actors.")
+		workerIndex             = flag.Int("worker-index", 0, "0-based index of this boomer-worker instance when running multiple distributed workers (also configurable via BOOMER_WORKER_INDEX).")
+		workerCount             = flag.Int("worker-count", 1, "Total number of distributed boomer-worker instances sharing the user pool (also configurable via BOOMER_WORKER_COUNT).")
 	)
 	// boomer.Run will call flag.Parse() if we haven't yet; calling here so
 	// our flag-derived values are usable before that.
 	flag.Parse()
+
+	if *workerIndex == 0 {
+		if v := strings.TrimSpace(os.Getenv("BOOMER_WORKER_INDEX")); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+				*workerIndex = parsed
+			}
+		}
+	}
+	if *workerCount == 1 {
+		if v := strings.TrimSpace(os.Getenv("BOOMER_WORKER_COUNT")); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed >= 1 {
+				*workerCount = parsed
+			}
+		}
+	}
 
 	class := strings.ToLower(*userClass)
 
@@ -218,13 +235,13 @@ func main() {
 		transport.MaxIdleConnsPerHost = perShardIdle
 		transport.MaxConnsPerHost = 256
 		transport.IdleConnTimeout = 5 * time.Minute
-		transport.ResponseHeaderTimeout = 10 * time.Second
+		transport.ResponseHeaderTimeout = 60 * time.Second
 		if routerTLS != nil {
 			transport.TLSClientConfig = routerTLS.Clone()
 			transport.ForceAttemptHTTP2 = false
 			transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 		}
-		httpClients = append(httpClients, &http.Client{Timeout: 15 * time.Second, Transport: transport})
+		httpClients = append(httpClients, &http.Client{Timeout: 90 * time.Second, Transport: transport})
 	}
 	httpClient := httpClients[0]
 
@@ -277,6 +294,8 @@ func main() {
 		TotalActors:      *totalActors,
 		SpawnConcurrency: *spawnConcurrency,
 		ActorDeadline:    time.Duration(*actorDeadline * float64(time.Second)),
+		WorkerIndex:      *workerIndex,
+		WorkerCount:      *workerCount,
 	}
 
 	taskFn, shutdownFn := entry.Init(cfg)

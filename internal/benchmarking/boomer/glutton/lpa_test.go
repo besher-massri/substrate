@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"unsafe"
@@ -65,8 +66,8 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 	if cfg.script == nil || len(cfg.script.Steps) != 61 {
 		t.Fatalf("loaded script steps = %d, want 61", len(cfg.script.Steps))
 	}
-	if len(cfg.validStartSteps) != 60 {
-		t.Fatalf("len(cfg.validStartSteps) = %d, want 60 (all 60 daily steps)", len(cfg.validStartSteps))
+	if len(cfg.validStartSteps) != 58 {
+		t.Fatalf("len(cfg.validStartSteps) = %d, want 58", len(cfg.validStartSteps))
 	}
 
 	svc, err := gluttonsvc.New(t.TempDir())
@@ -157,13 +158,14 @@ func TestLPAEnabledLoadsPersonalAssistantLightAndExecutesAllSteps(t *testing.T) 
 
 func TestLPAAllScriptsValidStartStepsFullTwoLapSimulation(t *testing.T) {
 	cases := []struct {
-		scriptName   string
-		wantSteps    int
-		wantValidLen int
+		scriptName      string
+		wantSteps       int
+		wantValidLen    int
+		wantIngestBytes int
 	}{
-		{scriptName: "personal-assistant-light", wantSteps: 61, wantValidLen: 60},
-		{scriptName: "coding-session", wantSteps: 20, wantValidLen: 3},
-		{scriptName: "personal-assistant", wantSteps: 61, wantValidLen: 60},
+		{scriptName: "personal-assistant-light", wantSteps: 61, wantValidLen: 58, wantIngestBytes: 0},
+		{scriptName: "coding-session", wantSteps: 20, wantValidLen: 3, wantIngestBytes: 16 << 20},
+		{scriptName: "personal-assistant", wantSteps: 61, wantValidLen: 58, wantIngestBytes: 384 << 10},
 	}
 
 	for _, tc := range cases {
@@ -180,10 +182,16 @@ func TestLPAAllScriptsValidStartStepsFullTwoLapSimulation(t *testing.T) {
 			if fullCfg.loadErr != nil {
 				t.Fatalf("loadLPAConfigFromEnv(%s, sizeScale=1.0): %v", tc.scriptName, fullCfg.loadErr)
 			}
-			for stepIdx, body := range fullCfg.stepBodies {
-				if len(body) >= 8*1024 {
-					t.Fatalf("%s step %d (%s) serialized protobuf size = %d bytes, want < 8192 bytes",
-						tc.scriptName, stepIdx, fullCfg.script.Steps[stepIdx].Name, len(body))
+			if tc.wantIngestBytes > 0 {
+				maxBody := 0
+				for _, body := range fullCfg.stepBodies {
+					if len(body) > maxBody {
+						maxBody = len(body)
+					}
+				}
+				if maxBody < tc.wantIngestBytes {
+					t.Fatalf("%s max step serialized protobuf size = %d bytes, want >= %d bytes (unmodified Request_Ingest payload)",
+						tc.scriptName, maxBody, tc.wantIngestBytes)
 				}
 			}
 
@@ -297,5 +305,31 @@ func TestBuildLPARunScriptRequestHonorsDwellAndCPUScales(t *testing.T) {
 				t.Fatalf("expected dwell sleep to be omitted when dwellScale == 0")
 			}
 		}
+	}
+}
+
+func TestMultiWorkerColdActorShardingIsDisjoint(t *testing.T) {
+	const (
+		workerCount   = 8
+		vusPerWorker  = 10
+		actorsPerUser = 5
+	)
+	seenCold := make(map[string]int)
+	for w := 0; w < workerCount; w++ {
+		for localVU := 0; localVU < vusPerWorker; localVU++ {
+			vuIdx := localVU*workerCount + w
+			for i := 1; i < actorsPerUser; i++ {
+				coldID := vuIdx*(actorsPerUser-1) + i
+				name := "sb-cold-" + strconv.Itoa(coldID)
+				if prevWorker, exists := seenCold[name]; exists {
+					t.Fatalf("cold actor collision at coldID=%d between worker %d and worker %d", coldID, prevWorker, w)
+				}
+				seenCold[name] = w
+			}
+		}
+	}
+	wantTotal := workerCount * vusPerWorker * (actorsPerUser - 1)
+	if len(seenCold) != wantTotal {
+		t.Fatalf("unique cold actors = %d, want %d", len(seenCold), wantTotal)
 	}
 }

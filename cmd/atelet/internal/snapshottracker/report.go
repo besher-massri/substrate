@@ -35,7 +35,7 @@ import (
 const (
 	// DefaultReportWorkers is how many reports run at once on a node by
 	// default.
-	DefaultReportWorkers = 1
+	DefaultReportWorkers = 4
 	// reportTimeout bounds one attempt to report an actor's state.
 	reportTimeout = 10 * time.Second
 	// reportRetryDelay is how long atelet holds an actor's report back after
