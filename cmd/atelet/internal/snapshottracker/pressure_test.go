@@ -156,7 +156,7 @@ func TestMemoryPressureAboveHighWatermarkEvictsOldestDurableIdleFirstDownToLowWa
 	}
 }
 
-func TestMemoryPressureSkipsStartedAndHeldActorsAndPrioritizesTiers(t *testing.T) {
+func TestMemoryPressureSkipsStartedAndHeldActorsAndPrioritizesDurableFirst(t *testing.T) {
 	useTempNodeDirs(t)
 	store := newFakeSnapshotStore()
 	tr := newStoreTracker(t, store,
@@ -186,17 +186,17 @@ func TestMemoryPressureSkipsStartedAndHeldActorsAndPrioritizesTiers(t *testing.T
 	}
 	defer endCheckpoint()
 
-	// 3. Undurable actor in tier 2 (t0+2m, LatestDurable == nil) - evicted only after tier 0 and tier 1.
+	// 3. Undurable actor (t0+2m, LatestDurable == nil) - prioritized after already-durable actors.
 	if err := os.MkdirAll(ateletpath.ActorPath("actor-undurable"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	writeTestLocalSnapshotFile(t, "actor-undurable", "snap-undurable", 1<<20)
 	tr.CommitLocal("actor-undurable", testRef("snap-undurable", 1, t0.Add(2*time.Minute)))
 
-	// 4. Eligible durable idle actor in tier 0 (t0+3m) - MUST be evicted first despite newer CommitTime than tier 2.
+	// 4. Eligible durable idle actor (t0+3m) - MUST be evicted first despite newer CommitTime than actor-undurable.
 	commitDurableIdleActor(t, tr, "actor-eligible", "snap-eligible", t0.Add(3*time.Minute), 1<<20)
 
-	// 5 MiB used - 4 MiB target = 1 MiB to free -> only 1 actor (tier 0 actor-eligible) is evicted.
+	// 6 MiB used - 5 MiB target = 1 MiB to free -> only 1 actor (already-durable actor-eligible) is detached.
 	if got := tr.evictUnderMemoryPressureOnce(); got != 1 {
 		t.Fatalf("evictUnderMemoryPressureOnce() = %d, want 1 (only actor-eligible)", got)
 	}
@@ -218,7 +218,7 @@ func TestMemoryPressureSkipsStartedAndHeldActorsAndPrioritizesTiers(t *testing.T
 	}
 }
 
-func TestMemoryPressureEvictsUndurableDeferredCheckpointsWithDurableBaselineInLRUOrder(t *testing.T) {
+func TestMemoryPressureDetachesAndUploadsUndurableDeferredCheckpointsInLRUOrder(t *testing.T) {
 	useTempNodeDirs(t)
 	store := newFakeSnapshotStore()
 	tr := newStoreTracker(t, store,
@@ -239,23 +239,25 @@ func TestMemoryPressureEvictsUndurableDeferredCheckpointsWithDurableBaselineInLR
 		if err := os.MkdirAll(ateletpath.ActorPath(actorUID), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		// Simulate Restore from golden snapshot (gen 1), then deferred Checkpoint (gen 2).
-		tr.RecordRestoredDurable(actorUID, testRef("golden-gen1", 1, time.Time{}))
 		writeTestLocalSnapshotFile(t, actorUID, snapUUID, 1<<20)
 		tr.CommitLocal(actorUID, testRef(snapUUID, 2, t0.Add(time.Duration(i)*time.Minute)))
 	}
 
-	// 6 MiB used - 4 MiB target = 2 MiB to free -> 2 oldest cold actors (cold-actor-1, cold-actor-2) evicted.
+	// 6 MiB used - 4 MiB target = 2 MiB to free -> 2 oldest cold actors (cold-actor-1, cold-actor-2) scheduled for detach.
 	if got := tr.evictUnderMemoryPressureOnce(); got != 2 {
 		t.Fatalf("evictUnderMemoryPressureOnce() = %d, want 2", got)
 	}
-	for _, actorUID := range []string{"cold-actor-1", "cold-actor-2"} {
+	eventually(t, "cold-actor-1 and cold-actor-2 are uploaded and detached", func() bool {
+		return tr.State("cold-actor-1").GetLatestLocal() == nil && tr.State("cold-actor-2").GetLatestLocal() == nil
+	})
+	for i, actorUID := range []string{"cold-actor-1", "cold-actor-2"} {
 		st := tr.State(actorUID)
 		if st.GetLatestLocal() != nil {
-			t.Errorf("State(%q).LatestLocal = %v, want nil after pressure prune", actorUID, st.GetLatestLocal())
+			t.Errorf("State(%q).LatestLocal = %v, want nil after detach", actorUID, st.GetLatestLocal())
 		}
-		if got := uuidOf(st.GetLatestDurable()); got != "golden-gen1" {
-			t.Errorf("State(%q).LatestDurable = %q, want golden-gen1 retained for fallback restore", actorUID, got)
+		wantUUID := fmt.Sprintf("snap-gen2-%d", i+1)
+		if got := uuidOf(st.GetLatestDurable()); got != wantUUID {
+			t.Errorf("State(%q).LatestDurable = %q, want %q uploaded before local prune", actorUID, got, wantUUID)
 		}
 		if _, err := os.Stat(ateletpath.LocalCheckpointsDir(actorUID)); !os.IsNotExist(err) {
 			t.Errorf("LocalCheckpointsDir(%q) stat err = %v, want not exist", actorUID, err)
