@@ -29,14 +29,14 @@ const (
 	// filesystem capacity at or above which atelet evicts the oldest idle
 	// local snapshots in LRU order. Below this watermark, zero pressure
 	// evictions occur and the normal detach timer governs.
-	DefaultMemoryPressureHighWatermark = 0.55
+	DefaultMemoryPressureHighWatermark = 0.22
 	// DefaultMemoryPressureLowWatermark is the target fraction of the local
 	// snapshot filesystem capacity to which a pressure-eviction sweep trims
 	// idle local snapshots once usage reaches the high watermark.
-	DefaultMemoryPressureLowWatermark = 0.45
+	DefaultMemoryPressureLowWatermark = 0.16
 	// DefaultMemoryPressureInterval is how often atelet checks the local
 	// snapshot filesystem usage for memory pressure.
-	DefaultMemoryPressureInterval = 5 * time.Second
+	DefaultMemoryPressureInterval = 2 * time.Second
 	// defaultEstimatedSnapshotBytes is the fallback size estimate (64 MiB) used
 	// when a local snapshot directory has zero allocated bytes on disk (for
 	// example in unit tests that record metadata without writing sentry files).
@@ -150,22 +150,40 @@ func (t *Tracker) evictUnderMemoryPressureOnce() int {
 
 	now := t.clock.Now()
 	candidates := make([]evictionCandidate, 0, len(actorUIDs))
+	type pendingDetach struct {
+		actorUID string
+		snapUUID string
+	}
+	var pending []pendingDetach
 	for _, actorUID := range actorUIDs {
 		if !t.locks.Lock(t.ctx, actorUID) {
 			return 0
 		}
 		a := t.findLocked(actorUID)
-		if isEligibleForPressureEviction(a, now) {
+		switch {
+		case isEligibleForPressureEviction(a, now):
 			candidates = append(candidates, evictionCandidate{
 				actorUID:       actorUID,
 				snapUUID:       a.LatestLocal.uuid(),
 				commitTime:     a.LatestLocal.CommitTime,
 				alreadyDurable: sameUUID(a.LatestLocal, a.LatestDurable),
 			})
+		case isPendingPressureDetach(a, now):
+			pending = append(pending, pendingDetach{
+				actorUID: actorUID,
+				snapUUID: a.LatestLocal.uuid(),
+			})
 		}
 		t.unlock(actorUID)
 	}
-	if len(candidates) == 0 {
+	for _, p := range pending {
+		snapBytes, err := localSnapshotSize(p.actorUID, p.snapUUID)
+		if err != nil || snapBytes <= 0 {
+			snapBytes = defaultEstimatedSnapshotBytes
+		}
+		bytesToFree -= snapBytes
+	}
+	if bytesToFree <= 0 || len(candidates) == 0 {
 		return 0
 	}
 
@@ -231,6 +249,24 @@ func isEligibleForPressureEviction(a *actorSnapshots, now time.Time) bool {
 		return false
 	}
 	return due.After(now)
+}
+
+// isPendingPressureDetach reports whether actor a is idle, unheld, has a local
+// snapshot on disk, and is already running a detach or queued for immediate
+// detach (due <= now) so its local snapshot bytes will be freed once the
+// in-flight or queued detach completes.
+func isPendingPressureDetach(a *actorSnapshots, now time.Time) bool {
+	if a == nil || a.Started || a.hold != holdNone || a.LatestLocal == nil {
+		return false
+	}
+	if a.op != nil {
+		return a.op.kind == opDetach
+	}
+	due, ok := a.detachDue()
+	if !ok {
+		return false
+	}
+	return !due.After(now)
 }
 
 // collectKnownActorUIDs returns a deduplicated list of actor UIDs currently

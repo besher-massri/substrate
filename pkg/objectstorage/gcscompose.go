@@ -37,7 +37,7 @@ import (
 // connection each. The same holds for the many small objects a node moves at once:
 // each snapshot below the part and range thresholds is a single request, so the
 // single-request paths draw on this pool too (see nextClient).
-const uploadPoolSize = 8
+const uploadPoolSize = 16
 
 // newPool builds the uploadPoolSize clients transfers are spread over, from the
 // same opts as the client they stand in for: a pooled client that authenticates

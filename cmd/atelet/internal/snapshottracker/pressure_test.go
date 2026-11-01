@@ -268,6 +268,40 @@ func TestMemoryPressureDetachesAndUploadsUndurableDeferredCheckpointsInLRUOrder(
 	}
 }
 
+func TestMemoryPressureAccountsForInFlightDetaches(t *testing.T) {
+	useTempNodeDirs(t)
+	store := newFakeSnapshotStore()
+	// 6 MiB used on 10 MiB filesystem (high=0.55, low=0.40 -> 2 MiB to free).
+	// Disable background detach workers (WithDetachWorkers(0)) so scheduled
+	// detaches remain pending in the queue with DetachAt <= now.
+	tr := newStoreTracker(t, store,
+		WithDetachWorkers(0),
+		WithMemoryPressureWatermarks(0.55, 0.40),
+		WithMemoryPressureInterval(2*time.Second),
+		WithDiskUsageFunc(func(string) (uint64, uint64, error) {
+			return 6 << 20, 10 << 20, nil
+		}),
+	)
+	tr.Start()
+
+	t0 := tr.clock.Now()
+	for i := 1; i <= 4; i++ {
+		actorUID := fmt.Sprintf("actor-%d", i)
+		snapUUID := fmt.Sprintf("snap-%d", i)
+		commitDurableIdleActor(t, tr, actorUID, snapUUID, t0.Add(time.Duration(i)*time.Minute), 1<<20)
+	}
+
+	// First pressure sweep schedules 2 actors (2 MiB) for immediate detach.
+	if got := tr.evictUnderMemoryPressureOnce(); got != 2 {
+		t.Fatalf("first evictUnderMemoryPressureOnce() = %d, want 2", got)
+	}
+	// Second pressure sweep while those 2 actors (2 MiB) are still pending
+	// detach must account for their pending 2 MiB and evict 0 additional actors.
+	if got := tr.evictUnderMemoryPressureOnce(); got != 0 {
+		t.Fatalf("second evictUnderMemoryPressureOnce() with 2 MiB already pending = %d, want 0", got)
+	}
+}
+
 func TestDefaultDiskUsage(t *testing.T) {
 	used, total, err := DefaultDiskUsage(t.TempDir())
 	if err != nil {

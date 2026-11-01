@@ -58,7 +58,7 @@ const (
 	// uploads and detaches run at once on a node by default. Each kind has a
 	// queue and workers of its own, so neither waits behind the other.
 	DefaultUploadWorkers = 2
-	DefaultDetachWorkers = 32
+	DefaultDetachWorkers = 128
 )
 
 // opKind is what an operation on an actor's snapshots does.
