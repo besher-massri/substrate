@@ -28,6 +28,7 @@ import (
 
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
@@ -176,6 +177,19 @@ func (c *Cache) Forget(name string) {
 		delete(c.workers, name)
 		delete(c.lastSlotFreed, name)
 	}
+}
+
+// Observe updates the cached view of w when a direct store read under a row
+// lock (such as in BindActorToWorker) observes a version at least as new as the
+// cached entry before the watch stream delivers it.
+func (c *Cache) Observe(w *ateapipb.Worker) {
+	if c == nil || w == nil || workerKey(w) == "" {
+		return
+	}
+	c.applyEvent(store.WorkerEvent{
+		Type:   store.WorkerEventUpdated,
+		Worker: proto.CloneOf(w),
+	})
 }
 
 // WorkerLastSlotFreedNano returns the UnixNano timestamp of the most recent

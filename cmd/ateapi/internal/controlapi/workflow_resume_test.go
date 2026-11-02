@@ -482,6 +482,68 @@ func TestAssignWorkerAttempt_RetryAfterConflictPicksFreshWorker(t *testing.T) {
 	}
 }
 
+func TestAssignWorkerAttempt_ObservesFullWorkerInStaleCache(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	wantRuntime := testSandboxRuntime()
+
+	contested := &ateapipb.Worker{
+		Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID("contested-pod")},
+		WorkerNamespace: "worker-ns",
+		WorkerPool:      "pool",
+		WorkerPod:       "contested-pod",
+		WorkerPodUid:    testWorkerUID("contested-pod"),
+		NodeName:        "node-1",
+		Status: &ateapipb.WorkerStatus{
+			State:          ateapipb.WorkerState_WORKER_STATE_ACTIVE,
+			Capacity:       &ateapipb.WorkerResources{Actors: 1},
+			SandboxClasses: workerSandboxClasses(wantRuntime),
+		},
+	}
+	storedContested, err := persistence.CreateWorker(ctx, contested)
+	if err != nil {
+		t.Fatalf("CreateWorker(contested-pod): %v", err)
+	}
+
+	// Start a workerCache backed by a static source holding the free version-1 snapshot
+	// of contested-pod, with a watch channel that never delivers events.
+	cacheCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	wc := workercache.New(&staticWorkerSource{workers: []*ateapipb.Worker{proto.CloneOf(storedContested)}}, time.Hour)
+	if err := wc.Start(cacheCtx); err != nil {
+		t.Fatalf("workercache.Start: %v", err)
+	}
+
+	// Now fill contested-pod in persistence (bumping its version to 2 with 1 allocated actor).
+	// Because wc uses staticWorkerSource, wc still thinks contested-pod is free (version 1, 0 actors).
+	seedAssignment(t, persistence, testWorkerUID("contested-pod"), &ateapipb.ActorAssignment{
+		Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "other"},
+		ActorUid: "other-actor-uid",
+	})
+
+	actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "id1"},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	})
+
+	w := &ActorWorkflow{store: persistence, workerCache: wc, scheduler: scheduling.New(wc)}
+	_, _, err = w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, &ateapipb.ActorTemplate{})
+	if !errors.Is(err, errWorkerFilledUp) {
+		t.Fatalf("assignWorkerAttempt() = %v, want errWorkerFilledUp when row-locked worker is full", err)
+	}
+
+	// Verify that admit observed the row-locked full worker into wc immediately,
+	// so wc now knows contested-pod is at capacity without waiting for watch delivery.
+	cached, err := wc.Worker(testWorkerUID("contested-pod"))
+	if err != nil {
+		t.Fatalf("wc.Worker(contested-pod): %v", err)
+	}
+	if got := cached.GetStatus().GetAllocated().GetActors(); got != 1 {
+		t.Errorf("cached contested-pod allocated actors = %d, want 1 after Observe", got)
+	}
+}
+
+
 // conflictInjectingStore wraps a store and runs inject exactly once,
 // immediately before the first update, simulating a concurrent writer racing
 // the step's read-modify-write window.

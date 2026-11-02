@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"go.ate.dev/substrate/internal/hardware"
 	"go.ate.dev/substrate/internal/resources"
@@ -508,6 +509,7 @@ func (f fleet) Workers() ([]*ateapipb.Worker, error) { return f, nil }
 
 func worker(pod, class, node string, lbls map[string]string, opts ...func(*ateapipb.Worker)) *ateapipb.Worker {
 	w := &ateapipb.Worker{
+		Metadata:  &ateapipb.ResourceMetadata{Name: pod},
 		WorkerPod: pod,
 		NodeName:  node,
 		Labels:    lbls,
@@ -801,3 +803,59 @@ func TestScheduleRequiredNodesUsesNodeLookup(t *testing.T) {
 		}
 	})
 }
+
+type idleTrackingFleet struct {
+	fleet
+	lastFreed map[string]int64
+}
+
+func (f *idleTrackingFleet) WorkerLastSlotFreedNano(name string) int64 {
+	return f.lastFreed[name]
+}
+
+func TestScheduleRecentSlotReleaseTieBreaking(t *testing.T) {
+	now := time.Now()
+
+	t.Run("prefers worker outside recentSlotReleaseWindow over recently freed worker", func(t *testing.T) {
+		f := &idleTrackingFleet{
+			fleet: fleet{
+				worker("w-recent", "gvisor", "node-a", nil, withMaxActors(4), assigned("demo", "a")),
+				worker("w-settled", "gvisor", "node-b", nil, withMaxActors(4), assigned("demo", "b")),
+			},
+			lastFreed: map[string]int64{
+				"w-recent":  now.Add(-50 * time.Millisecond).UnixNano(),
+				"w-settled": now.Add(-2 * time.Second).UnixNano(),
+			},
+		}
+		got, err := New(f, WithIntn(firstIntn)).Schedule(context.Background(), Constraints{})
+		if err != nil {
+			t.Fatalf("Schedule() error = %v", err)
+		}
+		if got.GetWorkerPod() != "w-settled" {
+			t.Errorf("Schedule() = %q, want w-settled (outside recentSlotReleaseWindow)", got.GetWorkerPod())
+		}
+	})
+
+	t.Run("does not bias toward oldest timestamp when both workers are outside recentSlotReleaseWindow", func(t *testing.T) {
+		f := &idleTrackingFleet{
+			fleet: fleet{
+				worker("w-newer-settled", "gvisor", "node-a", nil, withMaxActors(4), assigned("demo", "a")),
+				worker("w-older-settled", "gvisor", "node-b", nil, withMaxActors(4), assigned("demo", "b")),
+			},
+			lastFreed: map[string]int64{
+				"w-newer-settled": now.Add(-2 * time.Second).UnixNano(),
+				"w-older-settled": now.Add(-10 * time.Second).UnixNano(),
+			},
+		}
+		// firstIntn samples w-newer-settled first, then w-older-settled. Both are outside
+		// recentSlotReleaseWindow, so they tie and the first sample is preserved.
+		got, err := New(f, WithIntn(firstIntn)).Schedule(context.Background(), Constraints{})
+		if err != nil {
+			t.Fatalf("Schedule() error = %v", err)
+		}
+		if got.GetWorkerPod() != "w-newer-settled" {
+			t.Errorf("Schedule() = %q, want first sample w-newer-settled preserved when both are outside recentSlotReleaseWindow", got.GetWorkerPod())
+		}
+	})
+}
+

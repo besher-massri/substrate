@@ -324,12 +324,12 @@ func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resou
 }
 
 // assignmentBackoff bounds the retries of an assignment attempt that loses a
-// race for a worker. The delay reaches Cap after 5 attempts, which ends the
-// retries before Steps runs out, so the loop takes about 0.5 to 1 s.
+// race for a worker. The delay reaches Cap after 12 attempts, which ends the
+// retries before Steps runs out, so the loop takes about 0.8 to 1.2 s.
 var assignmentBackoff = wait.Backoff{
-	Steps:    12,
-	Duration: 15 * time.Millisecond,
-	Factor:   2.0,
+	Steps:    16,
+	Duration: 8 * time.Millisecond,
+	Factor:   1.35,
 	Jitter:   1.0,
 	Cap:      250 * time.Millisecond,
 }
@@ -492,6 +492,7 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	if err != nil {
 		return nil, nil, err
 	}
+	reclaimed := assignedWorker != nil
 	if assignedWorker == nil {
 		pickedWorker, err := w.scheduler.Schedule(ctx, constraints)
 		if errors.Is(err, scheduling.ErrNoCapacity) && relaxable {
@@ -549,6 +550,9 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	bound := assignedWorker
 	admit := func(fresh *ateapipb.Worker) error {
 		if !w.scheduler.Applies(fresh, constraints) || !w.scheduler.HasRoom(fresh, constraints) {
+			if !reclaimed && w.workerCache != nil {
+				w.workerCache.Observe(fresh)
+			}
 			return errWorkerFilledUp
 		}
 		bound = fresh

@@ -21,12 +21,20 @@ import (
 	"fmt"
 	"math/rand"
 	"slices"
+	"time"
 
 	"go.ate.dev/substrate/internal/hardware"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"k8s.io/apimachinery/pkg/labels"
 )
+
+// recentSlotReleaseWindow bounds how long a newly freed worker slot is treated
+// as recently freed so unpinned placements avoid stealing a slot from a pinned
+// actor in its brief suspend-resume turn gap, without imposing a global total
+// order across older idle slots that would concentrate concurrent callers onto
+// the single oldest timestamp.
+const recentSlotReleaseWindow = 250 * time.Millisecond
 
 // Constraints describes what a worker must satisfy to host an actor.
 type Constraints struct {
@@ -132,8 +140,11 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 	}
 
 	var idleTracker workerSlotIdleTracker
+	var nowNano int64
 	if len(constraints.RequiredNodes) == 0 {
-		idleTracker, _ = s.source.(workerSlotIdleTracker)
+		if idleTracker, _ = s.source.(workerSlotIdleTracker); idleTracker != nil {
+			nowNano = time.Now().UnixNano()
+		}
 	}
 
 	var candidates []candidate
@@ -143,7 +154,8 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 		}
 		if cand, ok := checkRoom(worker, constraints.Limits); ok {
 			if idleTracker != nil {
-				cand.lastSlotFreedNano = idleTracker.WorkerLastSlotFreedNano(worker.GetMetadata().GetName())
+				lastFreed := idleTracker.WorkerLastSlotFreedNano(worker.GetMetadata().GetName())
+				cand.recentlyFreed = lastFreed > 0 && nowNano-lastFreed < int64(recentSlotReleaseWindow)
 			}
 			candidates = append(candidates, cand)
 		}
@@ -209,9 +221,9 @@ type candidate struct {
 	// resUtil is the worker's dominant compute-resource utilization in [0,1],
 	// or -1 if not yet computed.
 	resUtil float64
-	// lastSlotFreedNano is the UnixNano timestamp of the most recent actor-slot
-	// release on this worker, or 0 if unknown / never released.
-	lastSlotFreedNano int64
+	// recentlyFreed reports whether this worker had an actor slot released
+	// within recentSlotReleaseWindow.
+	recentlyFreed bool
 }
 
 func (c *candidate) resourceUtilization() float64 {
@@ -224,8 +236,9 @@ func (c *candidate) resourceUtilization() float64 {
 // lessLoaded compares dominant utilization — the higher of actor-slot
 // utilization (allocated/capacity) and compute-resource utilization — so either
 // dimension can mark a worker as hot. Ties fall back to actor-slot utilization,
-// then to remaining actor slots, then to older slot-release timestamp so
-// unpinned placements prefer slots that have been idle longest.
+// then to remaining actor slots, then to preferring slots that were not freed
+// within recentSlotReleaseWindow while keeping uniform random selection within
+// each bucket.
 func lessLoaded(a, b *candidate) bool {
 	aAlloc := int64(a.worker.GetStatus().GetAllocated().GetActors())
 	bAlloc := int64(b.worker.GetStatus().GetAllocated().GetActors())
@@ -248,7 +261,7 @@ func lessLoaded(a, b *candidate) bool {
 		return aFree > bFree
 	}
 
-	return a.lastSlotFreedNano < b.lastSlotFreedNano
+	return !a.recentlyFreed && b.recentlyFreed
 }
 
 // workerResourceUtilization returns the highest allocated/capacity ratio across

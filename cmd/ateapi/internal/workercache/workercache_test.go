@@ -655,3 +655,50 @@ func TestCache_WorkersByNode(t *testing.T) {
 		return err == nil && len(b) == 0
 	}, 2*time.Second)
 }
+
+func TestCache_Observe(t *testing.T) {
+	w1 := makeWorker("ns", "pod1", 2)
+	w1.NodeName = "node-a"
+	fs := newFakeStore(w1)
+	c := workercache.New(fs, time.Hour)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Older version must be ignored.
+	stale := makeWorker("ns", "pod1", 1)
+	stale.Status.Allocated = &ateapipb.WorkerResources{Actors: 9}
+	c.Observe(stale)
+	got, err := c.Worker(workerName("ns", "pod1"))
+	if err != nil {
+		t.Fatalf("Worker: %v", err)
+	}
+	if got.GetMetadata().GetVersion() != 2 || got.GetStatus().GetAllocated().GetActors() != 0 {
+		t.Fatalf("stale Observe regressed cache: got version=%d actors=%d", got.GetMetadata().GetVersion(), got.GetStatus().GetAllocated().GetActors())
+	}
+
+	// Newer version observed under row lock updates the cache and node index immediately,
+	// and clones the caller's proto so subsequent caller mutations do not leak into the cache.
+	fresh := makeWorker("ns", "pod1", 3)
+	fresh.NodeName = "node-b"
+	fresh.Status.Allocated = &ateapipb.WorkerResources{Actors: 1}
+	c.Observe(fresh)
+	fresh.Status.Allocated.Actors = 99
+
+	got, err = c.Worker(workerName("ns", "pod1"))
+	if err != nil {
+		t.Fatalf("Worker after Observe: %v", err)
+	}
+	if got.GetMetadata().GetVersion() != 3 || got.GetStatus().GetAllocated().GetActors() != 1 {
+		t.Fatalf("Observe did not apply cloned fresh worker: got version=%d actors=%d", got.GetMetadata().GetVersion(), got.GetStatus().GetAllocated().GetActors())
+	}
+	byB, err := c.WorkersByNode("node-b")
+	if err != nil || len(byB) != 1 {
+		t.Fatalf("WorkersByNode(node-b) = %v, %v, want 1 worker", byB, err)
+	}
+	byA, err := c.WorkersByNode("node-a")
+	if err != nil || len(byA) != 0 {
+		t.Fatalf("WorkersByNode(node-a) = %v, %v, want 0 workers", byA, err)
+	}
+}
+
