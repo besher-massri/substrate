@@ -493,11 +493,13 @@ func TestDetachFromFullNode(t *testing.T) {
 // room on node-2: it moves to node-2 only when node-1 is full.
 func TestResumeActor_DetachesFromFullNode(t *testing.T) {
 	tests := []struct {
-		name     string
-		node1    bool
-		wantNode string
+		name       string
+		node1      bool
+		staleCache bool
+		wantNode   string
 	}{
 		{name: "node-1 full: detaches and resumes on node-2", wantNode: "node-2"},
+		{name: "node-1 full in store with stale cache: detaches and resumes on node-2", staleCache: true, wantNode: "node-2"},
 		{name: "node-1 has room: resumes there from the local copy", node1: true, wantNode: "node-1"},
 	}
 	for _, tt := range tests {
@@ -517,7 +519,7 @@ func TestResumeActor_DetachesFromFullNode(t *testing.T) {
 				"node-1": seedRuntimeWorker(t, ctx, st, "pod-1", "node-1", testSandboxRuntime()),
 				"node-2": seedRuntimeWorker(t, ctx, st, "pod-2", "node-2", testSandboxRuntime()),
 			}
-			if !tt.node1 {
+			if !tt.node1 && !tt.staleCache {
 				fillWorker(t, st, workers["node-1"])
 			}
 			snap := newPausedSnapshot(t, 1, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", "pause-snap-1", "node-1")
@@ -527,6 +529,9 @@ func TestResumeActor_DetachesFromFullNode(t *testing.T) {
 				a.Status.Snapshots = []*ateapipb.Snapshot{proto.CloneOf(snap)}
 			})
 			w, atelet := newDetachTestWorkflow(t, ctx, st)
+			if tt.staleCache {
+				fillWorker(t, st, workers["node-1"])
+			}
 			addAteletOnNode(t, w, "node-2")
 			atelet.detachState = detachedState(snap)
 

@@ -488,7 +488,6 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	relaxable := canRelaxRuntime(actor, constraints)
 
 	var assignedWorker *ateapipb.Worker
-	pinnedNodeCacheMiss := false
 	assignedWorker, err = w.workerHoldingStaleClaim(ctx, actor, constraints, relaxable)
 	if err != nil {
 		return nil, nil, err
@@ -505,7 +504,6 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 					if nw.GetNodeName() != "" && w.scheduler.Applies(nw, constraints) {
 						pickedWorker = nw
 						err = nil
-						pinnedNodeCacheMiss = true
 						break
 					}
 				}
@@ -561,7 +559,7 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 			w.workerCache.Forget(assignedWorker.GetMetadata().GetName())
 			return nil, nil, fmt.Errorf("selected worker disappeared before claim: %w", store.ErrVersionConflict)
 		}
-		if errors.Is(err, errWorkerFilledUp) && pinnedNodeCacheMiss {
+		if errors.Is(err, errWorkerFilledUp) && len(constraints.RequiredNodes) == 1 {
 			outcome = ateattr.SchedulerOutcomeNoCapacity
 			return nil, nil, apierror.ResourceExhausted("%w", errNoWorkerRoom)
 		}
