@@ -23,9 +23,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/kube"
@@ -213,6 +215,9 @@ func (e *Env) DeployAteSystem(ctx context.Context, opts DeployOptions) error {
 		}
 	}
 	if err := e.waitFakeWorkersync(ctx); err != nil {
+		return err
+	}
+	if err := e.applyGMPCadvisorFilter(ctx); err != nil {
 		return err
 	}
 	return e.applyOtelEndpointOverride(ctx)
@@ -537,6 +542,9 @@ func (e *Env) DeployAtelet(ctx context.Context) error {
 	if err := e.Kube.RolloutStatus(ctx, kube.KindDaemonSet, e.Namespace(), "atelet", e.Cfg.RolloutTimeout); err != nil {
 		return err
 	}
+	if err := e.applyGMPCadvisorFilter(ctx); err != nil {
+		return err
+	}
 	return e.waitFakeWorkersync(ctx)
 }
 
@@ -724,4 +732,26 @@ func (e *Env) waitCRDsEstablished(ctx context.Context, crds []*unstructured.Unst
 	// has to see the kinds that were just installed.
 	e.Kube.InvalidateDiscovery()
 	return nil
+}
+
+// gmpOperatorConfigs is the GKE Managed Service for Prometheus OperatorConfig
+// resource. GKE keeps its single object at gmp-public/config.
+var gmpOperatorConfigs = schema.GroupVersionResource{Group: "monitoring.googleapis.com", Version: "v1", Resource: "operatorconfigs"}
+
+// applyGMPCadvisorFilter applies gmp-kubelet-cadvisor.yaml on GKE under
+// --gmp-exclude-actor-subcgroups. It first clears collection.kubeletScraping
+// and collection.filter in gmp-public/config, so GMP's built-in kubelet
+// scraping does not keep collecting the unfiltered cAdvisor series alongside
+// it. A cluster without that OperatorConfig has nothing to clear.
+func (e *Env) applyGMPCadvisorFilter(ctx context.Context) error {
+	if e.Cfg.Kind || !e.Cfg.GMPExcludeActorSubCgroups {
+		return nil
+	}
+	patch := []byte(`{"collection":{"kubeletScraping":null,"filter":null}}`)
+	_, err := e.Kube.Dynamic.Resource(gmpOperatorConfigs).Namespace("gmp-public").
+		Patch(ctx, "config", types.MergePatchType, patch, metav1.PatchOptions{FieldManager: kube.FieldManager})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("while clearing kubelet scraping in gmp-public/config: %w", err)
+	}
+	return e.Kube.ApplyPath(ctx, e.Cfg.Manifest("gmp-kubelet-cadvisor.yaml"))
 }

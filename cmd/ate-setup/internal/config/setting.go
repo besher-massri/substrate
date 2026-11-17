@@ -305,6 +305,12 @@ var Registry = []Setting{
 			"labeled and tainted ate.dev/workloadType=ate-postgres:NoSchedule for postgres alone",
 	},
 	{
+		Key: "gmp.excludeActorSubCgroups", Env: "ATE_INSTALL_GMP_EXCLUDE_ACTOR_SUBCGROUPS", Flag: "gmp-exclude-actor-subcgroups",
+		Kind: KindBool, Default: "false",
+		Usage: "Scrape kubelet cAdvisor into GKE Managed Service for Prometheus through the " +
+			"substrate-kubelet-cadvisor ClusterNodeMonitoring, which drops per-actor sandbox sub-cgroups at scrape time",
+	},
+	{
 		Key: "fakeDataPlane.enabled", Env: "ATE_INSTALL_FAKE_DATA_PLANE", Flag: "fake-data-plane",
 		Kind: KindBool, Default: "false",
 		Usage: "Install the fake data plane for control-plane benchmarks: fake-atelet in place of " +

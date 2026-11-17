@@ -1,0 +1,40 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Scrape kubelet cAdvisor into Google Managed Prometheus without the per-actor
+# sandbox sub-cgroups. Both runtimes create one cgroup per actor beneath the
+# worker container's systemd scope, and kubelet keeps reporting destroyed ones,
+# so at high actor density or churn an unfiltered scrape can exhaust the GMP
+# collector's memory. metricRelabeling drops them at scrape time, unlike
+# OperatorConfig collection.filter, which only filters at export.
+#
+# Not part of any bundle: cmd/ate-setup applies it on GKE under
+# --gmp-exclude-actor-subcgroups.
+apiVersion: monitoring.googleapis.com/v1
+kind: ClusterNodeMonitoring
+metadata:
+  name: substrate-kubelet-cadvisor
+spec:
+  endpoints:
+  - path: /metrics/cadvisor
+    scheme: https
+    interval: 15s
+    metricRelabeling:
+    - sourceLabels: [id]
+      regex: '.+/cri-containerd-[^/]+\.scope/.+'
+      action: drop
+    # Container PSI, working-set memory and CPU usage.
+    - sourceLabels: [__name__]
+      regex: 'container_(pressure_.*|memory_working_set_bytes|cpu_usage_seconds_total)'
+      action: keep

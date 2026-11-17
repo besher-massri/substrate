@@ -230,6 +230,11 @@ type Config struct {
 	// data plane applies (ATE_INSTALL_E2E_TUNING).
 	E2ETuning bool
 
+	// GMPExcludeActorSubCgroups makes GKE Managed Service for Prometheus scrape
+	// kubelet cAdvisor without the per-actor sandbox sub-cgroups
+	// (ATE_INSTALL_GMP_EXCLUDE_ACTOR_SUBCGROUPS). See applyGMPCadvisorFilter.
+	GMPExcludeActorSubCgroups bool
+
 	// IngressAllowedSPIFFEIDs are the SPIFFE IDs the ingress router lets
 	// reach actors over its TLS listeners (ATE_INGRESS_ALLOWED_SPIFFE_IDS).
 	// Empty means no client may reach actors through the router.

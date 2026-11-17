@@ -41,6 +41,7 @@ type Options struct {
 	CordonSystemInfraComponents    bool
 	FakeDataPlane                  bool
 	E2ETuning                      bool
+	GMPExcludeActorSubCgroups      bool
 	AdditionalEgressExtprocService string
 	CredentialProvider             string
 	OtlpEndpoint                   string
@@ -107,6 +108,7 @@ func optionsFlagSet(opts Options) (*pflag.FlagSet, error) {
 		{"cordon-system-infra-components", opts.CordonSystemInfraComponents},
 		{"fake-data-plane", opts.FakeDataPlane},
 		{"e2e-tuning", opts.E2ETuning},
+		{"gmp-exclude-actor-subcgroups", opts.GMPExcludeActorSubCgroups},
 	} {
 		if kv.val {
 			if err := fs.Set(kv.flag, "true"); err != nil {

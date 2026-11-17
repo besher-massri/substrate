@@ -18,6 +18,7 @@ import (
 	"errors"
 	"io/fs"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -226,6 +227,48 @@ func TestComponentManifestsMatchSystemBundle(t *testing.T) {
 			if diff := cmp.Diff(want.Object, got.Object); diff != "" {
 				t.Errorf("router=%s kind=%v: %s renders a different %s/%s than the system bundle (-bundle +standalone):\n%s", tc.router, tc.kind, component.path, component.kind, component.name, diff)
 			}
+		}
+	}
+}
+
+// TestGMPCadvisorFilterRelabeling checks that the ClusterNodeMonitoring's
+// metricRelabeling, anchored as Prometheus anchors it, drops per-actor sandbox
+// sub-cgroups and keeps only the wanted container metrics.
+func TestGMPCadvisorFilterRelabeling(t *testing.T) {
+	objs, err := kube.LoadPath(filepath.Join(repoRoot(t), "manifests", "ate-install", "gmp-kubelet-cadvisor.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cnm := findObject(objs, "ClusterNodeMonitoring", "substrate-kubelet-cadvisor")
+	if cnm == nil {
+		t.Fatal("manifest has no clusternodemonitoring/substrate-kubelet-cadvisor")
+	}
+	endpoints, _, _ := unstructured.NestedSlice(cnm.Object, "spec", "endpoints")
+	if len(endpoints) != 1 {
+		t.Fatalf("spec.endpoints has %d entries, want 1", len(endpoints))
+	}
+	rules, _, _ := unstructured.NestedSlice(endpoints[0].(map[string]any), "metricRelabeling")
+	if len(rules) != 2 {
+		t.Fatalf("metricRelabeling has %d rules, want 2", len(rules))
+	}
+	anchored := func(rule any) *regexp.Regexp {
+		return regexp.MustCompile("^(?:" + rule.(map[string]any)["regex"].(string) + ")$")
+	}
+	drop, keep := anchored(rules[0]), anchored(rules[1])
+	const scope = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-0123abcd.scope"
+	for _, tc := range []struct {
+		name, id string
+		want     bool
+	}{
+		{"container_cpu_usage_seconds_total", scope, true},
+		{"container_memory_working_set_bytes", "/kubepods.slice", true},
+		{"container_pressure_cpu_waiting_seconds_total", scope, true},
+		{"container_memory_rss", scope, false},
+		{"container_cpu_usage_seconds_total", scope + "/actor-0001", false},
+		{"container_tasks_state", scope + "/actor-0001", false},
+	} {
+		if got := !drop.MatchString(tc.id) && keep.MatchString(tc.name); got != tc.want {
+			t.Errorf("%s{id=%q} kept = %v, want %v", tc.name, tc.id, got, tc.want)
 		}
 	}
 }
